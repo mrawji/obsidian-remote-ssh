@@ -86,6 +86,8 @@ interface PassResult {
   budgetExceeded: boolean;
   /** How the launch ended: a real window close, or the harness's signal. */
   shutdown?: 'closed' | 'signalled';
+  /** Adapter-level stat/read timings, outside Obsidian's indexing queue. */
+  adapterProbe?: unknown;
   reads: number | null;
   readAvgMs: number | null;
   readInflightMax: number | null;
@@ -229,6 +231,42 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
 }
 
 /**
+ * Time the adapter directly, outside Obsidian's indexing queue: `stat` (one
+ * RPC) and `readBinary` (two RPCs cold, since the adapter revalidates with a
+ * stat) on distinct notes, sequentially.
+ *
+ * metadataCache reads one note at a time and each `vault.readBinary` costs
+ * ~42 ms on LAN and on a 40 ms WAN alike, so the cost is not the link. This
+ * says how much of it is our read path and how much is Obsidian's.
+ */
+async function probeAdapter(page: Page, paths: string[]): Promise<unknown> {
+  return withTimeout(page.evaluate(async (ps: string[]) => {
+    const adapter = (window as unknown as {
+      app?: { vault?: { adapter?: {
+        stat?: (p: string) => Promise<unknown>;
+        readBinary?: (p: string) => Promise<ArrayBuffer>;
+      } } };
+    }).app?.vault?.adapter;
+    if (!adapter?.stat || !adapter?.readBinary) return { error: 'no adapter' };
+    const time = async (fn: () => Promise<unknown>) => {
+      const t = performance.now();
+      try { await fn(); } catch { /* count the attempt anyway */ }
+      return performance.now() - t;
+    };
+    const statMs: number[] = [];
+    for (const p of ps) statMs.push(await time(() => adapter.stat!(p)));
+    const readMs: number[] = [];
+    for (const p of ps) readMs.push(await time(() => adapter.readBinary!(p)));
+    // Second pass over the same notes: now warm in the ReadCache, so what is
+    // left is the revalidating stat plus our own overhead.
+    const rereadMs: number[] = [];
+    for (const p of ps) rereadMs.push(await time(() => adapter.readBinary!(p)));
+    const avg = (xs: number[]) => Math.round(xs.reduce((a, b) => a + b, 0) / (xs.length || 1));
+    return { n: ps.length, statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs) };
+  }, paths), EVAL_TIMEOUT_MS * 6).catch((): typeof TIMED_OUT => TIMED_OUT);
+}
+
+/**
  * Close Obsidian the way a user does, and only fall back to the harness's
  * SIGTERM if that doesn't take.
  *
@@ -329,6 +367,16 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     await new Promise((r) => setTimeout(r, SAMPLE_EVERY_MS));
   }
 
+  // Adapter-level timings on 30 notes the index has already been through.
+  const probePaths = await obsidian.page.evaluate(() => {
+    const files = (window as unknown as {
+      app?: { vault?: { getMarkdownFiles?: () => Array<{ path: string }> } };
+    }).app?.vault?.getMarkdownFiles?.() ?? [];
+    return files.slice(0, 30).map((f) => f.path);
+  }).catch(() => [] as string[]);
+  const adapterProbe = probePaths.length ? await probeAdapter(obsidian.page, probePaths) : null;
+  console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] adapter probe: ${JSON.stringify(adapterProbe)}`);
+
   // Let IndexedDB's relaxed-durability writes land, then close the window
   // rather than signalling the process, so the next pass measures reuse.
   await new Promise((r) => setTimeout(r, 5_000));
@@ -356,6 +404,7 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     frozenSamples: samples.filter((s) => s.evalMs === null).length,
     budgetExceeded,
     shutdown: how,
+    adapterProbe: adapterProbe === TIMED_OUT ? 'timed out' : adapterProbe,
     reads: last?.reads ?? null,
     readAvgMs: last?.readAvgMs ?? null,
     readInflightMax: last?.readInflightMax ?? null,
