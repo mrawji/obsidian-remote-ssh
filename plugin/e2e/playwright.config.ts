@@ -69,7 +69,6 @@ export default defineConfig({
         '**/reflect.spec.ts',
         '**/restart-settings.spec.ts',
         '**/plugin-code-roundtrip.spec.ts',
-        '**/fs-sync-bridge-probe.spec.ts',
       ],
     },
     {
