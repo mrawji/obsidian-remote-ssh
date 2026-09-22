@@ -10,6 +10,7 @@ import {
 } from './helpers/obsidian';
 import { scaffoldTestVault, type ScaffoldResult } from './helpers/vault-scaffold';
 import { assertSshdReachable } from './helpers/sshd';
+import { logPathFor, readLogEntries } from './helpers/log-oracle';
 import { SCALE_PROFILES, seedScaleFixture, type SeededFixture } from './helpers/scale-fixture';
 import { NET_PROFILES, applyNetProfile, clearNetProfile, containerTxBytes } from './helpers/netem';
 
@@ -50,6 +51,7 @@ const SAMPLE_EVERY_MS = 10_000;
 const EVAL_TIMEOUT_MS = 30_000;
 
 const RESULTS_DIR = path.resolve(__dirname, '..', 'scale-results');
+const TIMED_OUT: unique symbol = Symbol('timed out');
 
 interface Sample {
   tMs: number;
@@ -82,6 +84,8 @@ interface PassResult {
   reads: number | null;
   readAvgMs: number | null;
   readInflightMax: number | null;
+  /** metadataCache internals right after launch: whether its cache survived startup. */
+  cacheAtStart: unknown;
 }
 
 let obsidian: ObsidianHandle | null = null;
@@ -133,7 +137,6 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIM
     clearTimeout(timer);
   }
 }
-const TIMED_OUT = Symbol('timed out');
 
 async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
   const evalStart = Date.now();
@@ -195,7 +198,7 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
       };
     }),
     EVAL_TIMEOUT_MS,
-  ).catch(() => TIMED_OUT);
+  ).catch((): typeof TIMED_OUT => TIMED_OUT);
   const evalMs = r === TIMED_OUT ? null : Date.now() - evalStart;
   return {
     tMs: Date.now() - t0,
@@ -211,11 +214,48 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
   };
 }
 
+/**
+ * What metadataCache kept through startup: its IndexedDB-backed `fileCache`
+ * (path → mtime/size/hash) against the model's `TFile.stat`. On a relaunch,
+ * a note is read again unless both match and the hash's metadata is present.
+ * Key names and stats only, never content.
+ */
+async function cacheAtStart(page: Page): Promise<unknown> {
+  return withTimeout(page.evaluate(() => {
+    interface Stat { mtime: number; size: number }
+    const app = (window as unknown as {
+      app?: {
+        vault?: { getMarkdownFiles?: () => Array<{ path: string; stat: Stat }> };
+        metadataCache?: {
+          initialized?: boolean;
+          fileCache?: Record<string, { mtime: number; size: number; hash: string }>;
+          metadataCache?: Record<string, unknown>;
+        };
+      };
+    }).app;
+    const mc = app?.metadataCache;
+    const fc = mc?.fileCache ?? {};
+    const files = app?.vault?.getMarkdownFiles?.() ?? [];
+    const entries = Object.values(fc);
+    return {
+      initialized: mc?.initialized ?? null,
+      modelMarkdown: files.length,
+      fileCacheEntries: entries.length,
+      withHash: entries.filter((e) => e.hash).length,
+      metadataEntries: Object.keys(mc?.metadataCache ?? {}).length,
+      statMatches: files.filter((f) => fc[f.path]?.mtime === f.stat.mtime && fc[f.path]?.size === f.stat.size).length,
+      first: files.slice(0, 3).map((f) => ({ path: f.path, stat: f.stat, cache: fc[f.path] ?? null })),
+    };
+  }), EVAL_TIMEOUT_MS).catch((): typeof TIMED_OUT => TIMED_OUT);
+}
+
 async function runPass(pass: PassResult['pass']): Promise<PassResult> {
   const expected = fixture.markdownFiles;
   const tx0 = containerTxBytes();
   const t0 = Date.now();
   obsidian = await launchObsidian(shadowVaultPath);
+  const cache = await cacheAtStart(obsidian.page);
+  console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] cache at start: ${JSON.stringify(cache)}`);
 
   const samples: Sample[] = [];
   const firstAt = (pred: (s: Sample) => boolean): number | null =>
@@ -239,8 +279,16 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     await new Promise((r) => setTimeout(r, SAMPLE_EVERY_MS));
   }
 
+  // Let IndexedDB's relaxed-durability writes land before the process goes,
+  // so the next pass measures reuse, not a lost save.
+  await new Promise((r) => setTimeout(r, 5_000));
   await obsidian.cleanup();
   obsidian = null;
+  for (const e of readLogEntries(logPathFor(shadowVaultPath))) {
+    if (/TreeSnapshot|reconciled|BackgroundIndexer: (complete|full walk)/.test(e.msg ?? '')) {
+      console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] log: ${e.msg}`);
+    }
+  }
 
   const parsedSample = samples.find(isParsed);
   const evals = samples.map((s) => s.evalMs).filter((v): v is number => v !== null);
@@ -259,6 +307,7 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     reads: last?.reads ?? null,
     readAvgMs: last?.readAvgMs ?? null,
     readInflightMax: last?.readInflightMax ?? null,
+    cacheAtStart: cache === TIMED_OUT ? 'timed out' : cache,
   };
 }
 
