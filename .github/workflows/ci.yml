@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
@@ -107,10 +107,9 @@ jobs:
   # behaviour drift, fs.cp polyfills, etc. — without the 9-job 3×3
   # OS×Node combinatorial explosion.
   #
-  # Node 18 is intentionally NOT in the matrix: Vitest 4.x requires
-  # Node 20.19+ (drops `require()` of ESM-only modules), so testing
-  # on 18 would just CI-fail without exercising real plugin code.
-  # `engines.node` is set to >=20 to reflect that.
+  # The other jobs run on Node 24 (current LTS). This job keeps the floor
+  # honest: jsdom 30 (undici 8) needs Node ^22.22.2, so 20 is out, and
+  # `engines.node` is set to >=22.22.2 to match.
   node-compat:
     name: Test (ubuntu, node-${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -151,7 +150,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
