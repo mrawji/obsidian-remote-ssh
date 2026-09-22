@@ -14,6 +14,7 @@ import { defineConfig } from '@playwright/test';
  *   TEST_VAULT     — path to the pre-scaffolded test vault
  *   CDP_PORT       — debugging port (default: 9222)
  *   E2E_DEMO       — set to include `demo.spec.ts` (media capture only)
+ *   E2E_SCALE      — set to include `scale.spec.ts` (the #513 benchmark)
  */
 export default defineConfig({
   testDir: '.',
@@ -25,7 +26,10 @@ export default defineConfig({
   // go red for reasons unrelated to product behaviour, which is corrosive to
   // trusting the suite. Excluded by default; the `Record demo + push GIF`
   // workflow sets E2E_DEMO=1 to opt it back in.
-  testIgnore: process.env.E2E_DEMO ? [] : ['**/demo.spec.ts'],
+  testIgnore: [
+    ...(process.env.E2E_DEMO ? [] : ['**/demo.spec.ts']),
+    ...(process.env.E2E_SCALE ? [] : ['**/scale.spec.ts']),
+  ],
   timeout: 120_000,
   // Playwright's DEFAULT actionTimeout is 0 — wait FOREVER. With Obsidian's
   // virtualised File Explorer under Xvfb a node can be *attached but never
@@ -97,6 +101,11 @@ export default defineConfig({
     // asks for it.
     ...(process.env.E2E_DEMO
       ? [{ name: 'demo', testMatch: ['**/demo.spec.ts'] }]
+      : []),
+    // The #513 scale benchmark: minutes to an hour per run, driven by
+    // e2e-scale.yml one profile at a time. Same opt-in shape as demo.
+    ...(process.env.E2E_SCALE
+      ? [{ name: 'scale', testMatch: ['**/scale.spec.ts'] }]
       : []),
   ],
   use: {

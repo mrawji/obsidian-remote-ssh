@@ -1,0 +1,136 @@
+name: E2E scale (#513)
+
+# How a big vault behaves end to end: connect, tree, metadataCache parse,
+# bytes over the wire, UI freezes, cold start vs relaunch. One job per
+# (vault size × link profile). It reports; a slow pass is a finding, not a
+# failure. See plugin/e2e/scale.spec.ts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: 'Vault sizes, comma-separated: s, m, l, xl-md, xl-mixed'
+        required: false
+        default: 's,m,l'
+      nets:
+        description: 'Link profiles, comma-separated: lan, wan'
+        required: false
+        default: 'lan,wan'
+      budget_min:
+        description: 'Per-pass budget in minutes'
+        required: false
+        default: '30'
+  schedule:
+    # Sundays, after the weekly E2E run.
+    - cron: '0 12 * * 0'
+  # A PR that touches the benchmark runs the smallest size only, to prove the
+  # harness works before anyone spends an hour on the big ones.
+  pull_request:
+    paths:
+      - '.github/workflows/e2e-scale.yml'
+      - 'plugin/e2e/scale.spec.ts'
+      - 'plugin/e2e/helpers/scale-fixture.ts'
+      - 'plugin/e2e/helpers/netem.ts'
+
+concurrency:
+  group: e2e-scale-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      profiles: ${{ steps.m.outputs.profiles }}
+      nets: ${{ steps.m.outputs.nets }}
+    steps:
+      - id: m
+        env:
+          PROFILES: ${{ inputs.profiles || (github.event_name == 'pull_request' && 's' || 's,m,l,xl-md,xl-mixed') }}
+          NETS: ${{ inputs.nets || 'lan,wan' }}
+        run: |
+          echo "profiles=$(jq -cn --arg s "$PROFILES" '$s | split(",") | map(gsub(" ";""))')" >> "$GITHUB_OUTPUT"
+          echo "nets=$(jq -cn --arg s "$NETS" '$s | split(",") | map(gsub(" ";""))')" >> "$GITHUB_OUTPUT"
+
+  scale:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        profile: ${{ fromJSON(needs.matrix.outputs.profiles) }}
+        net: ${{ fromJSON(needs.matrix.outputs.nets) }}
+    name: Scale (${{ matrix.profile }} / ${{ matrix.net }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk for the xl fixtures (5 GB)
+        if: startsWith(matrix.profile, 'xl')
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+      - run: npm ci
+      - name: Build plugin
+        run: node esbuild.config.mjs production
+      - name: Build server daemon
+        run: npm run build:server
+      - name: Bring up test sshd
+        run: npm run sshd:start
+      - name: Cache Obsidian AppImage
+        id: obsidian-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/obsidian/Obsidian.AppImage
+          key: obsidian-appimage-1.8.9-v2
+      - name: Download Obsidian AppImage
+        if: steps.obsidian-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/obsidian
+          curl -fL -o ~/obsidian/Obsidian.AppImage \
+            "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.8.9/Obsidian-1.8.9.AppImage"
+          chmod +x ~/obsidian/Obsidian.AppImage
+      - name: Extract AppImage (no FUSE in CI)
+        run: |
+          cd ~/obsidian
+          ./Obsidian.AppImage --appimage-extract >/dev/null
+      - name: Start Xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          Xvfb :99 -screen 0 1280x1024x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+      - name: Run scale benchmark
+        env:
+          OBSIDIAN_PATH: ~/obsidian/squashfs-root/obsidian
+          DISPLAY: ':99'
+          E2E_SCALE: '1'
+          SCALE_PROFILE: ${{ matrix.profile }}
+          SCALE_NET: ${{ matrix.net }}
+          SCALE_BUDGET_MIN: ${{ inputs.budget_min || '30' }}
+        run: npx playwright test --config e2e/playwright.config.ts --project=scale
+      - name: Publish summary
+        if: always()
+        run: cat scale-results/*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no scale report written" >> "$GITHUB_STEP_SUMMARY"
+      - name: Tear down test sshd
+        if: always()
+        run: npm run sshd:stop
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scale-${{ matrix.profile }}-${{ matrix.net }}-${{ github.run_id }}
+          path: plugin/scale-results/
+          retention-days: 90

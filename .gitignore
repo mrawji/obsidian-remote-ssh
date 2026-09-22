@@ -38,3 +38,5 @@ docker/test-vault/*
 public/
 # Quartz framework source — fetched in CI from docs/quartz-framework branch
 quartz/
+
+plugin/scale-results/
