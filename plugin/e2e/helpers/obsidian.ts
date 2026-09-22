@@ -347,6 +347,12 @@ async function killExistingObsidian(): Promise<void> {
  * Register the scaffold vault in Obsidian's app config (`obsidian.json`)
  * and mark it as the only `open: true` vault so Obsidian opens it on
  * launch. Returns a restore function that puts back the original config.
+ *
+ * The id is derived from the vault PATH, and an existing entry for that
+ * path is reused. Obsidian uses this id as `app.appId`, and its metadata
+ * cache lives in IndexedDB under `<appId>-cache`. A random id per launch
+ * therefore gave every launch a brand-new, empty cache — which looks
+ * exactly like "Obsidian refuses to reuse its index" and is not (#513).
  */
 function registerVault(vaultPath: string): () => void {
   const configPath = path.join(
@@ -372,10 +378,14 @@ function registerVault(vaultPath: string): () => void {
     delete config.vaults[id].open;
   }
 
-  // Add scaffold vault as open
-  const vaultId = crypto.randomBytes(8).toString('hex');
+  // Add scaffold vault as open, under a stable id for this path.
+  const normalised = process.platform === 'win32' ? vaultPath.replace(/\//g, '\\') : vaultPath;
+  const existing = Object.entries(config.vaults ?? {} as Record<string, { path?: string }>)
+    .find(([, v]) => (v as { path?: string }).path === normalised)?.[0];
+  const vaultId = existing
+    ?? crypto.createHash('sha256').update(normalised).digest('hex').slice(0, 16);
   config.vaults[vaultId] = {
-    path: process.platform === 'win32' ? vaultPath.replace(/\//g, '\\') : vaultPath,
+    path: normalised,
     ts: Date.now(),
     open: true,
   };
