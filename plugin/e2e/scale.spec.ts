@@ -81,6 +81,8 @@ interface PassResult {
   maxEvalMs: number | null;
   frozenSamples: number;
   budgetExceeded: boolean;
+  /** How the launch ended: a real window close, or the harness's signal. */
+  shutdown?: 'closed' | 'signalled';
   reads: number | null;
   readAvgMs: number | null;
   readInflightMax: number | null;
@@ -215,6 +217,32 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
 }
 
 /**
+ * Close Obsidian the way a user does, and only fall back to the harness's
+ * SIGTERM if that doesn't take.
+ *
+ * This matters for what is being measured. Obsidian writes its metadata cache
+ * to IndexedDB with `durability: "relaxed"`, so a process that is signalled
+ * away can lose the last writes — and then the next launch has no cache to
+ * reuse, whatever the plugin did. #513 concluded "reuse is genuinely refused"
+ * from a harness that killed Obsidian, so the conclusion has to be re-taken on
+ * a clean shutdown.
+ */
+async function quitObsidian(handle: ObsidianHandle): Promise<'closed' | 'signalled'> {
+  try {
+    await handle.page.evaluate(() => { window.close(); });
+  } catch {
+    // The window may already be gone; fall through to the wait.
+  }
+  const exited = await new Promise<boolean>((resolve) => {
+    if (handle.process.exitCode !== null) return resolve(true);
+    const timer = setTimeout(() => resolve(false), 20_000);
+    handle.process.on('exit', () => { clearTimeout(timer); resolve(true); });
+  });
+  await handle.cleanup().catch(() => { /* best effort */ });
+  return exited ? 'closed' : 'signalled';
+}
+
+/**
  * What metadataCache kept through startup: its IndexedDB-backed `fileCache`
  * (path → mtime/size/hash) against the model's `TFile.stat`. On a relaunch,
  * a note is read again unless both match and the hash's metadata is present.
@@ -279,10 +307,11 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     await new Promise((r) => setTimeout(r, SAMPLE_EVERY_MS));
   }
 
-  // Let IndexedDB's relaxed-durability writes land before the process goes,
-  // so the next pass measures reuse, not a lost save.
+  // Let IndexedDB's relaxed-durability writes land, then close the window
+  // rather than signalling the process, so the next pass measures reuse.
   await new Promise((r) => setTimeout(r, 5_000));
-  await obsidian.cleanup();
+  const how = await quitObsidian(obsidian);
+  console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] shutdown: ${how}`);
   obsidian = null;
   for (const e of readLogEntries(logPathFor(shadowVaultPath))) {
     if (/TreeSnapshot|reconciled|BackgroundIndexer: (complete|full walk)/.test(e.msg ?? '')) {
@@ -304,6 +333,7 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     maxEvalMs: evals.length ? Math.max(...evals) : null,
     frozenSamples: samples.filter((s) => s.evalMs === null).length,
     budgetExceeded,
+    shutdown: how,
     reads: last?.reads ?? null,
     readAvgMs: last?.readAvgMs ?? null,
     readInflightMax: last?.readInflightMax ?? null,
