@@ -1,6 +1,6 @@
 {
   "name": "obsidian-remote-ssh",
-  "version": "1.1.8-beta.13",
+  "version": "1.1.8-beta.16",
   "description": "VS Code Remote SSH-like experience for Obsidian",
   "main": "main.js",
   "scripts": {
@@ -36,7 +36,7 @@
   "author": "",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.22.2"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
@@ -50,14 +50,14 @@
     "@types/ssh2": "^1.15.6",
     "@typescript-eslint/eslint-plugin": "^8.70.0",
     "@typescript-eslint/parser": "^8.59.2",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^5.0.1",
     "esbuild": "^0.28.2",
     "eslint": "^10.11.0",
     "eslint-plugin-obsidianmd": "^0.4.2",
     "fast-check": "^4.10.1",
-    "jsdom": "^29.1.1",
+    "jsdom": "^30.1.1",
     "obsidian": "~1.12.3",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.5"
+    "vitest": "^5.0.1"
   }
 }
