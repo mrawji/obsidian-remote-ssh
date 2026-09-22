@@ -1,12 +1,17 @@
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { CONTAINER, dockerExec } from './netem';
 
 /**
  * Deterministic large-vault fixtures for `scale.spec.ts` (#513).
  *
- * Written straight onto the HOST side of the sshd bind mount
- * (`docker/test-vault` → `/home/tester/vault`), so seeding 5 GB costs disk
- * throughput, not SSH round-trips.
+ * Built in a host temp dir and `docker cp`'d into the sshd container, so
+ * seeding 5 GB costs disk throughput, not SSH round-trips. It can't be written
+ * onto the bind mount directly: the container's entrypoint hands that tree to
+ * `tester` (uid 1000), and the plugin needs `tester` to own it because it
+ * writes per-device config into the remote vault.
  *
  * Notes look like real notes as far as `metadataCache` cares: frontmatter,
  * headings, tags and `[[links]]` to other notes in the same fixture. Link
@@ -39,9 +44,6 @@ export const SCALE_PROFILES: Record<string, ScaleProfile> = {
   },
 };
 
-/** Host side of the sshd bind mount (see docker-compose.yml). */
-export const HOST_VAULT_ROOT = path.resolve(__dirname, '..', '..', '..', 'docker', 'test-vault');
-/** The same directory as the remote sees it. */
 export const REMOTE_VAULT_ROOT = '/home/tester/vault';
 
 const FOLDERS_PER_LEVEL = 10;
@@ -87,27 +89,39 @@ function noteBody(i: number, p: ScaleProfile, rand: () => number): string {
 export interface SeededFixture {
   /** Remote path to use as the profile's `remotePath`. */
   remotePath: string;
-  hostPath: string;
   /** Markdown files in the fixture, including the root index note. */
   markdownFiles: number;
   markdownBytes: number;
   attachmentBytes: number;
 }
 
+const MARKER = '.scale-complete.json';
+
 /**
- * Build the fixture under `docker/test-vault/scale-<profile>/`. Skips the work
- * when a previous run left a complete copy (the marker file is written last).
+ * Put the fixture at `/home/tester/vault/scale-<profile>/` in the sshd
+ * container. Skips the work when a previous run left a complete copy (the
+ * marker file is copied in last).
  */
 export function seedScaleFixture(p: ScaleProfile): SeededFixture {
   const dir = `scale-${p.name}`;
-  const hostPath = path.join(HOST_VAULT_ROOT, dir);
-  const marker = path.join(hostPath, '.scale-complete.json');
-  if (fs.existsSync(marker)) {
-    return JSON.parse(fs.readFileSync(marker, 'utf8')) as SeededFixture;
-  }
-  fs.rmSync(hostPath, { recursive: true, force: true });
-  fs.mkdirSync(hostPath, { recursive: true });
+  const remotePath = `${REMOTE_VAULT_ROOT}/${dir}`;
+  try {
+    return JSON.parse(dockerExec(['cat', `${remotePath}/${MARKER}`])) as SeededFixture;
+  } catch { /* not seeded yet */ }
 
+  const hostPath = fs.mkdtempSync(path.join(os.tmpdir(), `${dir}-`));
+  try {
+    const seeded = buildFixture(p, hostPath, remotePath);
+    dockerExec(['rm', '-rf', remotePath]);
+    execFileSync('docker', ['cp', `${hostPath}/.`, `${CONTAINER}:${remotePath}`], { stdio: 'ignore' });
+    dockerExec(['chown', '-R', 'tester:tester', remotePath]);
+    return seeded;
+  } finally {
+    fs.rmSync(hostPath, { recursive: true, force: true });
+  }
+}
+
+function buildFixture(p: ScaleProfile, hostPath: string, remotePath: string): SeededFixture {
   const rand = rng(0x5eed + p.notes);
   let markdownBytes = 0;
   for (let i = 0; i < p.notes; i++) {
@@ -141,12 +155,11 @@ export function seedScaleFixture(p: ScaleProfile): SeededFixture {
   }
 
   const seeded: SeededFixture = {
-    remotePath: `${REMOTE_VAULT_ROOT}/${dir}`,
-    hostPath,
+    remotePath,
     markdownFiles: p.notes + 1,
     markdownBytes,
     attachmentBytes,
   };
-  fs.writeFileSync(marker, JSON.stringify(seeded));
+  fs.writeFileSync(path.join(hostPath, MARKER), JSON.stringify(seeded));
   return seeded;
 }

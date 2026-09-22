@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
  * unshaped.
  */
 
-const CONTAINER = 'obsidian-remote-ssh-test-sshd';
+export const CONTAINER = 'obsidian-remote-ssh-test-sshd';
 const IFACE = 'eth0';
 
 export interface NetProfile {
@@ -27,8 +27,11 @@ export const NET_PROFILES: Record<string, NetProfile> = {
   wan: { name: 'wan', delayMs: 40, rateMbit: 100 },
 };
 
-function dockerExec(args: string[]): string {
-  return execFileSync('docker', ['exec', CONTAINER, ...args], { encoding: 'utf8' }).trim();
+export function dockerExec(args: string[]): string {
+  return execFileSync('docker', ['exec', CONTAINER, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
 }
 
 export function applyNetProfile(p: NetProfile): void {
