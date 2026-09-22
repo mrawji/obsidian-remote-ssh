@@ -67,6 +67,9 @@ interface Sample {
   readMaxMs: number | null;
   /** Most `vault.readBinary` calls in flight at once. 1 = strictly sequential. */
   readInflightMax: number | null;
+  /** metadataCache's fileCache: entries, and how many carry a parsed hash. */
+  cacheEntries: number | null;
+  cacheWithHash: number | null;
 }
 
 interface PassResult {
@@ -186,7 +189,12 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
       }
       const rs = w.__SCALE_READS__;
       const files = app?.vault?.getMarkdownFiles?.() ?? [];
-      const mc = app?.metadataCache;
+      const mc = app?.metadataCache as {
+        getFileCache?: (f: MdFile) => unknown;
+        isCacheClean?: () => boolean;
+        fileCache?: Record<string, { hash: string }>;
+      } | undefined;
+      const fc = Object.values(mc?.fileCache ?? {});
       let parsed = 0;
       for (const f of files) if (mc?.getFileCache?.(f)) parsed++;
       return {
@@ -197,6 +205,8 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         readAvgMs: rs && rs.count ? Math.round(rs.totalMs / rs.count) : null,
         readMaxMs: rs ? Math.round(rs.maxMs) : null,
         readInflightMax: rs?.inflightMax ?? 0,
+        cacheEntries: fc.length,
+        cacheWithHash: fc.filter((e) => e.hash).length,
       };
     }),
     EVAL_TIMEOUT_MS,
@@ -213,6 +223,8 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
     readAvgMs: r === TIMED_OUT ? null : r.readAvgMs,
     readMaxMs: r === TIMED_OUT ? null : r.readMaxMs,
     readInflightMax: r === TIMED_OUT ? null : r.readInflightMax,
+    cacheEntries: r === TIMED_OUT ? null : r.cacheEntries,
+    cacheWithHash: r === TIMED_OUT ? null : r.cacheWithHash,
   };
 }
 
@@ -299,7 +311,8 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
       `[scale ${PROFILE.name}/${NET.name} ${pass}] t=${(s.tMs / 1000).toFixed(0)}s ` +
       `model=${s.mdInModel}/${expected} parsed=${s.parsed} clean=${s.clean} ` +
       `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms ` +
-      `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax}`,
+      `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax} ` +
+      `cache=${s.cacheEntries}/${s.cacheWithHash} hashed`,
     );
     // Two clean samples in a row, so a late straggler read is still counted.
     if (samples.length >= 2 && isClean(s) && isClean(samples[samples.length - 2])) break;
