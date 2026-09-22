@@ -59,6 +59,12 @@ interface Sample {
   mdInModel: number | null;
   parsed: number | null;
   clean: boolean | null;
+  /** `vault.readBinary` calls so far this launch: what metadataCache reads through. */
+  reads: number | null;
+  readAvgMs: number | null;
+  readMaxMs: number | null;
+  /** Most `vault.readBinary` calls in flight at once. 1 = strictly sequential. */
+  readInflightMax: number | null;
 }
 
 interface PassResult {
@@ -73,6 +79,9 @@ interface PassResult {
   maxEvalMs: number | null;
   frozenSamples: number;
   budgetExceeded: boolean;
+  reads: number | null;
+  readAvgMs: number | null;
+  readInflightMax: number | null;
 }
 
 let obsidian: ObsidianHandle | null = null;
@@ -140,6 +149,37 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
           };
         };
       }).app;
+      // Time every vault.readBinary, the call metadataCache's sequential work
+      // queue makes per note. Installed on the first sample, before the
+      // remote tree lands, so no read is missed.
+      interface ReadStats {
+        count: number; totalMs: number; maxMs: number; inflight: number; inflightMax: number;
+      }
+      const w = window as unknown as { __SCALE_READS__?: ReadStats };
+      const vault = (app?.vault ?? null) as
+        | { readBinary?: (f: MdFile) => Promise<ArrayBuffer>; __scaleWrapped?: boolean }
+        | null;
+      if (vault?.readBinary && !vault.__scaleWrapped) {
+        const stats: ReadStats = { count: 0, totalMs: 0, maxMs: 0, inflight: 0, inflightMax: 0 };
+        w.__SCALE_READS__ = stats;
+        const orig = vault.readBinary.bind(vault);
+        vault.readBinary = async (f: MdFile) => {
+          const t = performance.now();
+          stats.inflight++;
+          stats.inflightMax = Math.max(stats.inflightMax, stats.inflight);
+          try {
+            return await orig(f);
+          } finally {
+            stats.inflight--;
+            const d = performance.now() - t;
+            stats.count++;
+            stats.totalMs += d;
+            stats.maxMs = Math.max(stats.maxMs, d);
+          }
+        };
+        vault.__scaleWrapped = true;
+      }
+      const rs = w.__SCALE_READS__;
       const files = app?.vault?.getMarkdownFiles?.() ?? [];
       const mc = app?.metadataCache;
       let parsed = 0;
@@ -148,6 +188,10 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         mdInModel: files.length,
         parsed,
         clean: typeof mc?.isCacheClean === 'function' ? mc.isCacheClean() : null,
+        reads: rs?.count ?? 0,
+        readAvgMs: rs && rs.count ? Math.round(rs.totalMs / rs.count) : null,
+        readMaxMs: rs ? Math.round(rs.maxMs) : null,
+        readInflightMax: rs?.inflightMax ?? 0,
       };
     }),
     EVAL_TIMEOUT_MS,
@@ -160,6 +204,10 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
     mdInModel: r === TIMED_OUT ? null : r.mdInModel,
     parsed: r === TIMED_OUT ? null : r.parsed,
     clean: r === TIMED_OUT ? null : r.clean,
+    reads: r === TIMED_OUT ? null : r.reads,
+    readAvgMs: r === TIMED_OUT ? null : r.readAvgMs,
+    readMaxMs: r === TIMED_OUT ? null : r.readMaxMs,
+    readInflightMax: r === TIMED_OUT ? null : r.readInflightMax,
   };
 }
 
@@ -182,7 +230,8 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     console.warn(
       `[scale ${PROFILE.name}/${NET.name} ${pass}] t=${(s.tMs / 1000).toFixed(0)}s ` +
       `model=${s.mdInModel}/${expected} parsed=${s.parsed} clean=${s.clean} ` +
-      `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms`,
+      `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms ` +
+      `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax}`,
     );
     // Two clean samples in a row, so a late straggler read is still counted.
     if (samples.length >= 2 && isClean(s) && isClean(samples[samples.length - 2])) break;
@@ -195,6 +244,7 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
 
   const parsedSample = samples.find(isParsed);
   const evals = samples.map((s) => s.evalMs).filter((v): v is number => v !== null);
+  const last = [...samples].reverse().find((s) => s.reads !== null);
   return {
     pass,
     samples,
@@ -206,6 +256,9 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     maxEvalMs: evals.length ? Math.max(...evals) : null,
     frozenSamples: samples.filter((s) => s.evalMs === null).length,
     budgetExceeded,
+    reads: last?.reads ?? null,
+    readAvgMs: last?.readAvgMs ?? null,
+    readInflightMax: last?.readInflightMax ?? null,
   };
 }
 
@@ -227,7 +280,8 @@ function writeReport(): void {
     `| ${p.pass} | ${fmtS(p.connectedMs)} | ${fmtS(p.treeMs)} | ${fmtS(p.parsedMs)} | ` +
     `${fmtS(p.cleanMs)} | ${(p.bytesToParsed / 1e6).toFixed(0)} MB | ` +
     `${(p.bytesToParsed / fixture.markdownBytes).toFixed(2)} | ` +
-    `${p.maxEvalMs ?? '-'} ms | ${p.frozenSamples} | ${p.budgetExceeded ? 'yes' : 'no'} |`,
+    `${p.maxEvalMs ?? '-'} ms | ${p.frozenSamples} | ${p.budgetExceeded ? 'yes' : 'no'} | ` +
+    `${p.reads ?? '-'} | ${p.readAvgMs ?? '-'} ms | ${p.readInflightMax ?? '-'} |`,
   );
   const md = [
     `### Scale: \`${PROFILE.name}\` over \`${NET.name}\``,
@@ -237,8 +291,8 @@ function writeReport(): void {
       ` · link: ${NET.delayMs ?? 0} ms delay, ${NET.rateMbit ?? 'unshaped'} Mbit` +
       ` · budget ${BUDGET_MS / 60_000} min/pass`,
     '',
-    '| pass | connected | tree | parsed | clean | bytes sent | ÷ markdown | max eval | frozen samples | over budget |',
-    '|---|---|---|---|---|---|---|---|---|---|',
+    '| pass | connected | tree | parsed | clean | bytes sent | ÷ markdown | max eval | frozen samples | over budget | reads | avg read | reads in flight (max) |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|',
     ...rows,
     '',
   ].join('\n');
