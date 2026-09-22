@@ -261,10 +261,11 @@ async function quitObsidian(handle: ObsidianHandle): Promise<'closed' | 'signall
  * Key names and stats only, never content.
  */
 async function cacheAtStart(page: Page): Promise<unknown> {
-  return withTimeout(page.evaluate(() => {
+  return withTimeout(page.evaluate(async () => {
     interface Stat { mtime: number; size: number }
     const app = (window as unknown as {
       app?: {
+        appId?: string;
         vault?: { getMarkdownFiles?: () => Array<{ path: string; stat: Stat }> };
         metadataCache?: {
           initialized?: boolean;
@@ -277,7 +278,15 @@ async function cacheAtStart(page: Page): Promise<unknown> {
     const fc = mc?.fileCache ?? {};
     const files = app?.vault?.getMarkdownFiles?.() ?? [];
     const entries = Object.values(fc);
+    // The metadata cache lives in IndexedDB under `<appId>-cache`. If appId
+    // is not stable per vault, every launch starts from an empty cache no
+    // matter what anyone does.
+    const dbs = typeof indexedDB.databases === 'function'
+      ? (await indexedDB.databases()).map((d) => d.name ?? '?')
+      : ['unsupported'];
     return {
+      appId: app?.appId ?? null,
+      databases: dbs,
       initialized: mc?.initialized ?? null,
       modelMarkdown: files.length,
       fileCacheEntries: entries.length,
