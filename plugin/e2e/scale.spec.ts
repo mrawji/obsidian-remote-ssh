@@ -261,8 +261,19 @@ async function probeAdapter(page: Page, paths: string[]): Promise<unknown> {
     // left is the revalidating stat plus our own overhead.
     const rereadMs: number[] = [];
     for (const p of ps) rereadMs.push(await time(() => adapter.readBinary!(p)));
+    // Controls: if a bare setTimeout(0) also takes tens of ms, the renderer's
+    // task queue is being throttled (an occluded Electron window under Xvfb)
+    // and the RPC figure says nothing about a real desktop.
+    const timerMs: number[] = [];
+    for (let i = 0; i < 30; i++) timerMs.push(await time(() => new Promise((r) => setTimeout(r, 0))));
+    const microMs: number[] = [];
+    for (let i = 0; i < 30; i++) microMs.push(await time(() => Promise.resolve()));
     const avg = (xs: number[]) => Math.round(xs.reduce((a, b) => a + b, 0) / (xs.length || 1));
-    return { n: ps.length, statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs) };
+    return {
+      n: ps.length, statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs),
+      setTimeout0AvgMs: avg(timerMs), microtaskAvgMs: avg(microMs),
+      hidden: document.hidden, visibility: document.visibilityState,
+    };
   }, paths), EVAL_TIMEOUT_MS * 6).catch((): typeof TIMED_OUT => TIMED_OUT);
 }
 
