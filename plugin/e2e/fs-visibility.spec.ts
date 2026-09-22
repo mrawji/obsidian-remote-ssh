@@ -29,6 +29,14 @@ import { fileURLToPath } from 'node:url';
  * #429 (the OPEN half) — "Claudian creates .md files in the local folder
  * instead of the remote vault".
  *
+ * STATUS (2026-09): the defect tests below are `test.fixme`. Raw Node `fs`
+ * under `basePath` is a documented, out-of-scope limitation (see
+ * docs/en/user-guide/plugin-compatibility.md). Both fixes named below were
+ * attempted in #481–#488 and reverted: patching `fs` in the renderer cannot
+ * reach child processes (Claudian's agent), and a local→remote watcher turns
+ * the plugin into a two-way sync engine. The assertions are kept unweakened so
+ * they can be re-armed if the design is ever revisited.
+ *
  * READ THIS BEFORE TOUCHING AN ASSERTION
  * ======================================
  * MOST OF THIS SPEC IS EXPECTED TO FAIL against the current product. That is
@@ -382,7 +390,7 @@ test.describe('a plugin\'s view of the filesystem must be the REMOTE vault (#429
    * remote assertion's red is conclusively "wrong destination" and not "the
    * write failed".
    */
-  test('a file a plugin writes under adapter.basePath reaches the REMOTE vault', async () => {
+  test.fixme('a file a plugin writes under adapter.basePath reaches the REMOTE vault', async () => {
     const wrote = await obsidian.page.evaluate((rel) => {
       const req = (window as unknown as { require?: (m: string) => unknown }).require;
       if (typeof req !== 'function') throw new Error('window.require is unavailable');
@@ -468,7 +476,7 @@ test.describe('a plugin\'s view of the filesystem must be the REMOTE vault (#429
    * it is in the model by construction — asserted FIRST, so a red on the `fs`
    * read cannot be dismissed as "it just hadn't synced yet".
    */
-  test('a note that exists on the REMOTE is readable via raw fs under basePath', async () => {
+  test.fixme('a note that exists on the REMOTE is readable via raw fs under basePath', async () => {
     await expect
       .poll(() => inVaultModel(obsidian.page, REMOTE_ONLY_NOTE), {
         message:
@@ -521,7 +529,7 @@ test.describe('a plugin\'s view of the filesystem must be the REMOTE vault (#429
    * distinguishes "wrong path" from "right-looking path with no file behind it"
    * — the latter being the actual product bug.
    */
-  test('getFullPath returns a path that resolves to the file', async () => {
+  test.fixme('getFullPath returns a path that resolves to the file', async () => {
     const basePath = String(await readBasePath(obsidian.page));
 
     const fullPath = await obsidian.page.evaluate((rel) => {
@@ -574,7 +582,7 @@ test.describe('a plugin\'s view of the filesystem must be the REMOTE vault (#429
    * `file://` surface plugins hand to `<img>`, `shell.openPath`, external
    * editors and `URL`-based tooling — and it resolves to nothing.
    */
-  test('getFilePath returns a file:// URL that resolves', async () => {
+  test.fixme('getFilePath returns a file:// URL that resolves', async () => {
     const filePath = await obsidian.page.evaluate((rel) => {
       const adapter = (window as unknown as {
         app?: { vault?: { adapter?: { getFilePath?: (p: string) => unknown } } };
@@ -609,7 +617,7 @@ test.describe('a plugin\'s view of the filesystem must be the REMOTE vault (#429
    * actual listing is quoted in the failure message, because the shape of what
    * a plugin DOES see is the diagnosis.
    */
-  test('a plugin reading the vault via fs.readdirSync(basePath) sees the vault\'s notes', async () => {
+  test.fixme('a plugin reading the vault via fs.readdirSync(basePath) sees the vault\'s notes', async () => {
     const entries = await obsidian.page.evaluate(() => {
       const req = (window as unknown as { require?: (m: string) => unknown }).require;
       if (typeof req !== 'function') throw new Error('window.require is unavailable');
@@ -643,7 +651,7 @@ test.describe('a plugin\'s view of the filesystem must be the REMOTE vault (#429
    * load it. This test runs LAST for that reason — it leaves behind a fresh
    * window that no earlier test depends on.
    */
-  test('REAL-PLUGIN REPRODUCTION: a plugin\'s fs.writeFileSync in onload() reaches the remote', async () => {
+  test.fixme('REAL-PLUGIN REPRODUCTION: a plugin\'s fs.writeFileSync in onload() reaches the remote', async () => {
     expect(
       fs.existsSync(path.join(shadowVaultPath, '.obsidian', 'plugins', FS_PLUGIN_ID, 'main.js')),
       'the reproduction plugin was never staged onto the shadow disk from the remote — ' +

@@ -23,8 +23,6 @@ function isThumbnailEligible(vaultPath: string): boolean {
 }
 import * as fs from 'fs';
 import * as nodePath from 'path';
-import { pathToFileURL } from 'url';
-import type { MaterializedCache } from './MaterializedCache';
 import type { RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
@@ -165,115 +163,6 @@ export class SftpDataAdapter {
    */
   getBasePath(): string {
     return this.shadowBasePath;
-  }
-
-  /**
-   * Bounded on-demand disk cache. Null (the default) leaves every
-   * materialisation call a no-op, which is what unit tests and any
-   * non-shadow caller want.
-   */
-  private materializedCache: MaterializedCache | null = null;
-
-  setMaterializedCache(cache: MaterializedCache | null): void {
-    this.materializedCache = cache;
-  }
-
-  /**
-   * True for anything under the vault's config dir.
-   *
-   * The disk cache must never take ownership of that tree, and the
-   * reason is a bug this guard exists to prevent: `pullPluginBinaries`
-   * fetches `<configDir>/plugins/<id>/main.js` THROUGH this adapter, so
-   * the read-through below would file it in the cache ledger — and the
-   * ledger deletes what it owns on eviction and on disconnect. The next
-   * launch would then find the plugin gone and silently not load it.
-   *
-   * `<configDir>/**` already has an owner: `writeThroughConfig` on the
-   * way out, the bootstrap's pull/push on the way in. Both keep real
-   * files there on purpose.
-   */
-  private isConfigTree(normalizedPath: string): boolean {
-    const dir = this.pathMapper?.configDir;
-    if (!dir) return false;
-    const rel = normalizedPath.startsWith('/') ? normalizedPath.slice(1) : normalizedPath;
-    return rel === dir || rel.startsWith(`${dir}/`);
-  }
-
-  /** Read-through into the disk cache, minus the tree it must not own. */
-  private cacheOnRead(normalizedPath: string, buf: Buffer): void {
-    if (this.isConfigTree(normalizedPath)) return;
-    this.materializedCache?.put(normalizedPath, buf);
-  }
-
-  /**
-   * Absolute path of a vault file on this device — and, unlike the
-   * stock `FileSystemAdapter`, a path that has a real file behind it.
-   *
-   * The stock implementation just joins onto the base, which over a
-   * virtual note tree means handing a plugin a path to nothing (#429).
-   * Asking for a full path IS the request that materialises the file:
-   * we fetch it synchronously through the ResourceBridge and write it
-   * into the bounded cache, so `fs.readFileSync(adapter.getFullPath(p))`
-   * works for the file that was asked about. Files over the cache
-   * limits are not fetched, and callers still get the joined path —
-   * exactly what they got before, no worse.
-   */
-  getFullPath(normalizedPath: string): string {
-    this.materializeSync(normalizedPath);
-    return nodePath.join(this.shadowBasePath, normalizedPath);
-  }
-
-  /**
-   * `file://` URL for a vault file. Same contract as
-   * {@link getFullPath}: the file is materialised first, because what
-   * follows this URL is usually `<img>`, `shell.openPath` or an
-   * external editor — none of which can be intercepted.
-   */
-  getFilePath(normalizedPath: string): string {
-    return pathToFileURL(this.getFullPath(normalizedPath)).href;
-  }
-
-  /**
-   * Put one file on the shadow disk, synchronously, and report whether
-   * it is there afterwards. This is the single "a request came in"
-   * entry point: `getFullPath` / `getFilePath` call it, and so does the
-   * patched `fs.readFileSync`. Never throws — a caller that wanted a
-   * path still gets one, and a caller that wanted bytes falls back to
-   * the real filesystem's own ENOENT.
-   */
-  materializeSync(normalizedPath: string): boolean {
-    const cache = this.materializedCache;
-    if (!cache || cache.disabled()) return false;
-    if (this.isConfigTree(normalizedPath)) {
-      // Never ours (see isConfigTree); answer from the real disk only.
-      return Boolean(this.shadowBasePath)
-        && fs.existsSync(nodePath.join(this.shadowBasePath, normalizedPath));
-    }
-    if (cache.has(normalizedPath)) return true;
-    // Already real on disk — materialised earlier, or written by
-    // somebody. One stat, no network.
-    if (this.shadowBasePath
-      && fs.existsSync(nodePath.join(this.shadowBasePath, normalizedPath))) {
-      return true;
-    }
-
-    // The ONLY synchronous source of bytes is the in-memory read cache
-    // (the note was opened, or written, this session). There is no
-    // synchronous way to reach the remote from here, and the obvious
-    // one is a trap: `ResourceBridge` runs its HTTP server on THIS
-    // event loop, so a blocking request to it can never be answered —
-    // the thread that would accept the connection is the thread doing
-    // the waiting. An earlier revision of this method shipped exactly
-    // that, and it hung connect until the request timed out.
-    //
-    // So the synchronous surface serves what is already here, and
-    // on-demand fetching lives on the async path (`fs.promises.*`,
-    // which can simply await `readBinary`).
-    const cached = this.readCache.peek(this.toRemote(normalizedPath));
-    if (cached) {
-      return cache.put(normalizedPath, cached.data);
-    }
-    return false;
   }
 
   /**
@@ -489,7 +378,6 @@ export class SftpDataAdapter {
 
   async read(normalizedPath: string): Promise<string> {
     const buf = await this.readBuffer(normalizedPath);
-    this.cacheOnRead(normalizedPath, buf);
     const text = buf.toString('utf8');
     // Snapshot the just-read content so a subsequent conflicting write
     // can show the user a real ancestor pane in the 3-way modal.
@@ -502,7 +390,6 @@ export class SftpDataAdapter {
 
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
     const buf = await this.readBuffer(normalizedPath);
-    this.cacheOnRead(normalizedPath, buf);
     // Copy into a fresh ArrayBuffer so callers can't accidentally mutate
     // the cached Buffer's underlying memory through the returned view.
     const ab = new ArrayBuffer(buf.byteLength);

@@ -42,49 +42,29 @@ test.describe('Remote SSH E2E smoke', () => {
     await expect(workspace).toBeVisible({ timeout: 30_000 });
   });
 
-  test('2 — plugin settings tab is accessible', async () => {
-    const { page } = obsidian;
-
-    // Open Settings (Ctrl+,) and assert the Remote SSH plugin tab
-    // is reachable. The previous version of this test only
-    // annotated when the tab was visible — it never failed, so a
-    // missing tab would silently slip through.
-    await page.keyboard.press('Control+,');
-    const settingsModal = page.locator('.modal-container');
-    await expect(settingsModal).toBeVisible({ timeout: 10_000 });
-
-    const pluginTab = settingsModal
-      .locator('.vertical-tab-nav-item:has-text("Remote SSH")')
-      .first();
-    await expect(pluginTab).toBeVisible({ timeout: 5_000 });
-
-    // Close settings so subsequent tests start from a clean state.
-    await page.keyboard.press('Escape');
-    await expect(settingsModal).toBeHidden({ timeout: 5_000 });
+  // 2 and 3 read Obsidian's registries instead of driving the UI. Since
+  // Obsidian 1.13 Settings opens in its own window (no `.modal-container` on
+  // this page), and under Xvfb a keystroke can go nowhere while the window is
+  // painting. Test 4 still drives the command palette end to end.
+  test('2 — plugin settings tab is registered', async () => {
+    const tabIds = await obsidian.page.evaluate(() => {
+      const app = (window as unknown as {
+        app: { setting: { pluginTabs: Array<{ id: string }> } };
+      }).app;
+      return app.setting.pluginTabs.map((t) => t.id);
+    });
+    expect(tabIds).toContain('remote-ssh');
   });
 
-  test('3 — command palette shows Remote SSH commands', async () => {
-    const { page } = obsidian;
-
-    // Open command palette
-    await page.keyboard.press('Control+P');
-    await page.waitForTimeout(500);
-
-    const palette = page.locator('.prompt');
-    await expect(palette).toBeVisible({ timeout: 10_000 });
-
-    // Type to filter for our commands
-    await page.keyboard.type('Remote SSH');
-    await page.waitForTimeout(500);
-
-    // Check that at least one command appears
-    const suggestions = palette.locator('.suggestion-item');
-    const count = await suggestions.count();
-
-    // Close palette
-    await page.keyboard.press('Escape');
-
-    expect(count).toBeGreaterThan(0);
+  test('3 — Remote SSH commands are registered', async () => {
+    const commandIds = await obsidian.page.evaluate(() => {
+      const app = (window as unknown as {
+        app: { commands: { commands: Record<string, unknown> } };
+      }).app;
+      return Object.keys(app.commands.commands);
+    });
+    expect(commandIds.filter((id) => id.startsWith('remote-ssh:')).length)
+      .toBeGreaterThan(0);
   });
 
   test('4 — connect to remote vault via command palette', async () => {
