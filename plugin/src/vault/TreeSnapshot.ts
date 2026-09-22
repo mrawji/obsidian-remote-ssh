@@ -1,0 +1,131 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import type { RemoteEntry } from './VaultModelBuilder';
+import { logger } from '../util/logger';
+import { errorMessage } from '../util/errorMessage';
+
+/**
+ * A per-device copy of the remote TREE (paths + mtime + size, never content),
+ * so the next launch can put the vault model back before Obsidian's
+ * `metadataCache.initialize()` runs (#513).
+ *
+ * ## Why this has to exist
+ *
+ * Obsidian's startup order is `plugins.initialize()` (our `onload`) →
+ * `vault.load()` → `metadataCache.initialize()`. That last step walks its
+ * IndexedDB cache and, for every cached path that is NOT in the vault model at
+ * that moment, calls `deletePath()`, which also deletes it from IndexedDB. The
+ * shadow vault's disk holds no notes, and the remote tree only arrives after
+ * connect (layout ready or later), so on every start Obsidian threw its whole
+ * cache away and then re-read and re-parsed every note once we registered it.
+ * Measured by `e2e/scale.spec.ts`: ~23 notes/s, the same on a relaunch as on a
+ * cold start.
+ *
+ * Inserting the tree from here, during `onload`, means `initialize()` finds
+ * every note with the same `mtime`/`size` it cached, keeps the entry, and does
+ * not read it. The tree is then reconciled against the real remote walk after
+ * connect (`BackgroundIndexer`'s reconcile), so a stale snapshot costs a
+ * re-read of what changed, never wrong state.
+ *
+ * Only written after a daemon `fs.walk` (the fast path): the SFTP fallback
+ * reports `mtime`/`size` as 0, and a snapshot of zeros would make Obsidian
+ * treat every note as unchanged forever.
+ *
+ * Lives beside `community-plugins.base.json` in
+ * `~/.obsidian-remote/state/<profile>/`: per-device, never synced, outside
+ * every vault (see `ShadowVaultBootstrap.communityPluginsBasePath`).
+ */
+
+const VERSION = 1;
+
+/** One entry, packed: `[path, isDirectory ? 1 : 0, mtime, size]`. ~50 bytes a note. */
+type PackedEntry = [string, 0 | 1, number, number];
+
+interface SnapshotFile {
+  version: number;
+  /** The profile's `remotePath` when this was taken. A different path is a different vault. */
+  remotePath: string;
+  entries: PackedEntry[];
+}
+
+export function treeSnapshotPath(stateRoot: string, stateKey: string): string {
+  return path.join(stateRoot, 'state', stateKey, 'tree-snapshot.json');
+}
+
+/**
+ * The snapshot's entries, parents before children, or null when there is none,
+ * it is unreadable, or it was taken for a different `remotePath`. Synchronous
+ * on purpose: it runs inside `onload`, which Obsidian awaits before
+ * `metadataCache.initialize()`.
+ */
+export function readTreeSnapshot(file: string, remotePath: string): RemoteEntry[] | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<SnapshotFile>;
+    if (parsed.version !== VERSION || parsed.remotePath !== remotePath || !Array.isArray(parsed.entries)) {
+      return null;
+    }
+    const entries: RemoteEntry[] = [];
+    for (const e of parsed.entries) {
+      if (!Array.isArray(e) || typeof e[0] !== 'string' || !e[0]) continue;
+      entries.push({ path: e[0], isDirectory: e[1] === 1, ctime: e[2], mtime: e[2], size: e[3] });
+    }
+    return entries;
+  } catch (e) {
+    logger.warn(`TreeSnapshot: ignoring unreadable ${file} (${errorMessage(e)})`);
+    return null;
+  }
+}
+
+/** Write atomically (tmp + rename), so a crash mid-write leaves the old snapshot. */
+export function writeTreeSnapshot(file: string, remotePath: string, entries: readonly RemoteEntry[]): void {
+  const body: SnapshotFile = {
+    version: VERSION,
+    remotePath,
+    entries: entries.map((e) => [e.path, e.isDirectory ? 1 : 0, e.mtime, e.size]),
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(body));
+  fs.renameSync(tmp, file);
+}
+
+export function deleteTreeSnapshot(file: string): void {
+  try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+}
+
+/** The shape of `vault.getAllLoadedFiles()` entries this needs. */
+export interface LoadedFileLike {
+  path: string;
+  stat?: { mtime: number; size: number };
+  children?: unknown[];
+}
+
+/**
+ * The vault model as snapshot entries, parents before children. Leaves out the
+ * root and the config dir: the root always exists, and `<configDir>` lives on
+ * the shadow disk and is never part of the remote note tree.
+ */
+export function collectModelEntries(files: readonly LoadedFileLike[], configDir: string): RemoteEntry[] {
+  const out: RemoteEntry[] = [];
+  for (const f of files) {
+    if (!f.path || f.path === '/') continue;
+    if (f.path === configDir || f.path.startsWith(configDir + '/')) continue;
+    const isDirectory = Array.isArray(f.children);
+    out.push({
+      path: f.path,
+      isDirectory,
+      ctime: isDirectory ? 0 : f.stat?.mtime ?? 0,
+      mtime: isDirectory ? 0 : f.stat?.mtime ?? 0,
+      size: isDirectory ? 0 : f.stat?.size ?? 0,
+    });
+  }
+  const depth = (p: string) => p.split('/').length;
+  out.sort((a, b) => depth(a.path) - depth(b.path) || Number(b.isDirectory) - Number(a.isDirectory));
+  return out;
+}
