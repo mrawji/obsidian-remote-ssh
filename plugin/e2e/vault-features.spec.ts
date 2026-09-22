@@ -98,6 +98,8 @@ import { logPathFor } from './helpers/log-oracle';
  *     `vault.getMarkdownFiles()`), and it is the direct answer to "do hyperlinks
  *     work while editing".
  *   5 clicking a link in Live Preview ...... PASS.
+ *  5b the #519 hub link (root → 3 levels down, path + `.md` + alias, sub-repo
+ *     `.git/` beside it, no folder ever expanded) .... PASS if 1 passes.
  *   6 backlinks deep→deep .................. PASS if 2 passes.
  *   7 global search into a deep note ....... PASS, but it is the slowest surface:
  *     search reads file bodies over SSH.
@@ -121,6 +123,13 @@ const DEEP = `${B_DIR}/deep.md`;
 const C_DIR = `${B_DIR}/c`;
 const DEEPER = `${C_DIR}/deeper.md`;
 const ORPHAN = `${STAMP}-orphan.md`;
+/**
+ * #519's layout: every top-level folder is its own git repo. The `.git/` dir is
+ * hidden from the tree, and the walk must still reach the notes beside it.
+ */
+const SUBREPO_GIT_HEAD = `${A_DIR}/.git/HEAD`;
+/** #519's link form: a full vault path, with the `.md` extension, behind an alias. */
+const HUB_ALIAS = `${STAMP} hub to deeper`;
 /** A scratch note for the Live-Preview typing test (test 4). */
 const SCRATCH = `${STAMP}-scratch.md`;
 
@@ -204,7 +213,7 @@ test.beforeAll(async () => {
 
   await remote.writeFile(
     ROOT,
-    `# Root\n\n[[${A_DIR}/one]]\n\n[[${B_DIR}/deep]]\n\n${TAG_ROOT}\n`,
+    `# Root\n\n[[${A_DIR}/one]]\n\n[[${B_DIR}/deep]]\n\n[[${DEEPER}|${HUB_ALIAS}]]\n\n${TAG_ROOT}\n`,
   );
   await remote.writeFile(
     ONE,
@@ -219,6 +228,8 @@ test.beforeAll(async () => {
     `# Deeper\n\n${NEEDLE}\n\n[[${A_DIR}/one]]\n\n${TAG_DEEP}\n`,
   );
   await remote.writeFile(ORPHAN, '# Orphan\n\nNo links, no edges.\n');
+  await remote.mkdirp(`${A_DIR}/.git`);
+  await remote.writeFile(SUBREPO_GIT_HEAD, 'ref: refs/heads/main\n');
   await remote.writeFile(SCRATCH, '# Scratch\n\n');
 
   // ── the Dataview-class plugin, on the REMOTE ─────────────────────────────
@@ -635,6 +646,65 @@ test.describe('a remote vault behaves like a real vault: editing, plugins, graph
     console.warn(`[e2e] Live Preview link navigation worked via: ${navigatedBy}`);
     expect(await activeFilePath(obsidian.page), 'the active file after following the link')
       .toBe(ONE);
+  });
+
+  /**
+   * #519 — "Wikilink from vault-root file to sub-repo file does not navigate".
+   *
+   * The reported shape, exactly: a hub note at the vault ROOT links with a full
+   * path, the `.md` extension and an alias (`[[a/b/c/deeper.md|…]]`) to a note
+   * three folders down. The top folder is a git repo of its own (`.git/` beside
+   * the notes). No folder has ever been expanded in File Explorer. Before #468,
+   * the target was absent from `vault.fileMap`, so the click was a no-op or
+   * offered "Create new note".
+   */
+  test('5b — #519: a root hub link into an unexpanded sub-repo opens the target', async () => {
+    await dismissBlockingModals(obsidian.page);
+    await openInLivePreview(obsidian.page, ROOT);
+
+    // With the cursor off its line, Live Preview renders an aliased link as the
+    // alias alone, so anchor on that.
+    const link = obsidian.page
+      .locator('.markdown-source-view.mod-cm6 .cm-content .cm-underline')
+      .filter({ hasText: HUB_ALIAS })
+      .first();
+
+    const rendered = await link
+      .waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS })
+      .then(() => true)
+      .catch(() => false);
+    if (!rendered) {
+      throw new Error(
+        `no rendered internal link "${HUB_ALIAS}" for "[[${DEEPER}|${HUB_ALIAS}]]" in the ` +
+        `LIVE PREVIEW of "${ROOT}" within ${ACTION_TIMEOUT_MS}ms.\n${await dumpEditor(obsidian.page)}`,
+      );
+    }
+
+    const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+    let navigatedBy: string | null = null;
+
+    await link.click({ timeout: ACTION_TIMEOUT_MS });
+    if (await waitForActiveFile(obsidian.page, DEEPER, 8_000)) {
+      navigatedBy = 'plain click';
+    } else {
+      await openInLivePreview(obsidian.page, ROOT);
+      await link.click({ timeout: ACTION_TIMEOUT_MS, modifiers: [modifier] });
+      if (await waitForActiveFile(obsidian.page, DEEPER, 8_000)) {
+        navigatedBy = `${modifier}+click`;
+      }
+    }
+
+    if (navigatedBy === null) {
+      throw new Error(
+        `#519: clicking "[[${DEEPER}|${HUB_ALIAS}]]" in "${ROOT}" did not open "${DEEPER}" ` +
+        `(plain click and ${modifier}+click, 8000ms each). The hub-note pattern is broken.\n` +
+        `${await dumpEditor(obsidian.page)}\n${await dumpVaultModel(obsidian.page)}`,
+      );
+    }
+
+    console.warn(`[e2e] #519 hub link navigation worked via: ${navigatedBy}`);
+    expect(await activeFilePath(obsidian.page), 'the active file after following the hub link')
+      .toBe(DEEPER);
   });
 
   /**
