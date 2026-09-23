@@ -67,6 +67,8 @@ interface Sample {
   readMaxMs: number | null;
   /** Most `vault.readBinary` calls in flight at once. 1 = strictly sequential. */
   readInflightMax: number | null;
+  /** `vault.readBinary` calls that threw. Never folded into the averages. */
+  readErrors: number | null;
   /** metadataCache's fileCache: entries, and how many carry a parsed hash. */
   cacheEntries: number | null;
   cacheWithHash: number | null;
@@ -164,13 +166,17 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
       // remote tree lands, so no read is missed.
       interface ReadStats {
         count: number; totalMs: number; maxMs: number; inflight: number; inflightMax: number;
+        /** Reads that threw. Obsidian may retry one, so these are counted, not averaged. */
+        errors: number;
       }
       const w = window as unknown as { __SCALE_READS__?: ReadStats };
       const vault = (app?.vault ?? null) as
         | { readBinary?: (f: MdFile) => Promise<ArrayBuffer>; __scaleWrapped?: boolean }
         | null;
       if (vault?.readBinary && !vault.__scaleWrapped) {
-        const stats: ReadStats = { count: 0, totalMs: 0, maxMs: 0, inflight: 0, inflightMax: 0 };
+        const stats: ReadStats = {
+          count: 0, totalMs: 0, maxMs: 0, inflight: 0, inflightMax: 0, errors: 0,
+        };
         w.__SCALE_READS__ = stats;
         const orig = vault.readBinary.bind(vault);
         vault.readBinary = async (f: MdFile) => {
@@ -178,13 +184,17 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
           stats.inflight++;
           stats.inflightMax = Math.max(stats.inflightMax, stats.inflight);
           try {
-            return await orig(f);
-          } finally {
-            stats.inflight--;
+            const r = await orig(f);
             const d = performance.now() - t;
             stats.count++;
             stats.totalMs += d;
             stats.maxMs = Math.max(stats.maxMs, d);
+            return r;
+          } catch (e) {
+            stats.errors++;
+            throw e;
+          } finally {
+            stats.inflight--;
           }
         };
         vault.__scaleWrapped = true;
@@ -207,6 +217,7 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         readAvgMs: rs && rs.count ? Math.round(rs.totalMs / rs.count) : null,
         readMaxMs: rs ? Math.round(rs.maxMs) : null,
         readInflightMax: rs?.inflightMax ?? 0,
+        readErrors: rs?.errors ?? 0,
         cacheEntries: fc.length,
         cacheWithHash: fc.filter((e) => e.hash).length,
       };
@@ -225,6 +236,7 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
     readAvgMs: r === TIMED_OUT ? null : r.readAvgMs,
     readMaxMs: r === TIMED_OUT ? null : r.readMaxMs,
     readInflightMax: r === TIMED_OUT ? null : r.readInflightMax,
+    readErrors: r === TIMED_OUT ? null : r.readErrors,
     cacheEntries: r === TIMED_OUT ? null : r.cacheEntries,
     cacheWithHash: r === TIMED_OUT ? null : r.cacheWithHash,
   };
@@ -248,29 +260,43 @@ async function probeAdapter(page: Page, paths: string[]): Promise<unknown> {
       } } };
     }).app?.vault?.adapter;
     if (!adapter?.stat || !adapter?.readBinary) return { error: 'no adapter' };
-    const time = async (fn: () => Promise<unknown>) => {
+    let errors = 0;
+    // A failed call returns null and is counted, never averaged: a fast
+    // rejection (a dropped channel, a lossy WAN profile) would otherwise look
+    // like a fast read and pull the figure this probe exists to establish.
+    const time = async (fn: () => Promise<unknown>): Promise<number | null> => {
       const t = performance.now();
-      try { await fn(); } catch { /* count the attempt anyway */ }
+      try {
+        await fn();
+      } catch {
+        errors++;
+        return null;
+      }
       return performance.now() - t;
     };
-    const statMs: number[] = [];
+    const ok = (xs: Array<number | null>): number[] => xs.filter((v): v is number => v !== null);
+    const statMs: Array<number | null> = [];
     for (const p of ps) statMs.push(await time(() => adapter.stat!(p)));
-    const readMs: number[] = [];
+    const readMs: Array<number | null> = [];
     for (const p of ps) readMs.push(await time(() => adapter.readBinary!(p)));
     // Second pass over the same notes: now warm in the ReadCache, so what is
     // left is the revalidating stat plus our own overhead.
-    const rereadMs: number[] = [];
+    const rereadMs: Array<number | null> = [];
     for (const p of ps) rereadMs.push(await time(() => adapter.readBinary!(p)));
     // Controls: if a bare setTimeout(0) also takes tens of ms, the renderer's
     // task queue is being throttled (an occluded Electron window under Xvfb)
     // and the RPC figure says nothing about a real desktop.
-    const timerMs: number[] = [];
+    const timerMs: Array<number | null> = [];
     for (let i = 0; i < 30; i++) timerMs.push(await time(() => new Promise((r) => setTimeout(r, 0))));
-    const microMs: number[] = [];
+    const microMs: Array<number | null> = [];
     for (let i = 0; i < 30; i++) microMs.push(await time(() => Promise.resolve()));
-    const avg = (xs: number[]) => Math.round(xs.reduce((a, b) => a + b, 0) / (xs.length || 1));
+    const avg = (xs: Array<number | null>) => {
+      const good = ok(xs);
+      return good.length ? Math.round(good.reduce((a, b) => a + b, 0) / good.length) : null;
+    };
     return {
-      n: ps.length, statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs),
+      n: ps.length, errors,
+      statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs),
       setTimeout0AvgMs: avg(timerMs), microtaskAvgMs: avg(microMs),
       hidden: document.hidden, visibility: document.visibilityState,
     };
@@ -370,7 +396,7 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
       `model=${s.mdInModel}/${expected} parsed=${s.parsed} clean=${s.clean} ` +
       `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms ` +
       `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax} ` +
-      `cache=${s.cacheEntries}/${s.cacheWithHash} hashed`,
+      `cache=${s.cacheEntries}/${s.cacheWithHash} hashed errors=${s.readErrors}`,
     );
     // Two clean samples in a row, so a late straggler read is still counted.
     if (samples.length >= 2 && isClean(s) && isClean(samples[samples.length - 2])) break;

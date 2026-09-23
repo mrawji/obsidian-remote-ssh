@@ -87,6 +87,25 @@ export async function launchObsidian(
   });
 
   const cdpUrl = `http://127.0.0.1:${CDP_PORT}`;
+  try {
+    return await attachToObsidian(cdpUrl, proc, restore);
+  } catch (e) {
+    // Everything from here on can throw (a CDP timeout on a loaded machine is
+    // the common one). `registerVault` has already rewritten the real
+    // obsidian.json, and only the `cleanup` we never get to return would put
+    // it back — so a developer's vault list would keep this scaffold vault as
+    // the only open one.
+    restore();
+    try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+    throw e;
+  }
+}
+
+async function attachToObsidian(
+  cdpUrl: string,
+  proc: ChildProcess,
+  restore: () => void,
+): Promise<ObsidianHandle> {
   await waitForCDP(cdpUrl, 30_000);
 
   const browser = await connectOverCDPWithRetry(cdpUrl);
@@ -130,7 +149,11 @@ export async function launchObsidian(
 
   const cleanup = async () => {
     try { await browser.close(); } catch { /* best effort */ }
-    if (!proc.killed) {
+    // `exitCode !== null` means the process is already gone — typically
+    // because the caller closed the window itself. A `kill` then has nothing
+    // to signal, and an `exit` listener attached now would never fire, so the
+    // wait below would burn its full timeout on the happy path.
+    if (!proc.killed && proc.exitCode === null) {
       proc.kill('SIGTERM');
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
