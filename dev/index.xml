@@ -10,13 +10,13 @@
     <link>https://codes.sota-shimozono.com/obsidian-remote-ssh/dev/en/cookbook/hardware-key</link>
     <guid>https://codes.sota-shimozono.com/obsidian-remote-ssh/dev/en/cookbook/hardware-key</guid>
     <description><![CDATA[ Use a YubiKey, Nitrokey, macOS Secure Enclave, or Windows Hello to sign SSH connections to your Obsidian vault. FIDO2 ed25519-sk + Apple keychain + TPM recipes. ]]></description>
-    <pubDate>Wed, 23 Sep 2026 14:28:27 GMT</pubDate>
+    <pubDate>Wed, 23 Sep 2026 15:36:23 GMT</pubDate>
   </item><item>
     <title>SSH config &amp; keys</title>
     <link>https://codes.sota-shimozono.com/obsidian-remote-ssh/dev/en/user-guide/ssh-config</link>
     <guid>https://codes.sota-shimozono.com/obsidian-remote-ssh/dev/en/user-guide/ssh-config</guid>
     <description><![CDATA[ How obsidian-remote-ssh resolves SSH credentials: ed25519/RSA key files, passphrase prompts, ssh-agent fallback, password auth, custom port and identity-only mode. ]]></description>
-    <pubDate>Wed, 23 Sep 2026 14:28:27 GMT</pubDate>
+    <pubDate>Wed, 23 Sep 2026 15:36:23 GMT</pubDate>
   </item><item>
     <title>Vault size</title>
     <link>https://codes.sota-shimozono.com/obsidian-remote-ssh/dev/en/user-guide/vault-size</link>
