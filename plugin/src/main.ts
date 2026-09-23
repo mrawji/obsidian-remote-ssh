@@ -970,7 +970,9 @@ export default class RemoteSshPlugin extends Plugin {
     const profile = this.snapshotProfile();
     if (!profile) return;
     try {
-      const entries = readTreeSnapshot(this.treeSnapshotFile(profile.id), profile.remotePath);
+      const entries = readTreeSnapshot(
+        this.treeSnapshotFile(profile.id), profile.remotePath, this.app.vault.configDir,
+      );
       if (!entries || entries.length === 0) return;
       const start = Date.now();
       const result = await new VaultModelBuilder(this.app.vault, { TFile, TFolder }).build(entries);
@@ -987,24 +989,47 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Once connected: re-index snapshot files Obsidian has no metadata for.
-   * Those are notes whose cached stat didn't match the snapshot (or were never
-   * cached), which metadataCache tried to read at startup through the native
-   * adapter, before our adapter was patched in, and failed. A `modify` sends
-   * them through its read queue again, now over SSH.
+   * Once connected, fire `modify` for restored files that need a real read.
+   *
+   * Two groups, both created by the same gap: between `onload` (where the
+   * snapshot lands in the model) and the adapter patch (which happens after
+   * layout ready), the only adapter is Obsidian's native one, pointed at a
+   * shadow disk that holds no notes.
+   *
+   *  - Notes with NO metadata: their cached stat didn't match the snapshot,
+   *    so `metadataCache.initialize()` tried to read them, through the native
+   *    adapter, and failed.
+   *  - Notes OPEN in a tab: Obsidian restores the workspace layout in that
+   *    same window and loads each open file's content the same way. The read
+   *    fails and the editor shows nothing. These notes usually DO have valid
+   *    metadata (that is the whole point of the snapshot), so the check above
+   *    would skip them and the tab would stay blank until reopened by hand.
    */
   private reindexSnapshotFilesWithoutMetadata(): void {
     if (!this.snapshotFiles || this.snapshotMetadataChecked) return;
     this.snapshotMetadataChecked = true;
     const builder = new VaultModelBuilder(this.app.vault, { TFile, TFolder });
+    const open = new Set<string>();
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const file = (leaf.view as { file?: { path?: string } } | undefined)?.file;
+      if (file?.path) open.add(file.path);
+    });
     let queued = 0;
+    let reopened = 0;
     for (const p of this.snapshotFiles) {
       const f = this.app.vault.getAbstractFileByPath(p);
       if (!(f instanceof TFile) || f.extension !== 'md') continue;
-      if (this.app.metadataCache.getFileCache(f)) continue;
-      if (builder.modifyOne(p)) queued++;
+      const needsMetadata = !this.app.metadataCache.getFileCache(f);
+      const isOpen = open.has(p);
+      if (!needsMetadata && !isOpen) continue;
+      if (!builder.modifyOne(p)) continue;
+      if (needsMetadata) queued++;
+      if (isOpen) reopened++;
     }
-    logger.info(`TreeSnapshot: ${queued} of ${this.snapshotFiles.size} restored files queued for re-index`);
+    logger.info(
+      `TreeSnapshot: ${queued} of ${this.snapshotFiles.size} restored files queued for re-index, ` +
+      `${reopened} open tab(s) refreshed`,
+    );
   }
 
   /**

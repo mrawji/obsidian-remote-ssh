@@ -14,10 +14,19 @@ function dir(path: string): RemoteEntry {
   return { path, isDirectory: true, ctime: 0, mtime: 0, size: 0 };
 }
 
-function walkResult(entries: RemoteEntry[], truncated = false) {
+function walkResult(
+  entries: RemoteEntry[],
+  over: Partial<{ truncated: boolean; source: 'rpc-walk' | 'fallback-list'; listErrors: number }> = {},
+) {
   return {
-    entries, source: 'rpc-walk' as const, truncated, walkMs: 1, pages: 1,
-    fastPathError: null, hiddenCount: 0,
+    entries,
+    source: over.source ?? ('rpc-walk' as const),
+    truncated: over.truncated ?? false,
+    walkMs: 1,
+    pages: 1,
+    fastPathError: over.source === 'fallback-list' ? 'fs.walk exploded' : null,
+    hiddenCount: 0,
+    listErrors: over.listErrors ?? 0,
   };
 }
 
@@ -60,13 +69,21 @@ function makeIndexer(opts: {
   remote: RemoteEntry[];
   model: ReturnType<typeof makeModel>;
   truncated?: boolean;
+  /** What the walk actually came back as. `walk()` degrades on its own. */
+  walkSource?: 'rpc-walk' | 'fallback-list';
+  /** Folders the fallback could not list; their children are simply absent. */
+  listErrors?: number;
   failFolder?: string;
   currentStat?: (p: string) => { mtime: number; size: number } | null;
   reconcile?: boolean;
 }) {
   const walk = vi.fn((path: string, recursive: boolean) => {
     if (opts.failFolder === path) return Promise.reject(new Error('EACCES'));
-    return Promise.resolve(walkResult(recursive ? opts.remote : childrenOf(opts.remote, path), opts.truncated));
+    return Promise.resolve(walkResult(recursive ? opts.remote : childrenOf(opts.remote, path), {
+      truncated: opts.truncated,
+      source: opts.walkSource,
+      listErrors: opts.listErrors,
+    }));
   });
   const walker = { hasFastPath: () => opts.fastPath, walk } as unknown as BulkWalker;
   const completions: IndexComplete[] = [];
@@ -134,6 +151,32 @@ describe('BackgroundIndexer reconcile', () => {
     expect(m.modifyOne).not.toHaveBeenCalled();
   });
 
+  it('treats a walk that degraded to the fallback as what it is', async () => {
+    // `walk()` falls back to per-folder listing on its own when fs.walk throws
+    // mid-pagination. Those entries carry mtime/size 0: believing them would
+    // zero every note's stat and then persist that as the next snapshot.
+    const m = makeModel([file('a.md', 5, 50), file('b.md', 5, 50)]);
+    const { indexer, completions } = makeIndexer({
+      fastPath: true, model: m, walkSource: 'fallback-list',
+      remote: [file('a.md', 0, 0)],
+    });
+    await indexer.start();
+
+    expect(m.modifyOne).not.toHaveBeenCalled();
+    expect(m.model.get('a.md')).toMatchObject({ mtime: 5, size: 50 });
+    expect(m.model.has('b.md')).toBe(true);
+    expect(completions).toEqual([{ viaFastPath: false, modified: 0, removed: 0 }]);
+  });
+
+  it('does not remove anything when the walk could not list every folder', async () => {
+    const m = makeModel([file('a.md'), file('b.md')]);
+    const { indexer } = makeIndexer({
+      fastPath: true, model: m, remote: [file('a.md')], listErrors: 1,
+    });
+    await indexer.start();
+    expect(m.model.has('b.md')).toBe(true);
+  });
+
   it('does not remove anything after a truncated walk', async () => {
     const m = makeModel([file('a.md'), file('b.md')]);
     const { indexer } = makeIndexer({ fastPath: true, model: m, remote: [file('a.md')], truncated: true });
@@ -189,10 +232,24 @@ describe('BackgroundIndexer reconcile', () => {
       expect(completions).toEqual([{ viaFastPath: false, modified: 0, removed: 1 }]);
     });
 
-    it('removes nothing when a folder could not be listed', async () => {
+    it('removes nothing when a folder walk threw', async () => {
       const m = makeModel([file('a.md'), dir('d'), file('d/x.md')]);
       const { indexer } = makeIndexer({
         fastPath: false, model: m, remote: [file('a.md'), dir('d'), file('d/x.md')], failFolder: 'd',
+      });
+      await indexer.start();
+      expect(m.removeOne).not.toHaveBeenCalled();
+      expect(m.model.has('d/x.md')).toBe(true);
+    });
+
+    it('removes nothing when a folder could not be listed', async () => {
+      // The real fallback SWALLOWS a failed list and returns an empty set for
+      // that folder, which reads exactly like "it is empty". Only listErrors
+      // tells them apart — and without it every note under that folder would
+      // be dropped from the model while it still exists on the remote.
+      const m = makeModel([file('a.md'), dir('d'), file('d/x.md')]);
+      const { indexer } = makeIndexer({
+        fastPath: false, model: m, remote: [file('a.md'), dir('d')], listErrors: 1,
       });
       await indexer.start();
       expect(m.removeOne).not.toHaveBeenCalled();

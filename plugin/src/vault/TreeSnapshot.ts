@@ -38,6 +38,13 @@ import { errorMessage } from '../util/errorMessage';
 
 const VERSION = 1;
 
+/**
+ * Refuse a snapshot bigger than any real vault this plugin can serve. It is
+ * read synchronously inside `onload`, which Obsidian awaits before it starts
+ * the vault, so a corrupt or inflated file would delay every launch.
+ */
+const MAX_ENTRIES = 500_000;
+
 /** One entry, packed: `[path, isDirectory ? 1 : 0, mtime, size]`. ~50 bytes a note. */
 type PackedEntry = [string, 0 | 1, number, number];
 
@@ -53,12 +60,24 @@ export function treeSnapshotPath(stateRoot: string, stateKey: string): string {
 }
 
 /**
+ * A vault-relative path the live walker would also accept. The snapshot is
+ * only ever written from an already-filtered model, but it is a plain file in
+ * the user's home: a hand-edited one must not be able to put `..`, an
+ * absolute path or the config dir into the vault model.
+ */
+function isUsablePath(p: string, configDir: string): boolean {
+  if (!p || p.startsWith('/') || p.includes('\\')) return false;
+  if (p === configDir || p.startsWith(configDir + '/')) return false;
+  return p.split('/').every((seg) => seg && seg !== '.' && seg !== '..');
+}
+
+/**
  * The snapshot's entries, parents before children, or null when there is none,
  * it is unreadable, or it was taken for a different `remotePath`. Synchronous
  * on purpose: it runs inside `onload`, which Obsidian awaits before
  * `metadataCache.initialize()`.
  */
-export function readTreeSnapshot(file: string, remotePath: string): RemoteEntry[] | null {
+export function readTreeSnapshot(file: string, remotePath: string, configDir: string): RemoteEntry[] | null {
   let raw: string;
   try {
     raw = fs.readFileSync(file, 'utf8');
@@ -70,11 +89,24 @@ export function readTreeSnapshot(file: string, remotePath: string): RemoteEntry[
     if (parsed.version !== VERSION || parsed.remotePath !== remotePath || !Array.isArray(parsed.entries)) {
       return null;
     }
+    if (parsed.entries.length > MAX_ENTRIES) {
+      logger.warn(`TreeSnapshot: ignoring ${file} — ${parsed.entries.length} entries is past the ${MAX_ENTRIES} cap`);
+      return null;
+    }
     const entries: RemoteEntry[] = [];
+    let rejected = 0;
     for (const e of parsed.entries) {
-      if (!Array.isArray(e) || typeof e[0] !== 'string' || !e[0]) continue;
+      if (!Array.isArray(e) || typeof e[0] !== 'string' || !isUsablePath(e[0], configDir)) {
+        rejected++;
+        continue;
+      }
+      if (typeof e[2] !== 'number' || typeof e[3] !== 'number') {
+        rejected++;
+        continue;
+      }
       entries.push({ path: e[0], isDirectory: e[1] === 1, ctime: e[2], mtime: e[2], size: e[3] });
     }
+    if (rejected > 0) logger.warn(`TreeSnapshot: dropped ${rejected} unusable entries from ${file}`);
     return entries;
   } catch (e) {
     logger.warn(`TreeSnapshot: ignoring unreadable ${file} (${errorMessage(e)})`);

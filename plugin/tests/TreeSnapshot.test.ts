@@ -35,28 +35,45 @@ describe('TreeSnapshot', () => {
 
   it('round-trips paths, kinds, mtime and size', () => {
     writeTreeSnapshot(file, '/home/u/vault', ENTRIES);
-    expect(readTreeSnapshot(file, '/home/u/vault')).toEqual(ENTRIES);
+    expect(readTreeSnapshot(file, '/home/u/vault', '.obsidian')).toEqual(ENTRIES);
   });
 
   it('is ignored for a different remotePath', () => {
     writeTreeSnapshot(file, '/home/u/vault', ENTRIES);
-    expect(readTreeSnapshot(file, '/home/u/other')).toBeNull();
+    expect(readTreeSnapshot(file, '/home/u/other', '.obsidian')).toBeNull();
   });
 
   it('is null when missing, corrupt, or from another version', () => {
-    expect(readTreeSnapshot(file, '/v')).toBeNull();
+    expect(readTreeSnapshot(file, '/v', '.obsidian')).toBeNull();
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, '{not json');
-    expect(readTreeSnapshot(file, '/v')).toBeNull();
+    expect(readTreeSnapshot(file, '/v', '.obsidian')).toBeNull();
     fs.writeFileSync(file, JSON.stringify({ version: 99, remotePath: '/v', entries: [] }));
-    expect(readTreeSnapshot(file, '/v')).toBeNull();
+    expect(readTreeSnapshot(file, '/v', '.obsidian')).toBeNull();
   });
 
   it('writes atomically and leaves no temp file behind', () => {
     writeTreeSnapshot(file, '/v', ENTRIES);
     writeTreeSnapshot(file, '/v', ENTRIES.slice(0, 1));
     expect(fs.readdirSync(path.dirname(file))).toEqual(['tree-snapshot.json']);
-    expect(readTreeSnapshot(file, '/v')).toHaveLength(1);
+    expect(readTreeSnapshot(file, '/v', '.obsidian')).toHaveLength(1);
+  });
+
+  it('drops entries a live walk would never produce', () => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      version: 1,
+      remotePath: '/v',
+      entries: [
+        ['ok.md', 0, 1, 2],
+        ['../escape.md', 0, 1, 2],
+        ['/abs.md', 0, 1, 2],
+        ['.obsidian/app.json', 0, 1, 2],
+        ['a/./b.md', 0, 1, 2],
+        ['bad-stat.md', 0, 'x', 2],
+      ],
+    }));
+    expect(readTreeSnapshot(file, '/v', '.obsidian')?.map((e) => e.path)).toEqual(['ok.md']);
   });
 
   it('delete is idempotent', () => {

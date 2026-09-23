@@ -161,11 +161,13 @@ export class BackgroundIndexer {
     try {
       const before = this.captureModelAtStart();
       const walker = this.deps.makeWalker();
-      const viaFastPath = walker.hasFastPath();
-      const result = viaFastPath
+      // What the walker CAN do, not what it did: `walk()` degrades to the
+      // per-folder fallback on its own when the daemon's fs.walk throws, and
+      // the pass below reports which path actually produced the entries.
+      const result = walker.hasFastPath()
         ? await this.indexViaFullWalk(walker, before)
         : await this.indexBreadthFirst(before);
-      if (result && !this.cancelled) this.deps.onComplete?.({ viaFastPath, ...result });
+      if (result && !this.cancelled) this.deps.onComplete?.(result);
     } catch (e) {
       // A background index that dies must never take the session with it — the
       // vault just stays lazily loaded (i.e. the pre-existing behaviour).
@@ -188,7 +190,7 @@ export class BackgroundIndexer {
   private async indexViaFullWalk(
     walker: BulkWalker,
     before: Map<string, RemoteEntry> | null,
-  ): Promise<Reconciled | null> {
+  ): Promise<IndexComplete | null> {
     const walk = await walker.walk('', true);
     if (this.cancelled) return null;
     logger.info(
@@ -221,10 +223,28 @@ export class BackgroundIndexer {
     for (const e of walk.entries) {
       if (e.isDirectory) this.deps.markLoaded(e.path);
     }
-    // A truncated walk is not the whole remote: removing what it missed would
-    // delete notes that exist.
-    if (!before) return { modified: 0, removed: 0 };
-    return this.reconcile(builder, before, walk.entries, { statUpdates: true, removals: !walk.truncated });
+    // The walk may have come back from the FALLBACK even though the daemon
+    // advertises fs.walk — `walk()` degrades on its own when the RPC throws
+    // partway through. Fallback entries carry mtime/size 0, so believing them
+    // would zero every note's stat and then persist that as the snapshot.
+    const viaFastPath = walk.source === 'rpc-walk';
+    if (!viaFastPath) {
+      logger.warn(
+        `BackgroundIndexer: fs.walk degraded to the per-folder fallback ` +
+        `(${walk.fastPathError ?? 'unknown'}); stats and removals skipped this pass`,
+      );
+    }
+    // A truncated walk, or one that could not list every folder, is not the
+    // whole remote: removing what it missed would delete notes that exist.
+    const complete = viaFastPath && !walk.truncated && walk.listErrors === 0;
+    if (!before) return { viaFastPath, modified: 0, removed: 0 };
+    return {
+      viaFastPath,
+      ...this.reconcile(builder, before, walk.entries, {
+        statUpdates: viaFastPath,
+        removals: complete,
+      }),
+    };
   }
 
   /**
@@ -237,7 +257,7 @@ export class BackgroundIndexer {
    * returns is already in `fileMap` from the connect populate, so that first
    * rebuild is a pure (counted) skip.
    */
-  private async indexBreadthFirst(before: Map<string, RemoteEntry> | null): Promise<Reconciled | null> {
+  private async indexBreadthFirst(before: Map<string, RemoteEntry> | null): Promise<IndexComplete | null> {
     const queue: string[] = [''];
     const seen = new Set<string>(queue);
     const walked: RemoteEntry[] = [];
@@ -245,9 +265,9 @@ export class BackgroundIndexer {
     while (queue.length > 0) {
       if (this.cancelled) return null;
       const folder = queue.shift()!;
-      let entries: RemoteEntry[];
+      let walkResult: Awaited<ReturnType<BulkWalker['walk']>>;
       try {
-        entries = (await this.deps.makeWalker().walk(folder, false)).entries;
+        walkResult = await this.deps.makeWalker().walk(folder, false);
       } catch (e) {
         // One unreadable folder (permissions, vanished mid-walk) must not sink
         // the whole index. Left unmarked, so an expand click can still retry it.
@@ -256,6 +276,11 @@ export class BackgroundIndexer {
         continue;
       }
       if (this.cancelled) return null;
+      // The fallback swallows a folder it cannot list and returns an empty
+      // set for it, which reads exactly like "that folder is empty". Only the
+      // count tells them apart, and removals must not run without it.
+      failures += walkResult.listErrors;
+      const entries = walkResult.entries;
       walked.push(...entries);
 
       const result = await this.deps.makeBuilder().buildChunked(entries, this.chunkSize);
@@ -271,13 +296,16 @@ export class BackgroundIndexer {
       this.emit(false);
       await this.yieldNow();
     }
-    if (!before) return { modified: 0, removed: 0 };
+    if (!before) return { viaFastPath: false, modified: 0, removed: 0 };
     // The fallback's entries carry mtime/size 0, so a stat comparison would call
     // every note changed. Removals only, and only if every folder was listed.
-    return this.reconcile(this.deps.makeBuilder(), before, walked, {
-      statUpdates: false,
-      removals: failures === 0,
-    });
+    return {
+      viaFastPath: false,
+      ...this.reconcile(this.deps.makeBuilder(), before, walked, {
+        statUpdates: false,
+        removals: failures === 0,
+      }),
+    };
   }
 
   /**
