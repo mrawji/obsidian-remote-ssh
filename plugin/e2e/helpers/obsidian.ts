@@ -1,4 +1,4 @@
-import { type Browser, type Page, chromium } from '@playwright/test';
+import { type Browser, type Locator, type Page, chromium } from '@playwright/test';
 import { type ChildProcess, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -221,7 +221,7 @@ export async function driveConnectFlow(page: Page): Promise<void> {
   // straight off Enter (no modal). Click the button if it shows; its
   // absence is not an error.
   const connectBtn = page.locator('.modal button:has-text("Connect")').first();
-  if (await connectBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
+  if (await isVisibleWithin(connectBtn, 5_000)) {
     await connectBtn.click();
   }
 }
@@ -351,19 +351,60 @@ export async function connectAndOpenShadow(
  * process and exits, so we'd connect to the user's real vault
  * instead of the scaffold vault.
  */
+/**
+ * Is this locator visible within `ms`?
+ *
+ * `locator.isVisible()` answers immediately — it is documented not to wait,
+ * and the `timeout` it accepts is ignored. Two call sites here passed one and
+ * read as "wait up to 5 s", so an element that appeared a frame later was
+ * treated as absent and the flow silently took its fallback path. `waitFor`
+ * is the call that actually waits.
+ */
+async function isVisibleWithin(locator: Locator, ms: number): Promise<boolean> {
+  try {
+    await locator.waitFor({ state: 'visible', timeout: ms });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function killExistingObsidian(): Promise<void> {
   const { execSync } = await import('node:child_process');
+  // Match the binary we are about to launch, not the word "Obsidian".
+  // `pkill -f Obsidian` never matched anything on Linux CI, where the
+  // AppImage extracts to `~/obsidian/squashfs-root/obsidian` — all lower
+  // case — so the single-instance guard silently did nothing and a stale
+  // window could serve the next test. Lower-casing the pattern is not the
+  // fix either: the CI checkout lives under `.../obsidian-remote-ssh/...`,
+  // so `-f obsidian` would match this very test process and kill the run.
+  const binary = resolveObsidianPath();
   try {
     if (process.platform === 'win32') {
       execSync('taskkill /F /IM Obsidian.exe /T', { stdio: 'ignore' });
     } else {
-      execSync('pkill -f Obsidian || true', { stdio: 'ignore' });
+      execSync(`pkill -f ${JSON.stringify(binary)} || true`, { stdio: 'ignore' });
     }
   } catch {
     // No existing process — fine
   }
-  // Brief wait for the process to fully exit
-  await new Promise((r) => setTimeout(r, 2_000));
+
+  // Wait for it to be gone rather than assuming two seconds is enough. A
+  // survivor is worth saying out loud: every later failure in the run would
+  // otherwise be blamed on the product.
+  if (process.platform === 'win32') {
+    await new Promise((r) => setTimeout(r, 2_000));
+    return;
+  }
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      execSync(`pgrep -f ${JSON.stringify(binary)}`, { stdio: 'ignore' });
+    } catch {
+      return;  // pgrep exits non-zero when nothing matches
+    }
+  }
+  console.warn(`[e2e] an Obsidian process at ${binary} survived the kill; the run may attach to it`);
 }
 
 /**
@@ -464,7 +505,7 @@ async function dismissTrustDialog(page: Page): Promise<boolean> {
   const trustBtn = page
     .locator('button:has-text("Trust author and enable plugins")')
     .first();
-  if (!await trustBtn.isVisible({ timeout: 8_000 }).catch(() => false)) {
+  if (!await isVisibleWithin(trustBtn, 8_000)) {
     return false;
   }
   await trustBtn.click();
