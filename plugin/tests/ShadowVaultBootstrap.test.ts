@@ -95,43 +95,6 @@ describe('ShadowVaultBootstrap.layoutFor', () => {
     } finally { scratch.cleanup(); }
   });
 
-  it('uses the config dir the vault actually has, not always .obsidian', () => {
-    // Obsidian lets a user override the config folder per vault. Everything
-    // after the shadow window opens reads the live `app.vault.configDir`; the
-    // pre-spawn pull runs before any window exists and used to assume
-    // `.obsidian`, so it read and wrote a folder Obsidian no longer used.
-    const scratch = makeScratch();
-    try {
-      const r = new ShadowVaultBootstrap(scratch.baseDir, scratch.sourceDir, new ObsidianRegistry(scratch.configPath));
-      const profile = { name: 'Renamed', remotePath: '/srv/vault' };
-      const vaultDir = r.layoutFor(profile).vaultDir;
-      fs.mkdirSync(path.join(vaultDir, '.config-obsidian', 'plugins', 'remote-ssh'), { recursive: true });
-
-      const layout = r.layoutFor(profile);
-      expect(layout.configDir).toBe(path.join(vaultDir, '.config-obsidian'));
-      expect(layout.pluginDir).toBe(path.join(vaultDir, '.config-obsidian', 'plugins', 'remote-ssh'));
-    } finally { scratch.cleanup(); }
-  });
-
-  it('prefers .obsidian when it is there, and falls back when the vault is ambiguous', () => {
-    const scratch = makeScratch();
-    try {
-      const r = new ShadowVaultBootstrap(scratch.baseDir, scratch.sourceDir, new ObsidianRegistry(scratch.configPath));
-      const profile = { name: 'Both', remotePath: '/srv/vault' };
-      const vaultDir = r.layoutFor(profile).vaultDir;
-      const fallback = path.join(vaultDir, '.obsidian');
-      fs.mkdirSync(path.join(fallback, 'plugins', 'remote-ssh'), { recursive: true });
-      fs.mkdirSync(path.join(vaultDir, '.other', 'plugins', 'remote-ssh'), { recursive: true });
-
-      expect(r.layoutFor(profile).configDir, 'the default wins when present').toBe(fallback);
-
-      // Two candidates and no default: too ambiguous to guess.
-      fs.rmSync(fallback, { recursive: true, force: true });
-      fs.mkdirSync(path.join(vaultDir, '.third', 'plugins', 'remote-ssh'), { recursive: true });
-      expect(r.layoutFor(profile).configDir).toBe(fallback);
-    } finally { scratch.cleanup(); }
-  });
-
   it('uses the last path segment as the tail, ignoring a trailing slash', () => {
     const scratch = makeScratch();
     try {

@@ -88,16 +88,6 @@ export interface BulkWalkResult {
    * a dot-dir) instead of firing a misleading "0 files — check remotePath".
    */
   hiddenCount: number;
-  /**
-   * Of `hiddenCount`, the entries dropped because a path segment matched
-   * `ignoreDirs` — as opposed to being a dot-name. These are names a user can
-   * legitimately have given a real folder (`build`, `dist`, `vendor`), and
-   * until 1.1.8 the SFTP fallback did not prune them at all, so a vault that
-   * upgraded can suddenly be missing a folder. The caller surfaces this.
-   */
-  excludedCount: number;
-  /** The `ignoreDirs` names that actually matched, for the message. */
-  excludedDirs: string[];
 }
 
 /**
@@ -156,8 +146,6 @@ export class BulkWalker {
           ...result,
           entries: visible,
           hiddenCount: result.entries.length - visible.length,
-          excludedCount: this.excludedPaths.size,
-          excludedDirs: [...this.excluded],
           walkMs: Date.now() - start,
           listErrors: 0,
           // `truncated` here means we stopped at the page guard on a
@@ -174,8 +162,6 @@ export class BulkWalker {
           ...fallback,
           entries: visible,
           hiddenCount: fallback.entries.length - visible.length,
-          excludedCount: this.excludedPaths.size,
-          excludedDirs: [...this.excluded],
           walkMs: Date.now() - start,
           fastPathError: message,
         };
@@ -188,8 +174,6 @@ export class BulkWalker {
       ...fallback,
       entries: visible,
       hiddenCount: fallback.entries.length - visible.length,
-      excludedCount: this.excludedPaths.size,
-      excludedDirs: [...this.excluded],
       walkMs: Date.now() - start,
       fastPathError: null,
     };
@@ -209,26 +193,13 @@ export class BulkWalker {
     return this.canUseFastPath();
   }
 
-  /** Names from `ignoreDirs` that this walk actually dropped something for. */
-  private excluded = new Set<string>();
-  /** Paths dropped for that reason. A path is visibility-checked more than
-   *  once (once to filter it, once to decide whether to descend), so count
-   *  paths, not calls. */
-  private excludedPaths = new Set<string>();
-
   /** Shared by full indexing and lazy expansion; allowances never override exclusions. */
   private visibleEntries(entries: RemoteEntry[]): RemoteEntry[] {
     return entries.filter((e) => this.isVisible(e.path, e.isDirectory));
   }
 
   private isVisible(vaultPath: string, isDirectory: boolean): boolean {
-    const verdict = pathVisibility(vaultPath, isDirectory, this.deps);
-    if (verdict.visible) return true;
-    if (verdict.excludedBy !== null) {
-      this.excluded.add(verdict.excludedBy);
-      this.excludedPaths.add(vaultPath);
-    }
-    return false;
+    return pathVisibility(vaultPath, isDirectory, this.deps);
   }
 
   // ─── internals ──────────────────────────────────────────────────────────
@@ -327,13 +298,6 @@ export class BulkWalker {
   }
 }
 
-/** What the visibility rules decide, and (for the ignore list) which name did it. */
-export interface VisibilityVerdict {
-  visible: boolean;
-  /** The `ignoreDirs` entry that excluded this path, or null for any other reason. */
-  excludedBy: string | null;
-}
-
 export interface VisibilityRules {
   ignoreDirs?: readonly string[];
   allowedHiddenDirs?: readonly string[];
@@ -353,23 +317,20 @@ export function pathVisibility(
   vaultPath: string,
   isDirectory: boolean,
   rules: VisibilityRules,
-): VisibilityVerdict {
-  const hidden: VisibilityVerdict = { visible: false, excludedBy: null };
+): boolean {
   const configDir = rules.configDir ?? '.obsidian';
-  if (vaultPath === configDir || vaultPath.startsWith(configDir + '/')) return hidden;
+  if (vaultPath === configDir || vaultPath.startsWith(configDir + '/')) return false;
   const parts = vaultPath.split('/');
   for (let i = 0; i < parts.length; i++) {
     const segment = parts[i];
-    if (!segment || segment === '.' || segment === '..') return hidden;
+    if (!segment || segment === '.' || segment === '..') return false;
     const directory = i < parts.length - 1 || isDirectory;
-    if (directory && rules.ignoreDirs?.includes(segment)) {
-      return { visible: false, excludedBy: segment };
-    }
+    if (directory && rules.ignoreDirs?.includes(segment)) return false;
     if (!segment.startsWith('.')) continue;
     // Only directories can be allowed. A parent allowance does not expose
     // nested dot-names, and .obsidian stays reserved at every depth.
     if (segment === '.obsidian' || !directory ||
-        !rules.allowedHiddenDirs?.includes(parts.slice(0, i + 1).join('/'))) return hidden;
+        !rules.allowedHiddenDirs?.includes(parts.slice(0, i + 1).join('/'))) return false;
   }
-  return { visible: true, excludedBy: null };
+  return true;
 }
