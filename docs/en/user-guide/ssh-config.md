@@ -20,6 +20,15 @@ Picked per profile in **Settings** → **Profile** → **Authentication**:
 
 Passphrase-protected keys: if your agent has the unlocked key, agent auth works transparently. Otherwise the plugin prompts for the passphrase per connect.
 
+### Which agent identities the plugin can use
+
+`ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521` and `ssh-ed25519`. Anything else your agent holds is **skipped**, including:
+
+- **OpenSSH certificates** (`ssh-ed25519-cert-v01@openssh.com` and friends) — common wherever a CA issues short-lived credentials (Teleport, Vault, step-ca, OS Login).
+- **FIDO security keys** (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`).
+
+If every identity your agent holds is one of those, the connection fails with "SSH authentication failed" while `ssh` on the same machine succeeds. Since 1.1.9 the plugin names the skipped identities in that notice and in its log, so you can tell this case apart from a wrong username or a server-side rejection. Tracking issue: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
+
 ## What the plugin reads from `~/.ssh/`
 
 Currently:

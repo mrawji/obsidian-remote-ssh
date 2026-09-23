@@ -3,7 +3,8 @@ import type { PluginSettings, SshProfile } from './types';
 import { SyncState } from './types';
 import { DEFAULT_SETTINGS, DEFAULT_WALK_IGNORE_DIRS } from './constants';
 import { SftpClient } from './ssh/SftpClient';
-import { AuthResolver } from './ssh/AuthResolver';
+import { AuthResolver, resolveAgentSocket } from './ssh/AuthResolver';
+import { diagnoseAgentAuth } from './ssh/AgentIdentities';
 import { HostKeyStore } from './ssh/HostKeyStore';
 import { SecretStore } from './ssh/SecretStore';
 import { KbdInteractiveModal } from './ui/KbdInteractiveModal';
@@ -488,7 +489,16 @@ export default class RemoteSshPlugin extends Plugin {
         category: classified.category, code: classified.code,
         original: classified.original.message, profileId: profile.id,
       });
-      new Notice(notice);
+      // ssh2 drops agent identities it cannot parse without a word (#536), so
+      // a certificate-only or FIDO-only agent fails as "authentication
+      // failed" and nothing more. Ask the agent what it actually holds and
+      // say so — best effort, and silent when the agent is not the problem.
+      let agentHint: string | null = null;
+      if (classified.category === 'auth' && profile.authMethod === 'agent') {
+        agentHint = await diagnoseAgentAuth(resolveAgentSocket(profile));
+        if (agentHint) logger.warn(`Connect failed: ${agentHint}`);
+      }
+      new Notice(agentHint ? `${notice}\n\n${agentHint}` : notice);
       try { await this.conn.client.disconnect(); } catch { /* ignore */ }
       return;
     }

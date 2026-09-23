@@ -6,6 +6,17 @@ import { logger } from '../util/logger';
 import { expandHome } from '../util/pathUtils';
 import { errorMessage } from "../util/errorMessage";
 
+/**
+ * Which agent socket a profile authenticates through: its own override, else
+ * the ambient `SSH_AUTH_SOCK` (on Windows, the `\\.\pipe\openssh-ssh-agent`
+ * named pipe path lives in the same variable). Exported so the failure
+ * diagnosis in `AgentIdentities` asks the *same* agent that auth just used —
+ * a second copy of this rule would eventually disagree with this one.
+ */
+export function resolveAgentSocket(profile: SshProfile): string | undefined {
+  return profile.agentSocket || process.env.SSH_AUTH_SOCK;
+}
+
 export class AuthResolver {
   // In-session secrets (e.g. password typed in ConnectModal but not yet persisted)
   private sessionSecrets: Map<string, string> = new Map();
@@ -66,7 +77,7 @@ export class AuthResolver {
       }
 
       case 'agent': {
-        const agentSocket = profile.agentSocket || process.env.SSH_AUTH_SOCK;
+        const agentSocket = resolveAgentSocket(profile);
         if (!agentSocket) throw new Error('SSH agent requested but SSH_AUTH_SOCK is not set.');
         logger.info(`Auth: using SSH agent at ${agentSocket}`);
         return { agent: agentSocket };
