@@ -27,6 +27,7 @@ import type { RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
 import type { ReadCache } from '../cache/ReadCache';
+import { ReadGate } from '../util/ReadGate';
 import type { DirCache } from '../cache/DirCache';
 import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
@@ -143,6 +144,12 @@ export class SftpDataAdapter {
      * (#127). When omitted (e.g. unit tests), no UI signaling occurs.
      */
     private transferTracker: TransferTracker | null = null,
+    /**
+     * Bounds concurrent remote reads and parks them across a reconnect.
+     * Injectable so a test can shorten the reconnect wait; production uses
+     * the defaults (see ReadGate).
+     */
+    private readGate: ReadGate = new ReadGate(),
   ) {}
 
   /**
@@ -801,11 +808,33 @@ export class SftpDataAdapter {
    */
   private async readBuffer(normalizedPath: string): Promise<Buffer> {
     const remote = this.toRemote(normalizedPath);
+
+    // Serve a cached hit without taking a slot: it costs no remote work, and
+    // making it queue behind other reads would only add latency.
+    if (this.reconnecting) {
+      const cachedNow = this.readCache.peek(remote);
+      if (cachedNow) {
+        this.readCache.get(remote); // bump LRU on hit
+        return cachedNow.data;
+      }
+    }
+
+    // Everything past here talks to the remote, so it goes through the gate:
+    // at most a few reads in flight, and a read that lands mid-reconnect
+    // waits for the session instead of failing. Indexing a large vault used
+    // to burst hard enough to take the session down, and then lose thousands
+    // of notes to "reconnecting" errors (#513).
+    return this.readGate.run(
+      () => this.readBufferOverWire(remote, normalizedPath),
+      () => this.reconnecting,
+    );
+  }
+
+  private async readBufferOverWire(remote: string, normalizedPath: string): Promise<Buffer> {
     const cached = this.readCache.peek(remote);
 
-    // While reconnecting we can't talk to the remote at all. Serve
-    // whatever is already in the cache so already-open editors keep
-    // working; throw on a miss rather than block forever.
+    // Still reconnecting after the gate's wait: serve the cache if we can,
+    // and only then give up, same as before.
     if (this.reconnecting) {
       if (cached) {
         this.readCache.get(remote); // bump LRU on hit
