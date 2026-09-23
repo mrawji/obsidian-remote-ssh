@@ -283,6 +283,26 @@ async function probeAdapter(page: Page, paths: string[]): Promise<unknown> {
     // left is the revalidating stat plus our own overhead.
     const rereadMs: Array<number | null> = [];
     for (const p of ps) rereadMs.push(await time(() => adapter.readBinary!(p)));
+    // The same round trip WITHOUT our adapter in the way: straight to the
+    // plugin's RpcClient. From plain Node this call measures under 1 ms
+    // (tests/integration/rpc.latency.test.ts) while the adapter measures
+    // ~41 ms here, so this says whether the cost is our adapter layer or the
+    // transport as the renderer sees it.
+    const plugin = (window as unknown as {
+      app?: { plugins?: { plugins?: Record<string, {
+        conn?: { rpcConnection?: { rpc?: { call?: (m: string, p: unknown) => Promise<unknown> } } };
+      }> } };
+    }).app?.plugins?.plugins?.['remote-ssh'];
+    const rpc = plugin?.conn?.rpcConnection?.rpc;
+    const rpcMs: Array<number | null> = [];
+    if (rpc?.call) {
+      const remoteBase = ps[0]?.split('/')[0] ?? '';
+      void remoteBase;
+      for (const p of ps) {
+        rpcMs.push(await time(() => rpc.call!('fs.stat', { path: p })));
+      }
+    }
+
     // Controls: if a bare setTimeout(0) also takes tens of ms, the renderer's
     // task queue is being throttled (an occluded Electron window under Xvfb)
     // and the RPC figure says nothing about a real desktop.
@@ -297,6 +317,7 @@ async function probeAdapter(page: Page, paths: string[]): Promise<unknown> {
     return {
       n: ps.length, errors,
       statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs),
+      rawRpcStatAvgMs: rpcMs.length ? avg(rpcMs) : null,
       setTimeout0AvgMs: avg(timerMs), microtaskAvgMs: avg(microMs),
       hidden: document.hidden, visibility: document.visibilityState,
     };
