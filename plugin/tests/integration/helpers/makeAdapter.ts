@@ -7,6 +7,7 @@ import { ReadCache } from '../../../src/cache/ReadCache';
 import { DirCache } from '../../../src/cache/DirCache';
 import { SftpRemoteFsClient } from '../../../src/adapter/SftpRemoteFsClient';
 import { SftpDataAdapter } from '../../../src/adapter/SftpDataAdapter';
+import { ReadGate } from '../../../src/util/ReadGate';
 import { PathMapper } from '../../../src/path/PathMapper';
 import type { SshProfile } from '../../../src/types';
 
@@ -62,6 +63,10 @@ export interface TestClient {
   ssh: SftpClient;
   pathMapper: PathMapper;
   adapter: SftpDataAdapter;
+  /** Exposed so a test can read hit/eviction counters off the live stack. */
+  readCache: ReadCache;
+  /** The gate the adapter reads through; `stats()` shows queueing under load. */
+  readGate: ReadGate;
   vaultRoot: string;
   disconnect(): Promise<void>;
 }
@@ -76,6 +81,14 @@ export async function makeTestClient(opts: {
   vaultRoot: string;
   /** Label folded into the SshProfile id; just for logging clarity. */
   label?: string;
+  /**
+   * Read-cache budget. Production uses 64 MiB; a test that wants the
+   * cache-overflow regime (more content touched than the cache holds)
+   * passes something small rather than seeding gigabytes.
+   */
+  readCacheBytes?: number;
+  /** Override the adapter's read gate — e.g. to measure with it and without. */
+  readGate?: ReadGate;
 }): Promise<TestClient> {
   const auth = new AuthResolver(new SecretStore());
   const hostKeys = new HostKeyStore();
@@ -85,15 +98,24 @@ export async function makeTestClient(opts: {
   const fsClient = new SftpRemoteFsClient(ssh);
   const pathMapper = new PathMapper(opts.clientId);
 
+  const readCache = new ReadCache(
+    opts.readCacheBytes === undefined ? {} : { maxBytes: opts.readCacheBytes },
+  );
+  const readGate = opts.readGate ?? new ReadGate();
   const adapter = new SftpDataAdapter(
     fsClient,
     opts.vaultRoot,
-    new ReadCache(),
+    readCache,
     new DirCache(),
     'integration-vault',
     pathMapper,
     null,  // no ResourceBridge in integration tests
     null,  // no write-conflict prompt
+    null,  // no AncestorTracker
+    null,  // no OfflineQueue
+    '',    // no shadow vault
+    null,  // no TransferTracker
+    readGate,
   );
 
   return {
@@ -101,6 +123,8 @@ export async function makeTestClient(opts: {
     ssh,
     pathMapper,
     adapter,
+    readCache,
+    readGate,
     vaultRoot: opts.vaultRoot,
     async disconnect() {
       try { await ssh.disconnect(); } catch { /* best effort */ }
