@@ -18,7 +18,7 @@ down, with frontmatter, tags and five `[[links]]` each).
 | 1,000 notes · 5 MB | ~1 min | ~15 s |
 | 10,000 notes · 50 MB | ~8 min | ~15 s |
 | 10,000 notes · 500 MB | ~15 min | ~15 s |
-| 50,000 notes · 5 GB | **does not finish** | — |
+| 50,000 notes · 5 GB | **hangs Obsidian** | — |
 
 "First connect" is the wait until links, graph, search and Dataview see
 the **whole** vault. The file tree itself shows up in about 15 seconds
@@ -26,8 +26,14 @@ at every size — you can open and edit notes long before the number
 above.
 
 **Practical limit today: around 10,000 notes.** Beyond that the first
-connect stops being something you can sit through, and at 50,000 notes
-indexing did not finish within an hour.
+connect stops being something you can sit through — and it is not simply
+slower. At 50,000 notes the plugin does not degrade gracefully: reads
+that take 42 ms at 10,000 notes take **24 seconds**, thousands of them
+fail, more bytes cross the wire than the vault contains, and after about
+15 minutes the Obsidian window stops responding and does not recover.
+Do not point this at a 50,000-note vault expecting a long wait; expect a
+hung window. Why it collapses rather than slows is being investigated in
+[#513](https://github.com/sotashimozono/obsidian-remote-ssh/issues/513).
 
 ## Why the first connect costs that
 
@@ -74,8 +80,9 @@ What helps now:
   directories* — a vault root shared with `node_modules`, `.venv` or
   build output is mostly noise, and pruning it server-side is the one
   lever that removes work rather than reordering it.
-- **Leave the first connect running** and come back to it. The file tree
-  is usable throughout; only the vault-wide features wait.
+- **Leave the first connect running** and come back to it — up to about
+  10,000 notes. The file tree is usable throughout; only the vault-wide
+  features wait. Past that size this stops being true, see above.
 
 Work on the first connect is tracked in
 [#513](https://github.com/sotashimozono/obsidian-remote-ssh/issues/513).
