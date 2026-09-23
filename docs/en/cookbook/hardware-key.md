@@ -7,7 +7,12 @@ schema: Article
 
 # Hardware-key SSH auth
 
-Sign SSH connections with a key that lives in tamper-resistant hardware — your YubiKey, your laptop's Secure Enclave, or any FIDO2 authenticator. The plugin uses your normal `ssh-agent`, so anything `ssh` can authenticate with works here too.
+Sign SSH connections with a key that lives in tamper-resistant hardware — your laptop's Secure Enclave, a TPM, or a YubiKey. The plugin authenticates through your normal `ssh-agent`.
+
+> [!warning] FIDO security keys (`sk-ssh-ed25519`, `sk-ecdsa-sha2-nistp256`) do not work yet
+> The plugin's SSH library can only use `ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521` and `ssh-ed25519`. An `sk-*` identity in your agent is skipped, and the connection fails with "SSH authentication failed" — even though `ssh` on the same machine connects fine. Same cause as OpenSSH certificates: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
+>
+> **Recipe 1 below therefore does not work today.** Recipes 2 and 3 do: they use ordinary `ed25519` / `ecdsa` keys whose *private* half is held in hardware, which is a different mechanism and is unaffected.
 
 ## Why hardware-back the key
 
@@ -21,7 +26,13 @@ The private key never leaves the secure element. A laptop compromise gives an at
 | **macOS Secure Enclave** (`ssh-agent` + `--apple-use-keychain`) | Apple Silicon / T2 chip | macOS-only; touchless re-use after one TouchID prompt |
 | **Windows Hello SSH agent** (Win11 24H2+) | TPM | Windows-only; same idea, Windows Hello prompt |
 
-## Recipe 1 — YubiKey (`sk-ssh-ed25519`)
+## Recipe 1 — YubiKey (`sk-ssh-ed25519`) — **not supported yet (#536)**
+
+The recipe below is correct for `ssh` itself and is kept so it is ready the day
+the plugin can use these keys. Today the plugin cannot: the agent offers an
+`sk-ssh-ed25519@openssh.com` identity and the plugin's SSH library drops it
+before the server ever sees it. If you need hardware backing now, use Recipe 2
+or 3.
 
 Generate a resident key on the YubiKey:
 
@@ -41,14 +52,9 @@ Copy the public key to the remote:
 ssh-copy-id -i ~/.ssh/id_ed25519_sk.pub user@host
 ```
 
-In the plugin profile:
-
-| Field | Value |
-|---|---|
-| Authentication | **SSH agent** |
-| (no key path needed — the agent has it) |  |
-
-On connect, the YubiKey blinks; touch it. Done.
+With `ssh` this is all you need. In the plugin, the profile field would be
+**Authentication → SSH agent** (no key path — the agent has it), but the
+connect fails today for the reason above.
 
 ### Importing on a second machine
 
@@ -115,8 +121,8 @@ In the plugin profile:
 
 ## Caveats
 
-- **YubiKey USB-A vs USB-C** — the FIDO2 protocol is the same; only the connector differs. The plugin doesn't care.
-- **Multi-machine workflow** — `sk-ssh-ed25519` resident keys re-import via `ssh-keygen -K` on each machine; remember to re-add to that machine's agent (`ssh-add ~/.ssh/id_ed25519_sk`).
+- **`sk-*` keys are the unsupported ones** — the limit is the key algorithm, not the device. A YubiKey holding an `sk-ssh-ed25519` key does not work with the plugin (#536); a Secure Enclave or TPM holding an ordinary `ed25519`/`ecdsa` key does.
+- **Multi-machine workflow** — `sk-ssh-ed25519` resident keys re-import via `ssh-keygen -K` on each machine; remember to re-add to that machine's agent (`ssh-add ~/.ssh/id_ed25519_sk`). For `ssh`; see above for the plugin.
 - **Touch fatigue** — `verify-required` means a touch per RPC round-trip if the agent doesn't cache. The plugin makes many fast RPCs after the initial auth. Most setups cache the signature for the SSH session's lifetime, so you touch once per connect; verify your specific agent's behaviour.
 - **CI / unattended use** — hardware-key auth is interactive by design; not suitable for cron jobs that need to ssh in without a human present.
 
