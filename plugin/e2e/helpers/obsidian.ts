@@ -87,6 +87,25 @@ export async function launchObsidian(
   });
 
   const cdpUrl = `http://127.0.0.1:${CDP_PORT}`;
+  try {
+    return await attachToObsidian(cdpUrl, proc, restore);
+  } catch (e) {
+    // Everything from here on can throw (a CDP timeout on a loaded machine is
+    // the common one). `registerVault` has already rewritten the real
+    // obsidian.json, and only the `cleanup` we never get to return would put
+    // it back — so a developer's vault list would keep this scaffold vault as
+    // the only open one.
+    restore();
+    try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+    throw e;
+  }
+}
+
+async function attachToObsidian(
+  cdpUrl: string,
+  proc: ChildProcess,
+  restore: () => void,
+): Promise<ObsidianHandle> {
   await waitForCDP(cdpUrl, 30_000);
 
   const browser = await connectOverCDPWithRetry(cdpUrl);
@@ -130,7 +149,11 @@ export async function launchObsidian(
 
   const cleanup = async () => {
     try { await browser.close(); } catch { /* best effort */ }
-    if (!proc.killed) {
+    // `exitCode !== null` means the process is already gone — typically
+    // because the caller closed the window itself. A `kill` then has nothing
+    // to signal, and an `exit` listener attached now would never fire, so the
+    // wait below would burn its full timeout on the happy path.
+    if (!proc.killed && proc.exitCode === null) {
       proc.kill('SIGTERM');
       await new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
@@ -347,6 +370,12 @@ async function killExistingObsidian(): Promise<void> {
  * Register the scaffold vault in Obsidian's app config (`obsidian.json`)
  * and mark it as the only `open: true` vault so Obsidian opens it on
  * launch. Returns a restore function that puts back the original config.
+ *
+ * The id is derived from the vault PATH, and an existing entry for that
+ * path is reused. Obsidian uses this id as `app.appId`, and its metadata
+ * cache lives in IndexedDB under `<appId>-cache`. A random id per launch
+ * therefore gave every launch a brand-new, empty cache — which looks
+ * exactly like "Obsidian refuses to reuse its index" and is not (#513).
  */
 function registerVault(vaultPath: string): () => void {
   const configPath = path.join(
@@ -372,10 +401,14 @@ function registerVault(vaultPath: string): () => void {
     delete config.vaults[id].open;
   }
 
-  // Add scaffold vault as open
-  const vaultId = crypto.randomBytes(8).toString('hex');
+  // Add scaffold vault as open, under a stable id for this path.
+  const normalised = process.platform === 'win32' ? vaultPath.replace(/\//g, '\\') : vaultPath;
+  const existing = Object.entries(config.vaults ?? {} as Record<string, { path?: string }>)
+    .find(([, v]) => (v as { path?: string }).path === normalised)?.[0];
+  const vaultId = existing
+    ?? crypto.createHash('sha256').update(normalised).digest('hex').slice(0, 16);
   config.vaults[vaultId] = {
-    path: process.platform === 'win32' ? vaultPath.replace(/\//g, '\\') : vaultPath,
+    path: normalised,
     ts: Date.now(),
     open: true,
   };

@@ -10,6 +10,7 @@ import {
 } from './helpers/obsidian';
 import { scaffoldTestVault, type ScaffoldResult } from './helpers/vault-scaffold';
 import { assertSshdReachable } from './helpers/sshd';
+import { logPathFor, readLogEntries } from './helpers/log-oracle';
 import { SCALE_PROFILES, seedScaleFixture, type SeededFixture } from './helpers/scale-fixture';
 import { NET_PROFILES, applyNetProfile, clearNetProfile, containerTxBytes } from './helpers/netem';
 
@@ -50,6 +51,7 @@ const SAMPLE_EVERY_MS = 10_000;
 const EVAL_TIMEOUT_MS = 30_000;
 
 const RESULTS_DIR = path.resolve(__dirname, '..', 'scale-results');
+const TIMED_OUT: unique symbol = Symbol('timed out');
 
 interface Sample {
   tMs: number;
@@ -59,6 +61,17 @@ interface Sample {
   mdInModel: number | null;
   parsed: number | null;
   clean: boolean | null;
+  /** `vault.readBinary` calls so far this launch: what metadataCache reads through. */
+  reads: number | null;
+  readAvgMs: number | null;
+  readMaxMs: number | null;
+  /** Most `vault.readBinary` calls in flight at once. 1 = strictly sequential. */
+  readInflightMax: number | null;
+  /** `vault.readBinary` calls that threw. Never folded into the averages. */
+  readErrors: number | null;
+  /** metadataCache's fileCache: entries, and how many carry a parsed hash. */
+  cacheEntries: number | null;
+  cacheWithHash: number | null;
 }
 
 interface PassResult {
@@ -73,6 +86,15 @@ interface PassResult {
   maxEvalMs: number | null;
   frozenSamples: number;
   budgetExceeded: boolean;
+  /** How the launch ended: a real window close, or the harness's signal. */
+  shutdown?: 'closed' | 'signalled';
+  /** Adapter-level stat/read timings, outside Obsidian's indexing queue. */
+  adapterProbe?: unknown;
+  reads: number | null;
+  readAvgMs: number | null;
+  readInflightMax: number | null;
+  /** metadataCache internals right after launch: whether its cache survived startup. */
+  cacheAtStart: unknown;
 }
 
 let obsidian: ObsidianHandle | null = null;
@@ -124,7 +146,6 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIM
     clearTimeout(timer);
   }
 }
-const TIMED_OUT = Symbol('timed out');
 
 async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
   const evalStart = Date.now();
@@ -140,18 +161,69 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
           };
         };
       }).app;
+      // Time every vault.readBinary, the call metadataCache's sequential work
+      // queue makes per note. Installed on the first sample, before the
+      // remote tree lands, so no read is missed.
+      interface ReadStats {
+        count: number; totalMs: number; maxMs: number; inflight: number; inflightMax: number;
+        /** Reads that threw. Obsidian may retry one, so these are counted, not averaged. */
+        errors: number;
+      }
+      const w = window as unknown as { __SCALE_READS__?: ReadStats };
+      const vault = (app?.vault ?? null) as
+        | { readBinary?: (f: MdFile) => Promise<ArrayBuffer>; __scaleWrapped?: boolean }
+        | null;
+      if (vault?.readBinary && !vault.__scaleWrapped) {
+        const stats: ReadStats = {
+          count: 0, totalMs: 0, maxMs: 0, inflight: 0, inflightMax: 0, errors: 0,
+        };
+        w.__SCALE_READS__ = stats;
+        const orig = vault.readBinary.bind(vault);
+        vault.readBinary = async (f: MdFile) => {
+          const t = performance.now();
+          stats.inflight++;
+          stats.inflightMax = Math.max(stats.inflightMax, stats.inflight);
+          try {
+            const r = await orig(f);
+            const d = performance.now() - t;
+            stats.count++;
+            stats.totalMs += d;
+            stats.maxMs = Math.max(stats.maxMs, d);
+            return r;
+          } catch (e) {
+            stats.errors++;
+            throw e;
+          } finally {
+            stats.inflight--;
+          }
+        };
+        vault.__scaleWrapped = true;
+      }
+      const rs = w.__SCALE_READS__;
       const files = app?.vault?.getMarkdownFiles?.() ?? [];
-      const mc = app?.metadataCache;
+      const mc = app?.metadataCache as {
+        getFileCache?: (f: MdFile) => unknown;
+        isCacheClean?: () => boolean;
+        fileCache?: Record<string, { hash: string }>;
+      } | undefined;
+      const fc = Object.values(mc?.fileCache ?? {});
       let parsed = 0;
       for (const f of files) if (mc?.getFileCache?.(f)) parsed++;
       return {
         mdInModel: files.length,
         parsed,
         clean: typeof mc?.isCacheClean === 'function' ? mc.isCacheClean() : null,
+        reads: rs?.count ?? 0,
+        readAvgMs: rs && rs.count ? Math.round(rs.totalMs / rs.count) : null,
+        readMaxMs: rs ? Math.round(rs.maxMs) : null,
+        readInflightMax: rs?.inflightMax ?? 0,
+        readErrors: rs?.errors ?? 0,
+        cacheEntries: fc.length,
+        cacheWithHash: fc.filter((e) => e.hash).length,
       };
     }),
     EVAL_TIMEOUT_MS,
-  ).catch(() => TIMED_OUT);
+  ).catch((): typeof TIMED_OUT => TIMED_OUT);
   const evalMs = r === TIMED_OUT ? null : Date.now() - evalStart;
   return {
     tMs: Date.now() - t0,
@@ -160,7 +232,145 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
     mdInModel: r === TIMED_OUT ? null : r.mdInModel,
     parsed: r === TIMED_OUT ? null : r.parsed,
     clean: r === TIMED_OUT ? null : r.clean,
+    reads: r === TIMED_OUT ? null : r.reads,
+    readAvgMs: r === TIMED_OUT ? null : r.readAvgMs,
+    readMaxMs: r === TIMED_OUT ? null : r.readMaxMs,
+    readInflightMax: r === TIMED_OUT ? null : r.readInflightMax,
+    readErrors: r === TIMED_OUT ? null : r.readErrors,
+    cacheEntries: r === TIMED_OUT ? null : r.cacheEntries,
+    cacheWithHash: r === TIMED_OUT ? null : r.cacheWithHash,
   };
+}
+
+/**
+ * Time the adapter directly, outside Obsidian's indexing queue: `stat` (one
+ * RPC) and `readBinary` (two RPCs cold, since the adapter revalidates with a
+ * stat) on distinct notes, sequentially.
+ *
+ * metadataCache reads one note at a time and each `vault.readBinary` costs
+ * ~42 ms on LAN and on a 40 ms WAN alike, so the cost is not the link. This
+ * says how much of it is our read path and how much is Obsidian's.
+ */
+async function probeAdapter(page: Page, paths: string[]): Promise<unknown> {
+  return withTimeout(page.evaluate(async (ps: string[]) => {
+    const adapter = (window as unknown as {
+      app?: { vault?: { adapter?: {
+        stat?: (p: string) => Promise<unknown>;
+        readBinary?: (p: string) => Promise<ArrayBuffer>;
+      } } };
+    }).app?.vault?.adapter;
+    if (!adapter?.stat || !adapter?.readBinary) return { error: 'no adapter' };
+    let errors = 0;
+    // A failed call returns null and is counted, never averaged: a fast
+    // rejection (a dropped channel, a lossy WAN profile) would otherwise look
+    // like a fast read and pull the figure this probe exists to establish.
+    const time = async (fn: () => Promise<unknown>): Promise<number | null> => {
+      const t = performance.now();
+      try {
+        await fn();
+      } catch {
+        errors++;
+        return null;
+      }
+      return performance.now() - t;
+    };
+    const ok = (xs: Array<number | null>): number[] => xs.filter((v): v is number => v !== null);
+    const statMs: Array<number | null> = [];
+    for (const p of ps) statMs.push(await time(() => adapter.stat!(p)));
+    const readMs: Array<number | null> = [];
+    for (const p of ps) readMs.push(await time(() => adapter.readBinary!(p)));
+    // Second pass over the same notes: now warm in the ReadCache, so what is
+    // left is the revalidating stat plus our own overhead.
+    const rereadMs: Array<number | null> = [];
+    for (const p of ps) rereadMs.push(await time(() => adapter.readBinary!(p)));
+    // Controls: if a bare setTimeout(0) also takes tens of ms, the renderer's
+    // task queue is being throttled (an occluded Electron window under Xvfb)
+    // and the RPC figure says nothing about a real desktop.
+    const timerMs: Array<number | null> = [];
+    for (let i = 0; i < 30; i++) timerMs.push(await time(() => new Promise((r) => setTimeout(r, 0))));
+    const microMs: Array<number | null> = [];
+    for (let i = 0; i < 30; i++) microMs.push(await time(() => Promise.resolve()));
+    const avg = (xs: Array<number | null>) => {
+      const good = ok(xs);
+      return good.length ? Math.round(good.reduce((a, b) => a + b, 0) / good.length) : null;
+    };
+    return {
+      n: ps.length, errors,
+      statAvgMs: avg(statMs), readAvgMs: avg(readMs), rereadAvgMs: avg(rereadMs),
+      setTimeout0AvgMs: avg(timerMs), microtaskAvgMs: avg(microMs),
+      hidden: document.hidden, visibility: document.visibilityState,
+    };
+  }, paths), EVAL_TIMEOUT_MS * 6).catch((): typeof TIMED_OUT => TIMED_OUT);
+}
+
+/**
+ * Close Obsidian the way a user does, and only fall back to the harness's
+ * SIGTERM if that doesn't take.
+ *
+ * This matters for what is being measured. Obsidian writes its metadata cache
+ * to IndexedDB with `durability: "relaxed"`, so a process that is signalled
+ * away can lose the last writes — and then the next launch has no cache to
+ * reuse, whatever the plugin did. #513 concluded "reuse is genuinely refused"
+ * from a harness that killed Obsidian, so the conclusion has to be re-taken on
+ * a clean shutdown.
+ */
+async function quitObsidian(handle: ObsidianHandle): Promise<'closed' | 'signalled'> {
+  try {
+    await handle.page.evaluate(() => { window.close(); });
+  } catch {
+    // The window may already be gone; fall through to the wait.
+  }
+  const exited = await new Promise<boolean>((resolve) => {
+    if (handle.process.exitCode !== null) return resolve(true);
+    const timer = setTimeout(() => resolve(false), 20_000);
+    handle.process.on('exit', () => { clearTimeout(timer); resolve(true); });
+  });
+  await handle.cleanup().catch(() => { /* best effort */ });
+  return exited ? 'closed' : 'signalled';
+}
+
+/**
+ * What metadataCache kept through startup: its IndexedDB-backed `fileCache`
+ * (path → mtime/size/hash) against the model's `TFile.stat`. On a relaunch,
+ * a note is read again unless both match and the hash's metadata is present.
+ * Key names and stats only, never content.
+ */
+async function cacheAtStart(page: Page): Promise<unknown> {
+  return withTimeout(page.evaluate(async () => {
+    interface Stat { mtime: number; size: number }
+    const app = (window as unknown as {
+      app?: {
+        appId?: string;
+        vault?: { getMarkdownFiles?: () => Array<{ path: string; stat: Stat }> };
+        metadataCache?: {
+          initialized?: boolean;
+          fileCache?: Record<string, { mtime: number; size: number; hash: string }>;
+          metadataCache?: Record<string, unknown>;
+        };
+      };
+    }).app;
+    const mc = app?.metadataCache;
+    const fc = mc?.fileCache ?? {};
+    const files = app?.vault?.getMarkdownFiles?.() ?? [];
+    const entries = Object.values(fc);
+    // The metadata cache lives in IndexedDB under `<appId>-cache`. If appId
+    // is not stable per vault, every launch starts from an empty cache no
+    // matter what anyone does.
+    const dbs = typeof indexedDB.databases === 'function'
+      ? (await indexedDB.databases()).map((d) => d.name ?? '?')
+      : ['unsupported'];
+    return {
+      appId: app?.appId ?? null,
+      databases: dbs,
+      initialized: mc?.initialized ?? null,
+      modelMarkdown: files.length,
+      fileCacheEntries: entries.length,
+      withHash: entries.filter((e) => e.hash).length,
+      metadataEntries: Object.keys(mc?.metadataCache ?? {}).length,
+      statMatches: files.filter((f) => fc[f.path]?.mtime === f.stat.mtime && fc[f.path]?.size === f.stat.size).length,
+      first: files.slice(0, 3).map((f) => ({ path: f.path, stat: f.stat, cache: fc[f.path] ?? null })),
+    };
+  }), EVAL_TIMEOUT_MS).catch((): typeof TIMED_OUT => TIMED_OUT);
 }
 
 async function runPass(pass: PassResult['pass']): Promise<PassResult> {
@@ -168,6 +378,8 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
   const tx0 = containerTxBytes();
   const t0 = Date.now();
   obsidian = await launchObsidian(shadowVaultPath);
+  const cache = await cacheAtStart(obsidian.page);
+  console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] cache at start: ${JSON.stringify(cache)}`);
 
   const samples: Sample[] = [];
   const firstAt = (pred: (s: Sample) => boolean): number | null =>
@@ -182,7 +394,9 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     console.warn(
       `[scale ${PROFILE.name}/${NET.name} ${pass}] t=${(s.tMs / 1000).toFixed(0)}s ` +
       `model=${s.mdInModel}/${expected} parsed=${s.parsed} clean=${s.clean} ` +
-      `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms`,
+      `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms ` +
+      `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax} ` +
+      `cache=${s.cacheEntries}/${s.cacheWithHash} hashed errors=${s.readErrors}`,
     );
     // Two clean samples in a row, so a late straggler read is still counted.
     if (samples.length >= 2 && isClean(s) && isClean(samples[samples.length - 2])) break;
@@ -190,11 +404,31 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     await new Promise((r) => setTimeout(r, SAMPLE_EVERY_MS));
   }
 
-  await obsidian.cleanup();
+  // Adapter-level timings on 30 notes the index has already been through.
+  const probePaths = await obsidian.page.evaluate(() => {
+    const files = (window as unknown as {
+      app?: { vault?: { getMarkdownFiles?: () => Array<{ path: string }> } };
+    }).app?.vault?.getMarkdownFiles?.() ?? [];
+    return files.slice(0, 30).map((f) => f.path);
+  }).catch(() => [] as string[]);
+  const adapterProbe = probePaths.length ? await probeAdapter(obsidian.page, probePaths) : null;
+  console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] adapter probe: ${JSON.stringify(adapterProbe)}`);
+
+  // Let IndexedDB's relaxed-durability writes land, then close the window
+  // rather than signalling the process, so the next pass measures reuse.
+  await new Promise((r) => setTimeout(r, 5_000));
+  const how = await quitObsidian(obsidian);
+  console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] shutdown: ${how}`);
   obsidian = null;
+  for (const e of readLogEntries(logPathFor(shadowVaultPath))) {
+    if (/TreeSnapshot|reconciled|BackgroundIndexer: (complete|full walk)/.test(e.msg ?? '')) {
+      console.warn(`[scale ${PROFILE.name}/${NET.name} ${pass}] log: ${e.msg}`);
+    }
+  }
 
   const parsedSample = samples.find(isParsed);
   const evals = samples.map((s) => s.evalMs).filter((v): v is number => v !== null);
+  const last = [...samples].reverse().find((s) => s.reads !== null);
   return {
     pass,
     samples,
@@ -206,6 +440,12 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
     maxEvalMs: evals.length ? Math.max(...evals) : null,
     frozenSamples: samples.filter((s) => s.evalMs === null).length,
     budgetExceeded,
+    shutdown: how,
+    adapterProbe: adapterProbe === TIMED_OUT ? 'timed out' : adapterProbe,
+    reads: last?.reads ?? null,
+    readAvgMs: last?.readAvgMs ?? null,
+    readInflightMax: last?.readInflightMax ?? null,
+    cacheAtStart: cache === TIMED_OUT ? 'timed out' : cache,
   };
 }
 
@@ -227,7 +467,8 @@ function writeReport(): void {
     `| ${p.pass} | ${fmtS(p.connectedMs)} | ${fmtS(p.treeMs)} | ${fmtS(p.parsedMs)} | ` +
     `${fmtS(p.cleanMs)} | ${(p.bytesToParsed / 1e6).toFixed(0)} MB | ` +
     `${(p.bytesToParsed / fixture.markdownBytes).toFixed(2)} | ` +
-    `${p.maxEvalMs ?? '-'} ms | ${p.frozenSamples} | ${p.budgetExceeded ? 'yes' : 'no'} |`,
+    `${p.maxEvalMs ?? '-'} ms | ${p.frozenSamples} | ${p.budgetExceeded ? 'yes' : 'no'} | ` +
+    `${p.reads ?? '-'} | ${p.readAvgMs ?? '-'} ms | ${p.readInflightMax ?? '-'} |`,
   );
   const md = [
     `### Scale: \`${PROFILE.name}\` over \`${NET.name}\``,
@@ -237,8 +478,8 @@ function writeReport(): void {
       ` · link: ${NET.delayMs ?? 0} ms delay, ${NET.rateMbit ?? 'unshaped'} Mbit` +
       ` · budget ${BUDGET_MS / 60_000} min/pass`,
     '',
-    '| pass | connected | tree | parsed | clean | bytes sent | ÷ markdown | max eval | frozen samples | over budget |',
-    '|---|---|---|---|---|---|---|---|---|---|',
+    '| pass | connected | tree | parsed | clean | bytes sent | ÷ markdown | max eval | frozen samples | over budget | reads | avg read | reads in flight (max) |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|',
     ...rows,
     '',
   ].join('\n');
