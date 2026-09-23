@@ -22,12 +22,14 @@ Passphrase-protected keys: if your agent has the unlocked key, agent auth works 
 
 ### Which agent identities the plugin can use
 
-`ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521` and `ssh-ed25519`. Anything else your agent holds is **skipped**, including:
+`ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521`, `ssh-ed25519` — and, since 1.1.9, **OpenSSH certificates** over any of them (`ssh-ed25519-cert-v01@openssh.com` and friends). That is the credential you get wherever a CA issues short-lived logins: Teleport, HashiCorp Vault, step-ca, Google OS Login. Nothing to configure — put the certificate in your agent as you would for `ssh`:
 
-- **OpenSSH certificates** (`ssh-ed25519-cert-v01@openssh.com` and friends) — common wherever a CA issues short-lived credentials (Teleport, Vault, step-ca, OS Login).
-- **FIDO security keys** (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`).
+```bash
+ssh-add ~/.ssh/id_ed25519      # picks up id_ed25519-cert.pub beside it
+ssh-add -l                     # both the key and the certificate should be listed
+```
 
-If every identity your agent holds is one of those, the connection fails with "SSH authentication failed" while `ssh` on the same machine succeeds. Since 1.1.9 the plugin names the skipped identities in that notice and in its log, so you can tell this case apart from a wrong username or a server-side rejection. Tracking issue: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
+**FIDO security keys** (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) are still **skipped** — the plugin's SSH library cannot parse them. An agent holding only those fails with "SSH authentication failed" while `ssh` on the same machine succeeds; the plugin names the skipped identities in that notice and in its log so you can tell it apart from a wrong username or a server-side rejection. Tracking issue: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
 
 ## What the plugin reads from `~/.ssh/`
 
