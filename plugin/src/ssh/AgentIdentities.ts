@@ -21,11 +21,13 @@ import { errorMessage } from '../util/errorMessage';
  * before the server ever hears about it. From the outside the agent simply
  * appears to hold nothing usable.
  *
- * This module does not fix that (see #536 for the candidate fixes). It asks
- * the agent what it holds and turns the silence into a sentence, so a user
- * who cannot connect at least learns why, and that `ssh` is not lying to
- * them. It only ever sends REQUEST_IDENTITIES — never a signature request —
- * so it reads public key types and comments and nothing else.
+ * `CertificateAgent` now keeps certificates rather than dropping them, so the
+ * gap left is FIDO security keys (`sk-*`), which ssh2 cannot parse either.
+ *
+ * This module is the reading half: it asks the agent what it holds, and turns
+ * the silence into a sentence for a user who cannot connect. Everything here
+ * sends REQUEST_IDENTITIES and nothing else, so it reads public key types,
+ * comments and blobs — never a signature.
  */
 
 export interface AgentIdentity {
@@ -33,6 +35,12 @@ export interface AgentIdentity {
   type: string;
   /** The agent's own label for the key, e.g. a file path or a comment. */
   comment: string;
+}
+
+/** An identity plus its wire blob, which is what a signature request needs. */
+export interface AgentIdentityBlob extends AgentIdentity {
+  /** The public key (or certificate) exactly as the agent returned it. */
+  blob: Buffer;
 }
 
 /**
@@ -49,9 +57,35 @@ export const SSH2_SUPPORTED_KEY_TYPES: ReadonlySet<string> = new Set([
   'ssh-ed25519',
 ]);
 
+/** The plain algorithm behind a certificate type, or the type itself. */
+export function baseKeyType(type: string): string {
+  return type.replace(/-cert-v\d+@openssh\.com$/, '');
+}
+
+export function isCertificateType(type: string): boolean {
+  return /-cert-v\d+@openssh\.com$/.test(type);
+}
+
+/**
+ * What the plugin can authenticate with: the types ssh2 parses, plus an
+ * OpenSSH certificate over any of them — `CertificateAgent` keeps those and
+ * `certificateAuth` finishes the handshake.
+ */
+export function isUsableIdentity(type: string): boolean {
+  return SSH2_SUPPORTED_KEY_TYPES.has(baseKeyType(type));
+}
+
 const SSH_AGENTC_REQUEST_IDENTITIES = 11;
 const SSH_AGENT_FAILURE = 5;
 const SSH_AGENT_IDENTITIES_ANSWER = 12;
+
+/** Length-prefix a buffer or string, the SSH wire `string` encoding. */
+export function sshString(value: Buffer | string): Buffer {
+  const buf = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(buf.length, 0);
+  return Buffer.concat([len, buf]);
+}
 
 const DEFAULT_TIMEOUT_MS = 2_000;
 /** A sane ceiling; a real agent holds a handful, not thousands. */
@@ -69,25 +103,51 @@ export interface AgentQueryOptions {
  * Rejects on anything unexpected: this runs while the user is already
  * looking at a failure, so a half-parsed answer must not become advice.
  */
-export function listAgentIdentities(
+export async function listAgentIdentities(
   socketPath: string,
   opts: AgentQueryOptions = {},
 ): Promise<AgentIdentity[]> {
+  const identities = await listAgentIdentityBlobs(socketPath, opts);
+  return identities.map(({ type, comment }) => ({ type, comment }));
+}
+
+/**
+ * As `listAgentIdentities`, but keeps each identity's wire blob — the form a
+ * signature request has to quote back to the agent.
+ */
+export async function listAgentIdentityBlobs(
+  socketPath: string,
+  opts: AgentQueryOptions = {},
+): Promise<AgentIdentityBlob[]> {
+  return parseIdentitiesAnswer(
+    await agentRoundTrip(socketPath, Buffer.from([SSH_AGENTC_REQUEST_IDENTITIES]), opts),
+  );
+}
+
+/**
+ * Send one request to the agent and return the body of its reply. One socket
+ * per exchange, as OpenSSH's own client does.
+ */
+export function agentRoundTrip(
+  socketPath: string,
+  request: Buffer,
+  opts: AgentQueryOptions = {},
+): Promise<Buffer> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-  return new Promise<AgentIdentity[]>((resolve, reject) => {
+  return new Promise<Buffer>((resolve, reject) => {
     const socket = net.connect(socketPath);
     // No encoding is set on the socket, so every chunk arrives as a Buffer.
     const chunks: Uint8Array[] = [];
     let length = -1;
     let settled = false;
 
-    const finish = (err: Error | null, ids?: AgentIdentity[]) => {
+    const finish = (err: Error | null, body?: Buffer) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      if (err) reject(err); else resolve(ids!);
+      if (err) reject(err); else resolve(body!);
     };
 
     const timer = setTimeout(
@@ -98,12 +158,7 @@ export function listAgentIdentities(
     socket.on('error', (e) => finish(new Error(`SSH agent at ${socketPath}: ${errorMessage(e)}`)));
     socket.on('end', () => finish(new Error('SSH agent closed the connection mid-reply')));
 
-    socket.on('connect', () => {
-      const frame = Buffer.alloc(5);
-      frame.writeUInt32BE(1, 0);
-      frame[4] = SSH_AGENTC_REQUEST_IDENTITIES;
-      socket.write(frame);
-    });
+    socket.on('connect', () => socket.write(sshString(request)));
 
     socket.on('data', (chunk: Uint8Array) => {
       chunks.push(chunk);
@@ -113,11 +168,7 @@ export function listAgentIdentities(
         length = buf.readUInt32BE(0);
       }
       if (buf.length < 4 + length) return;
-      try {
-        finish(null, parseIdentitiesAnswer(buf.subarray(4, 4 + length)));
-      } catch (e) {
-        finish(e instanceof Error ? e : new Error(String(e)));
-      }
+      finish(null, buf.subarray(4, 4 + length));
     });
   });
 }
@@ -131,7 +182,7 @@ function readString(buf: Buffer, pos: number): { value: Buffer; next: number } {
   return { value: buf.subarray(start, start + len), next: start + len };
 }
 
-function parseIdentitiesAnswer(body: Buffer): AgentIdentity[] {
+function parseIdentitiesAnswer(body: Buffer): AgentIdentityBlob[] {
   if (body.length < 1) throw new Error('empty agent reply');
   if (body[0] === SSH_AGENT_FAILURE) throw new Error('the SSH agent refused the identities request');
   if (body[0] !== SSH_AGENT_IDENTITIES_ANSWER) {
@@ -142,7 +193,7 @@ function parseIdentitiesAnswer(body: Buffer): AgentIdentity[] {
   const count = body.readUInt32BE(1);
   if (count > MAX_IDENTITIES) throw new Error(`implausible identity count ${count}`);
 
-  const identities: AgentIdentity[] = [];
+  const identities: AgentIdentityBlob[] = [];
   let p = 5;
   for (let i = 0; i < count; i++) {
     const blob = readString(body, p);
@@ -153,6 +204,7 @@ function parseIdentitiesAnswer(body: Buffer): AgentIdentity[] {
     identities.push({
       type: algo.value.toString('utf8'),
       comment: comment.value.toString('utf8'),
+      blob: blob.value,
     });
   }
   return identities;
@@ -174,16 +226,16 @@ export function describeAgentIdentities(identities: AgentIdentity[]): string | n
     return 'The SSH agent holds no identities — check with `ssh-add -l`, and add a key with `ssh-add`.';
   }
 
-  const unusable = identities.filter((i) => !SSH2_SUPPORTED_KEY_TYPES.has(i.type));
+  const unusable = identities.filter((i) => !isUsableIdentity(i.type));
   if (unusable.length === 0) return null;
 
   const listed = unusable.map((i) => `${i.type} (${kindOf(i.type)})`).join(', ');
   const usable = identities.length - unusable.length;
   return (
     `The SSH agent offers ${unusable.length} of ${identities.length} identities the plugin cannot use: ` +
-    `${listed}. Its SSH library handles only ssh-rsa, ssh-dss, ecdsa-sha2-nistp256/384/521 and ` +
-    `ssh-ed25519, so OpenSSH certificates and FIDO security keys are dropped before the server sees ` +
-    `them (#536) — which is why \`ssh\` connects and this does not. ` +
+    `${listed}. It can use ssh-rsa, ssh-dss, ecdsa-sha2-nistp256/384/521, ssh-ed25519 and OpenSSH ` +
+    `certificates over any of them; FIDO security keys are not implemented yet (#536), so they are ` +
+    `never offered to the server — which is why \`ssh\` connects and this does not. ` +
     (usable === 0
       ? 'No usable identity is left, so agent authentication cannot succeed as things stand.'
       : usable === 1

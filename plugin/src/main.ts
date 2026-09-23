@@ -489,10 +489,10 @@ export default class RemoteSshPlugin extends Plugin {
         category: classified.category, code: classified.code,
         original: classified.original.message, profileId: profile.id,
       });
-      // ssh2 drops agent identities it cannot parse without a word (#536), so
-      // a certificate-only or FIDO-only agent fails as "authentication
-      // failed" and nothing more. Ask the agent what it actually holds and
-      // say so — best effort, and silent when the agent is not the problem.
+      // ssh2 drops agent identities it cannot parse without a word (#536).
+      // Certificates are handled now; a FIDO-only agent still fails as
+      // "authentication failed" and nothing more. Ask the agent what it
+      // holds and say so — best effort, silent when that is not the problem.
       let agentHint: string | null = null;
       if (classified.category === 'auth' && profile.authMethod === 'agent') {
         agentHint = await diagnoseAgentAuth(resolveAgentSocket(profile));

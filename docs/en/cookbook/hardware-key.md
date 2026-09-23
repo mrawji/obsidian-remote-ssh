@@ -10,7 +10,7 @@ schema: Article
 Sign SSH connections with a key that lives in tamper-resistant hardware — your laptop's Secure Enclave, a TPM, or a YubiKey. The plugin authenticates through your normal `ssh-agent`.
 
 > [!warning] FIDO security keys (`sk-ssh-ed25519`, `sk-ecdsa-sha2-nistp256`) do not work yet
-> The plugin's SSH library can only use `ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521` and `ssh-ed25519`. An `sk-*` identity in your agent is skipped, and the connection fails with "SSH authentication failed" — even though `ssh` on the same machine connects fine. Same cause as OpenSSH certificates: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
+> The plugin's SSH library can only parse `ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521` and `ssh-ed25519` (plus OpenSSH certificates over those, since 1.1.9). An `sk-*` identity in your agent is skipped, and the connection fails with "SSH authentication failed" — even though `ssh` on the same machine connects fine. Tracking issue: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
 >
 > **Recipe 1 below therefore does not work today.** Recipes 2 and 3 do: they use ordinary `ed25519` / `ecdsa` keys whose *private* half is held in hardware, which is a different mechanism and is unaffected.
 

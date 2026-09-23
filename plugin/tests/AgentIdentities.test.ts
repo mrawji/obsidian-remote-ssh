@@ -152,13 +152,20 @@ describe('describeAgentIdentities', () => {
     ])).toBeNull();
   });
 
-  it('names the certificate the plugin had to skip', () => {
-    const msg = describeAgentIdentities([
+  it('says nothing about a certificate, which the plugin now authenticates with', () => {
+    // Before CertificateAgent this was the headline complaint (#536). Calling
+    // it unusable now would send a stuck user chasing the wrong thing.
+    expect(describeAgentIdentities([
       { type: 'ssh-ed25519', comment: 'laptop' },
       { type: 'ssh-ed25519-cert-v01@openssh.com', comment: 'work-cert' },
+    ])).toBeNull();
+  });
+
+  it('still flags a certificate over a key type nothing here can parse', () => {
+    const msg = describeAgentIdentities([
+      { type: 'sk-ssh-ed25519-cert-v01@openssh.com', comment: 'yubikey-cert' },
     ]);
-    expect(msg).toContain('ssh-ed25519-cert-v01@openssh.com');
-    expect(msg).toContain('certificate');
+    expect(msg).toContain('sk-ssh-ed25519-cert-v01@openssh.com');
     expect(msg).toContain('#536');
   });
 
@@ -202,15 +209,18 @@ describe('describeAgentIdentities', () => {
 });
 
 describe('diagnoseAgentAuth', () => {
-  it('explains an auth failure when the agent holds only a certificate', async () => {
+  it('explains an auth failure when the agent holds only a FIDO key', async () => {
     const sock = await fakeAgent([
-      { type: 'ssh-ed25519-cert-v01@openssh.com', comment: 'work-cert' },
+      { type: 'sk-ssh-ed25519@openssh.com', comment: 'yubikey' },
     ]);
-    await expect(diagnoseAgentAuth(sock)).resolves.toContain('certificate');
+    await expect(diagnoseAgentAuth(sock)).resolves.toMatch(/security key/i);
   });
 
   it('stays quiet when the agent looks fine — the failure is something else', async () => {
-    const sock = await fakeAgent([{ type: 'ssh-ed25519', comment: 'laptop' }]);
+    const sock = await fakeAgent([
+      { type: 'ssh-ed25519', comment: 'laptop' },
+      { type: 'ssh-ed25519-cert-v01@openssh.com', comment: 'work-cert' },
+    ]);
     await expect(diagnoseAgentAuth(sock)).resolves.toBeNull();
   });
 
