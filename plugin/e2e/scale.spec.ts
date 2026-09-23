@@ -80,6 +80,13 @@ interface Sample {
   heapMB: number | null;
   heapLimitMB: number | null;
   readCache: unknown;
+  /**
+   * Reads at the ADAPTER, split by entry point. metadataCache goes through
+   * `vault.readBinary`; Obsidian's core search goes through `vault.cachedRead`
+   * → `adapter.read`. Counting only the first hid a second full pass over the
+   * vault, and with it why traffic is 1.5–2.7× the markdown.
+   */
+  adapterReads: { read: number; readBinary: number } | null;
   syncState: string | null;
   lastReadError: string | null;
 }
@@ -214,6 +221,29 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         };
         vault.__scaleWrapped = true;
       }
+      // Same idea one layer down, installed once.
+      interface AdapterCounts { read: number; readBinary: number }
+      const aw = window as unknown as { __SCALE_ADAPTER_READS__?: AdapterCounts };
+      const adapter = (app?.vault as unknown as {
+        read?: (p: string) => Promise<string>;
+        readBinary?: (p: string) => Promise<ArrayBuffer>;
+        __scaleWrapped?: boolean;
+      } | undefined) && (app as unknown as {
+        vault: { adapter: {
+          read?: (p: string) => Promise<string>;
+          readBinary?: (p: string) => Promise<ArrayBuffer>;
+          __scaleWrapped?: boolean;
+        } };
+      }).vault.adapter;
+      if (adapter && !adapter.__scaleWrapped && adapter.read && adapter.readBinary) {
+        const counts: AdapterCounts = { read: 0, readBinary: 0 };
+        aw.__SCALE_ADAPTER_READS__ = counts;
+        const origRead = adapter.read.bind(adapter);
+        const origBin = adapter.readBinary.bind(adapter);
+        adapter.read = (p: string) => { counts.read++; return origRead(p); };
+        adapter.readBinary = (p: string) => { counts.readBinary++; return origBin(p); };
+        adapter.__scaleWrapped = true;
+      }
       const rs = w.__SCALE_READS__;
       const files = app?.vault?.getMarkdownFiles?.() ?? [];
       const mc = app?.metadataCache as {
@@ -250,6 +280,7 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         heapMB: mem ? Math.round(mem.usedJSHeapSize / 1e6) : null,
         heapLimitMB: mem ? Math.round(mem.jsHeapSizeLimit / 1e6) : null,
         readCache: plugin?.adapterMgr?.readCache?.stats?.() ?? null,
+        adapterReads: aw.__SCALE_ADAPTER_READS__ ? { ...aw.__SCALE_ADAPTER_READS__ } : null,
         syncState: plugin?.state ?? null,
         lastReadError: (window as unknown as { __SCALE_LAST_READ_ERROR__?: string })
           .__SCALE_LAST_READ_ERROR__ ?? null,
@@ -275,6 +306,7 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
     heapMB: r === TIMED_OUT ? null : r.heapMB,
     heapLimitMB: r === TIMED_OUT ? null : r.heapLimitMB,
     readCache: r === TIMED_OUT ? null : r.readCache,
+    adapterReads: r === TIMED_OUT ? null : r.adapterReads,
     syncState: r === TIMED_OUT ? null : r.syncState,
     lastReadError: r === TIMED_OUT ? null : r.lastReadError,
   };
@@ -436,7 +468,8 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
       `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax} ` +
       `cache=${s.cacheEntries}/${s.cacheWithHash} hashed errors=${s.readErrors} ` +
       `heap=${s.heapMB}/${s.heapLimitMB}MB state=${s.syncState} ` +
-      `rc=${JSON.stringify(s.readCache)} lastErr=${s.lastReadError ?? '-'}`,
+      `rc=${JSON.stringify(s.readCache)} adapter=${JSON.stringify(s.adapterReads)} ` +
+      `lastErr=${s.lastReadError ?? '-'}`,
     );
     // Two clean samples in a row, so a late straggler read is still counted.
     if (samples.length >= 2 && isClean(s) && isClean(samples[samples.length - 2])) break;
