@@ -72,6 +72,16 @@ interface Sample {
   /** metadataCache's fileCache: entries, and how many carry a parsed hash. */
   cacheEntries: number | null;
   cacheWithHash: number | null;
+  /**
+   * Why a big vault collapses rather than merely slowing (#513): the renderer's
+   * heap, what the failed reads actually say, the plugin's own read cache, and
+   * whether the session is reconnecting underneath.
+   */
+  heapMB: number | null;
+  heapLimitMB: number | null;
+  readCache: unknown;
+  syncState: string | null;
+  lastReadError: string | null;
 }
 
 interface PassResult {
@@ -192,6 +202,11 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
             return r;
           } catch (e) {
             stats.errors++;
+            // Keep the message: at 50k notes ~9,000 reads failed and the
+            // counter alone cannot say whether that is a timeout, a dropped
+            // channel or a reconnect.
+            (window as unknown as { __SCALE_LAST_READ_ERROR__?: string })
+              .__SCALE_LAST_READ_ERROR__ = String((e as Error)?.message ?? e).slice(0, 200);
             throw e;
           } finally {
             stats.inflight--;
@@ -207,6 +222,18 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         fileCache?: Record<string, { hash: string }>;
       } | undefined;
       const fc = Object.values(mc?.fileCache ?? {});
+      const plugin = (window as unknown as {
+        app?: { plugins?: { plugins?: Record<string, {
+          state?: string;
+          adapterMgr?: { readCache?: { stats?: () => unknown } };
+        }> } };
+      }).app?.plugins?.plugins?.['remote-ssh'];
+      // Chromium only exposes performance.memory on the renderer, and only
+      // for the JS heap — enough to tell "we are at the ceiling" from "we are
+      // not", which is the question here.
+      const mem = (performance as unknown as {
+        memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number };
+      }).memory;
       let parsed = 0;
       for (const f of files) if (mc?.getFileCache?.(f)) parsed++;
       return {
@@ -220,6 +247,12 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
         readErrors: rs?.errors ?? 0,
         cacheEntries: fc.length,
         cacheWithHash: fc.filter((e) => e.hash).length,
+        heapMB: mem ? Math.round(mem.usedJSHeapSize / 1e6) : null,
+        heapLimitMB: mem ? Math.round(mem.jsHeapSizeLimit / 1e6) : null,
+        readCache: plugin?.adapterMgr?.readCache?.stats?.() ?? null,
+        syncState: plugin?.state ?? null,
+        lastReadError: (window as unknown as { __SCALE_LAST_READ_ERROR__?: string })
+          .__SCALE_LAST_READ_ERROR__ ?? null,
       };
     }),
     EVAL_TIMEOUT_MS,
@@ -239,6 +272,11 @@ async function sample(page: Page, t0: number, tx0: number): Promise<Sample> {
     readErrors: r === TIMED_OUT ? null : r.readErrors,
     cacheEntries: r === TIMED_OUT ? null : r.cacheEntries,
     cacheWithHash: r === TIMED_OUT ? null : r.cacheWithHash,
+    heapMB: r === TIMED_OUT ? null : r.heapMB,
+    heapLimitMB: r === TIMED_OUT ? null : r.heapLimitMB,
+    readCache: r === TIMED_OUT ? null : r.readCache,
+    syncState: r === TIMED_OUT ? null : r.syncState,
+    lastReadError: r === TIMED_OUT ? null : r.lastReadError,
   };
 }
 
@@ -396,7 +434,9 @@ async function runPass(pass: PassResult['pass']): Promise<PassResult> {
       `model=${s.mdInModel}/${expected} parsed=${s.parsed} clean=${s.clean} ` +
       `tx=${(s.txBytes / 1e6).toFixed(1)}MB eval=${s.evalMs ?? 'FROZEN'}ms ` +
       `reads=${s.reads} avg=${s.readAvgMs}ms max=${s.readMaxMs}ms inflightMax=${s.readInflightMax} ` +
-      `cache=${s.cacheEntries}/${s.cacheWithHash} hashed errors=${s.readErrors}`,
+      `cache=${s.cacheEntries}/${s.cacheWithHash} hashed errors=${s.readErrors} ` +
+      `heap=${s.heapMB}/${s.heapLimitMB}MB state=${s.syncState} ` +
+      `rc=${JSON.stringify(s.readCache)} lastErr=${s.lastReadError ?? '-'}`,
     );
     // Two clean samples in a row, so a late straggler read is still counted.
     if (samples.length >= 2 && isClean(s) && isClean(samples[samples.length - 2])) break;
