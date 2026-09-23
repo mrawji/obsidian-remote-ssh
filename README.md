@@ -430,3 +430,23 @@ strategy is in [docs/en/contributing/testing-strategy.md](docs/en/contributing/t
 Inspired by VS Code's Remote-SSH model. The wire format is an LSP-style
 framed JSON-RPC over a unix-socket-forwarded stream — the same shape
 language servers use, just for filesystem ops.
+
+---
+
+## Licensing on this branch
+
+This branch carries two codebases and therefore two licences.
+
+| What | Whose | Licence |
+|---|---|---|
+| `quartz/`, `quartz.config.ts`, `quartz.layout.ts`, `index.d.ts`, `globals.d.ts`, the root `package.json` / `package-lock.json` | [Quartz](https://github.com/jackyzha0/quartz) v4.5.2 by jackyzha0 | MIT — [`LICENSE.txt`](LICENSE.txt) |
+| everything else (`plugin/`, `server/`, `docs/`, `mobile/`, `next/`, …) | this project | MIT — [`LICENSE`](LICENSE) |
+
+The docs workflow on `main`/`next` fetches the first group from here at build
+time (`.github/workflows/docs.yml`), which is why Quartz lives on a branch of
+its own rather than in the release tree.
+
+`LICENSE.txt` is Quartz's own notice, kept beside Quartz's own code. It was
+previously only at `docs-site/LICENSE.txt`, a directory that no longer holds
+any of that code — and for a while it sat on the release branches instead,
+which have none of it at all.
