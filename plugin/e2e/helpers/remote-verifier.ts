@@ -1,4 +1,4 @@
-import { Client } from 'ssh2';
+import { Client, type FileEntryWithStats, type SFTPWrapper } from 'ssh2';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -165,6 +165,85 @@ export class RemoteVerifier {
     });
   }
 
+  /**
+   * Binary read. The utf8 `readFile` above round-trips bytes through a
+   * string decode, which silently mangles any non-UTF8 payload (a PNG
+   * comes back with U+FFFD where its IDAT bytes were) — so a spec that
+   * wants to prove "the image that landed on the remote is byte-identical
+   * to the one the vault reflected" has to read it as a Buffer.
+   * Returns null if the path is missing.
+   */
+  async readBinaryFile(relativePath: string): Promise<Buffer | null> {
+    const fullPath = `${TEST_VAULT_REMOTE}/${relativePath}`;
+    return new Promise((resolve) => {
+      this.requireClient().sftp((err, sftp) => {
+        if (err) { resolve(null); return; }
+        sftp.readFile(fullPath, (readErr, data) => {
+          sftp.end();
+          if (readErr || !data) { resolve(null); return; }
+          resolve(data);
+        });
+      });
+    });
+  }
+
+  /**
+   * `mkdir -p` on the remote. SFTP's `mkdir` is a single POSIX
+   * `mkdir(2)`: it does NOT create intermediate directories, so
+   * `writeFile('Sub/x.md')` against a vault with no `Sub/` fails with a
+   * bare ENOENT that reads like a broken connection. Creates each path
+   * segment in turn and tolerates the segments that already exist.
+   *
+   * "Already exists" cannot be discriminated by code alone — the server
+   * reports it as SSH_FX_FAILURE, the same generic code as a real
+   * failure — so a failed `mkdir` is only swallowed once a `stat`
+   * confirms a directory is genuinely sitting there.
+   */
+  async mkdirp(relativePath: string): Promise<void> {
+    const segments = relativePath.split('/').filter((s) => s.length > 0);
+    await this.withSftp(async (sftp) => {
+      let current = TEST_VAULT_REMOTE;
+      for (const segment of segments) {
+        current += `/${segment}`;
+        await mkdirTolerant(sftp, current);
+      }
+    });
+  }
+
+  /**
+   * `rm -rf` on the remote: depth-first unlink of files, rmdir of the
+   * directories on the way back up. Tolerant of a missing path (an
+   * `afterAll` must not turn a red test into two red tests) and of a
+   * plain file being passed instead of a directory.
+   */
+  async rmrf(relativePath: string): Promise<void> {
+    await this.withSftp((sftp) =>
+      removeRecursive(sftp, `${TEST_VAULT_REMOTE}/${relativePath}`),
+    );
+  }
+
+  /**
+   * Force a file's mtime (POSIX seconds, as SFTP carries it). The
+   * cache-staleness scenarios need the remote to report the SAME mtime
+   * across two different contents — otherwise the mtime moves on its own
+   * and any cache keyed on it invalidates for the wrong reason, so the
+   * test would pass without exercising the thing it names. atime is set
+   * to the same value; nothing here reads it.
+   */
+  async setMtime(relativePath: string, mtimeSeconds: number): Promise<void> {
+    const fullPath = `${TEST_VAULT_REMOTE}/${relativePath}`;
+    return new Promise((resolve, reject) => {
+      this.requireClient().sftp((err, sftp) => {
+        if (err) { reject(err); return; }
+        sftp.utimes(fullPath, mtimeSeconds, mtimeSeconds, (utimesErr) => {
+          sftp.end();
+          if (utimesErr) reject(utimesErr);
+          else resolve();
+        });
+      });
+    });
+  }
+
   /** Delete a file on the remote (for test cleanup). */
   async removeFile(relativePath: string): Promise<void> {
     const fullPath = `${TEST_VAULT_REMOTE}/${relativePath}`;
@@ -188,4 +267,65 @@ export class RemoteVerifier {
     if (!this.client) throw new Error('RemoteVerifier: not connected');
     return this.client;
   }
+
+  /**
+   * Run `fn` against ONE sftp session and close it afterwards. The
+   * single-shot methods above open a session per call, which is fine for
+   * one round-trip; the multi-round-trip ones (`mkdirp` walking segments,
+   * `rmrf` recursing a tree) would otherwise open a channel per node and
+   * exhaust the server's channel limit on a deep tree.
+   */
+  private withSftp<T>(fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.requireClient().sftp((err, sftp) => {
+        if (err) { reject(err); return; }
+        fn(sftp).then(
+          (value) => { sftp.end(); resolve(value); },
+          (fnErr: unknown) => { sftp.end(); reject(fnErr); },
+        );
+      });
+    });
+  }
+}
+
+/** `mkdir` one segment, treating "it's already a directory" as success. */
+function mkdirTolerant(sftp: SFTPWrapper, fullPath: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    sftp.mkdir(fullPath, (err) => {
+      if (!err) { resolve(); return; }
+      sftp.stat(fullPath, (statErr, attrs) => {
+        if (!statErr && attrs?.isDirectory()) resolve();
+        else reject(err);
+      });
+    });
+  });
+}
+
+/**
+ * Depth-first delete of `fullPath`. A missing path resolves silently —
+ * cleanup is best-effort by design.
+ */
+async function removeRecursive(sftp: SFTPWrapper, fullPath: string): Promise<void> {
+  const isDir = await new Promise<boolean | null>((resolve) => {
+    sftp.lstat(fullPath, (err, attrs) => {
+      if (err || !attrs) { resolve(null); return; } // ENOENT — nothing to remove
+      resolve(attrs.isDirectory());
+    });
+  });
+  if (isDir === null) return;
+
+  if (!isDir) {
+    await new Promise<void>((resolve) => { sftp.unlink(fullPath, () => resolve()); });
+    return;
+  }
+
+  const entries = await new Promise<FileEntryWithStats[]>((resolve) => {
+    sftp.readdir(fullPath, (err, list) => { resolve(err || !list ? [] : list); });
+  });
+  for (const entry of entries) {
+    if (entry.filename === '.' || entry.filename === '..') continue;
+    await removeRecursive(sftp, `${fullPath}/${entry.filename}`);
+  }
+
+  await new Promise<void>((resolve) => { sftp.rmdir(fullPath, () => resolve()); });
 }

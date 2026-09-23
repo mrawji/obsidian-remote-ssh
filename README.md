@@ -334,7 +334,7 @@ binaries are cosign-signed and end-to-end tested against Linux + macOS remotes.
 [![docs (dev preview)](https://img.shields.io/badge/docs-dev_preview-9b7ec8?logo=obsidian&logoColor=white)](http://codes.sota-shimozono.com/obsidian-remote-ssh/dev/)
 [![Obsidian 1.5+](https://img.shields.io/badge/Obsidian-1.5+-7C3AED?logo=obsidian&logoColor=white)](https://obsidian.md)
 [![Go 1.25+](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![Node 20+](https://img.shields.io/badge/Node-20+-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![Node 22.22+](https://img.shields.io/badge/Node-22.22+-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 ![Platforms: linux · macOS · amd64 · arm64](https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%C2%B7%20amd64%20%7C%20arm64-555)
 
 </details>

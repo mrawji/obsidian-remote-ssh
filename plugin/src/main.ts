@@ -25,9 +25,19 @@ import { VaultModelBuilder } from './vault/VaultModelBuilder';
 import { FsChangeListener } from './vault/FsChangeListener';
 import { BulkWalker } from './vault/BulkWalker';
 import { LazyFolderLoader } from './vault/LazyFolderLoader';
+import { BackgroundIndexer, type IndexComplete, type IndexProgress } from './vault/BackgroundIndexer';
+import {
+  collectModelEntries,
+  deleteTreeSnapshot,
+  readTreeSnapshot,
+  treeSnapshotPath,
+  writeTreeSnapshot,
+} from './vault/TreeSnapshot';
+import type { RemoteEntry } from './vault/VaultModelBuilder';
+import { pathVisibility } from './vault/BulkWalker';
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
-import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
+import { ShadowVaultBootstrap, sanitiseStateKey } from './shadow/ShadowVaultBootstrap';
 import type { SharedConfigReader, BootstrapResult } from './shadow/ShadowVaultBootstrap';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
 import { ShadowVaultManager } from './shadow/ShadowVaultManager';
@@ -57,6 +67,18 @@ import { telemetry, telemetryLogPath } from "./util/Telemetry";
 
 /** GitHub `owner/repo` the daemon binaries are released from. */
 const DAEMON_RELEASE_REPO = 'sotashimozono/obsidian-remote-ssh';
+
+/**
+ * Everything this plugin keeps OUTSIDE any vault, on every OS:
+ * `~/.obsidian-remote/` — the shadow `vaults/` themselves, plus the
+ * per-device, never-synced `state/` (the community-plugins base
+ * snapshots; see `ShadowVaultBootstrap.communityPluginsBasePath`).
+ * `os.homedir()` resolves at runtime — no hardcoded user.
+ */
+const shadowStateRoot = (): string => path.join(os.homedir(), '.obsidian-remote');
+
+/** Where shadow vaults live: `~/.obsidian-remote/vaults/`. */
+const shadowVaultsDir = (): string => path.join(shadowStateRoot(), 'vaults');
 
 export default class RemoteSshPlugin extends Plugin {
   settings: PluginSettings = DEFAULT_SETTINGS;
@@ -116,6 +138,9 @@ export default class RemoteSshPlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+    // Before anything else that awaits: Obsidian runs metadataCache.initialize()
+    // right after every plugin's onload resolves (see TreeSnapshot).
+    await this.restoreTreeSnapshot();
 
     logger.setDebug(this.settings.enableDebugLog);
     logger.setMaxLines(this.settings.maxLogLines);
@@ -622,16 +647,23 @@ export default class RemoteSshPlugin extends Plugin {
       // #429 / #342 residual: round-trip the enabled community-plugins
       // list. Pull first so plugins set up on the remote load in the
       // shadow vault (the marketplace installer then fetches any missing
-      // binaries); then push the merged result so a plugin present only
-      // locally reaches the remote for other machines. Pushing *after*
-      // the pull is safe — the local list is now the union, so it can
-      // never drop a plugin the remote already had. Kept out of the
-      // verbatim shared-config set because `remote-ssh` must be
-      // force-preserved through the merge (a verbatim copy of a remote
-      // list omitting it would disable this very plugin).
+      // binaries); then push the converged result so a plugin enabled —
+      // or UNINSTALLED — only here reaches the remote for other machines.
+      // Kept out of the verbatim shared-config set because `remote-ssh`
+      // must be force-preserved through the merge (a verbatim copy of a
+      // remote list omitting it would disable this very plugin).
+      //
+      // Both halves take this device's BASE snapshot: the converged list
+      // as of the last successful round-trip HERE. It is what turns the
+      // old monotonic union into a real 3-way merge, so a local uninstall
+      // propagates instead of being resurrected by the next pull. The
+      // pull only reads it; the push commits it once both sides agree.
+      const cpBasePath = ShadowVaultBootstrap.communityPluginsBasePath(
+        shadowStateRoot(), profile.id,
+      );
       try {
-        await ShadowVaultBootstrap.pullCommunityPlugins(da, remoteConfigDir, localConfigDir);
-        await ShadowVaultBootstrap.pushCommunityPlugins(da, remoteConfigDir, localConfigDir);
+        await ShadowVaultBootstrap.pullCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
+        await ShadowVaultBootstrap.pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
       } catch (e) {
         logger.warn(
           `runAutoConnect(${tag}): community-plugins round-trip failed: ${errorMessage(e)}`,
@@ -849,6 +881,12 @@ export default class RemoteSshPlugin extends Plugin {
     // Drop lazy-load state — the walker it captured is now disconnected. A
     // stray File-Explorer click after this finds a null loader and no-ops.
     this.lazyLoader = null;
+    // Same for the background full-index pass: its walker rides the transport
+    // we're about to tear down, so stop it before the socket goes. `cancel()`
+    // makes it bail at its next checkpoint (one folder / one depth level away),
+    // and dropping the reference makes its late progress emits no-ops.
+    this.backgroundIndexer?.cancel();
+    this.backgroundIndexer = null;
     await this.conn.disconnectTransport();
     this.setState(SyncState.IDLE);
     if (this.settings.activeProfileId !== null) {
@@ -894,6 +932,231 @@ export default class RemoteSshPlugin extends Plugin {
   private lazyLoader: LazyFolderLoader | null = null;
   private lazyExpandHookInstalled = false;
 
+  /** Background full-tree index; null until a lazy connect, dropped on disconnect. */
+  private backgroundIndexer: BackgroundIndexer | null = null;
+
+  /**
+   * Files put into the model from the tree snapshot at startup, before any
+   * connect. Null when no snapshot was restored this session.
+   */
+  private snapshotFiles: Set<string> | null = null;
+  /** Whether the post-connect metadata catch-up for snapshot files has run. */
+  private snapshotMetadataChecked = false;
+
+  /** The profile whose tree snapshot applies to this vault, if any. */
+  private snapshotProfile(): SshProfile | null {
+    const id = this.settings.autoConnectProfileId;
+    // The snapshot is only ever reconciled by the background index, which runs
+    // in lazy mode; the eager walk has nothing to reconcile it with.
+    if (!id || this.settings.lazyFolderLoad === false) return null;
+    return this.settings.profiles.find((p) => p.id === id) ?? null;
+  }
+
+  private treeSnapshotFile(profileId: string): string {
+    return treeSnapshotPath(shadowStateRoot(), sanitiseStateKey(profileId));
+  }
+
+  /** The vault's note tree as it stands, without the root and the config dir. */
+  private modelEntries(): RemoteEntry[] {
+    return collectModelEntries(this.app.vault.getAllLoadedFiles(), this.app.vault.configDir);
+  }
+
+  /**
+   * Put last session's remote tree into the vault model during `onload`, so
+   * Obsidian's metadataCache.initialize() keeps its cached index instead of
+   * deleting every note it cannot see on the shadow disk (#513). Reconciled
+   * against the real remote once the background index has walked it.
+   */
+  private async restoreTreeSnapshot(): Promise<void> {
+    const profile = this.snapshotProfile();
+    if (!profile) return;
+    try {
+      const stored = readTreeSnapshot(
+        this.treeSnapshotFile(profile.id), profile.remotePath, this.app.vault.configDir,
+      );
+      if (!stored || stored.length === 0) return;
+      const start = Date.now();
+      // The snapshot was captured under LAST session's ignore / allowed-hidden
+      // settings. Judge every entry by the CURRENT ones, or a folder the user
+      // has since ignored comes back at every launch and only goes away once
+      // the background index has walked the whole remote.
+      const rules = {
+        ignoreDirs: profile.walkIgnoreDirs ?? [...DEFAULT_WALK_IGNORE_DIRS],
+        allowedHiddenDirs: profile.allowedHiddenDirs,
+        configDir: this.app.vault.configDir,
+      };
+      const entries = stored.filter((e) => pathVisibility(e.path, e.isDirectory, rules));
+      const dropped = stored.length - entries.length;
+      if (entries.length === 0) return;
+      // BEFORE the insert, not after. `buildChunked` mutates `vault.fileMap`
+      // chunk by chunk, so a failure partway leaves entries in the model — and
+      // everything that later repairs a restored entry is gated on this set:
+      // the post-connect re-index of notes with no metadata, and the stat
+      // zeroing that is the ONLY thing correcting a restored stat on an SFTP
+      // session. Assigning it afterwards meant a partial restore left stale
+      // entries that nothing would ever reconcile.
+      this.snapshotFiles = new Set(entries.filter((e) => !e.isDirectory).map((e) => e.path));
+      // Chunked, not `build()`: this runs inside `onload`, which Obsidian
+      // awaits before it loads the vault, and a one-tick insert of tens of
+      // thousands of entries — each firing `vault.trigger('create')` — freezes
+      // the window for as long as it takes.
+      const result = await new VaultModelBuilder(this.app.vault, { TFile, TFolder })
+        .buildChunked(entries);
+      logger.info(
+        `TreeSnapshot: restored ${result.filesAdded}f + ${result.foldersAdded}d ` +
+        `before metadataCache.initialize (${Date.now() - start}ms` +
+        `${dropped > 0 ? `, ${dropped} entries dropped by current ignore/allow settings` : ''})`,
+      );
+    } catch (e) {
+      // Never stop the plugin loading over a snapshot. What the vault holds
+      // afterwards depends on where this threw: nothing yet (the file was
+      // unreadable), or the entries some chunks managed to insert. Either is
+      // safe — `snapshotFiles` is already set, so the post-connect catch-up
+      // covers whatever landed, and the background index reconciles the rest.
+      logger.warn(`TreeSnapshot: restore failed (${errorMessage(e)}); continuing without the rest`);
+    }
+  }
+
+  /**
+   * Once connected, fire `modify` for restored files that need a real read.
+   *
+   * Two groups, both created by the same gap: between `onload` (where the
+   * snapshot lands in the model) and the adapter patch (which happens after
+   * layout ready), the only adapter is Obsidian's native one, pointed at a
+   * shadow disk that holds no notes.
+   *
+   *  - Notes with NO metadata: their cached stat didn't match the snapshot,
+   *    so `metadataCache.initialize()` tried to read them, through the native
+   *    adapter, and failed.
+   *  - Notes OPEN in a tab: Obsidian restores the workspace layout in that
+   *    same window and loads each open file's content the same way. The read
+   *    fails and the editor shows nothing. These notes usually DO have valid
+   *    metadata (that is the whole point of the snapshot), so the check above
+   *    would skip them and the tab would stay blank until reopened by hand.
+   */
+  private reindexSnapshotFilesWithoutMetadata(): void {
+    if (!this.snapshotFiles || this.snapshotMetadataChecked) return;
+    this.snapshotMetadataChecked = true;
+    const builder = new VaultModelBuilder(this.app.vault, { TFile, TFolder });
+    const open = new Set<string>();
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const file = (leaf.view as { file?: { path?: string } } | undefined)?.file;
+      if (file?.path) open.add(file.path);
+    });
+    let queued = 0;
+    let reopened = 0;
+    for (const p of this.snapshotFiles) {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile) || f.extension !== 'md') continue;
+      const needsMetadata = !this.app.metadataCache.getFileCache(f);
+      const isOpen = open.has(p);
+      if (!needsMetadata && !isOpen) continue;
+      if (!builder.modifyOne(p)) continue;
+      if (needsMetadata) queued++;
+      if (isOpen) reopened++;
+    }
+    logger.info(
+      `TreeSnapshot: ${queued} of ${this.snapshotFiles.size} restored files queued for re-index, ` +
+      `${reopened} open tab(s) refreshed`,
+    );
+  }
+
+  /**
+   * A background pass finished. After a daemon walk the model matches the
+   * remote with real mtime/size, so it becomes next launch's snapshot. After
+   * the SFTP fallback it can't: its stats are 0, and a snapshot restored at
+   * startup would carry a daemon session's stats, which metadataCache would
+   * trust as "unchanged". Zero those so every restored note is re-read, and
+   * drop the snapshot.
+   */
+  private onIndexComplete(indexer: BackgroundIndexer, r: IndexComplete): void {
+    if (this.backgroundIndexer !== indexer) return;
+    const profile = this.conn.activeProfile;
+    if (!profile) return;
+    const file = this.treeSnapshotFile(profile.id);
+    if (r.viaFastPath) {
+      try {
+        const entries = this.modelEntries();
+        writeTreeSnapshot(file, profile.remotePath, entries);
+        logger.info(`TreeSnapshot: saved ${entries.length} entries`);
+      } catch (e) {
+        logger.warn(`TreeSnapshot: save failed (${errorMessage(e)})`);
+      }
+      return;
+    }
+    if (this.snapshotFiles) {
+      const builder = new VaultModelBuilder(this.app.vault, { TFile, TFolder });
+      for (const p of this.snapshotFiles) builder.modifyOne(p, { ctime: 0, mtime: 0, size: 0 });
+      this.snapshotFiles = null;
+    }
+    deleteTreeSnapshot(file);
+  }
+
+  /**
+   * Start (or restart) the background full-index pass that completes the vault
+   * model behind the lazy root-level populate.
+   *
+   * Fire-and-forget by design: connect returns immediately and the indexer
+   * trickles the rest of the tree into `vault.fileMap`, yielding to the renderer
+   * between units. Any previous pass (e.g. from the connect before a reconnect)
+   * is cancelled first, so only one indexer is ever live and a stale one can't
+   * write progress over the new one's.
+   */
+  private startBackgroundIndex(): void {
+    this.backgroundIndexer?.cancel();
+    const indexer: BackgroundIndexer = new BackgroundIndexer({
+      makeWalker: () => this.makeWalker(),
+      makeBuilder: () => new VaultModelBuilder(this.app.vault, { TFile, TFolder }),
+      // Folders the indexer has fully materialised don't need re-walking when the
+      // user later expands them in File Explorer.
+      markLoaded: (path) => this.lazyLoader?.markLoaded(path),
+      onProgress: (p) => this.onIndexProgress(indexer, p),
+      // Reconcile, not just fill in: the model may hold snapshot entries the
+      // remote has changed or dropped since last session.
+      modelAtStart: () => this.modelEntries(),
+      currentStat: (path) => {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        return f instanceof TFile ? f.stat : null;
+      },
+      onComplete: (r) => this.onIndexComplete(indexer, r),
+    });
+    this.backgroundIndexer = indexer;
+    void indexer.start();
+  }
+
+  /**
+   * Surface indexing honestly. Until the pass completes, search / graph /
+   * backlinks really ARE incomplete, so say so in the status bar rather than
+   * letting a vault that has registered 12 of 30 000 files look "ready".
+   *
+   * Non-nagging: status-bar text while it runs (no modal, no toast spam), and a
+   * single Notice when it finishes. A cancelled pass says nothing — the user
+   * disconnected; they don't need a report.
+   */
+  private onIndexProgress(indexer: BackgroundIndexer, p: IndexProgress): void {
+    // A pass superseded by a reconnect, or one still unwinding after disconnect,
+    // must not paint over the live session's status bar.
+    if (this.backgroundIndexer !== indexer) return;
+    if (this.state !== SyncState.CONNECTED) return;
+    if (!p.done) {
+      this.statusBar?.update(
+        SyncState.CONNECTED,
+        `Remote SSH: Indexing… ${p.files} files`,
+      );
+      return;
+    }
+    this.statusBar?.update(SyncState.CONNECTED);
+    if (p.cancelled) return;
+    // Nothing added means the connect populate had already registered the whole
+    // vault (a flat, root-only tree) — there was no gap, so there's nothing to
+    // announce. Announcing "0 files indexed" would be noise on every connect.
+    if (p.files + p.folders === 0) return;
+    new Notice(
+      `Remote SSH: vault index complete — ${p.files} files, ${p.folders} folders. ` +
+      'Search, graph and links now cover the whole vault.',
+    );
+  }
+
   /** A fresh BulkWalker bound to the current session's transport + ignore list. */
   private makeWalker(): BulkWalker {
     return new BulkWalker({
@@ -903,6 +1166,8 @@ export default class RemoteSshPlugin extends Plugin {
       // defaults so existing users immediately benefit. An explicit empty
       // array (user cleared it) means "ignore nothing" and is respected.
       ignoreDirs: this.conn.activeProfile?.walkIgnoreDirs ?? [...DEFAULT_WALK_IGNORE_DIRS],
+      allowedHiddenDirs: this.conn.activeProfile?.allowedHiddenDirs,
+      configDir: this.app.vault.configDir,
     });
   }
 
@@ -959,6 +1224,7 @@ export default class RemoteSshPlugin extends Plugin {
    */
   async populateVaultFromRemote(label: string = 'remote'): Promise<string> {
     const start = Date.now();
+    this.reindexSnapshotFilesWithoutMetadata();
 
     // Phase E1-α.2: prefer the daemon's `fs.walk` (one RPC, real
     // mtime+size per entry) when the active session is RPC AND the
@@ -993,7 +1259,16 @@ export default class RemoteSshPlugin extends Plugin {
       );
       this.lazyLoader.markLoaded('');
       this.installLazyExpandHook();
+      // The root level is on screen and connect is done — now index the REST of
+      // the tree in the background. Without this, everything below depth 1 stays
+      // out of `vault.fileMap` until the user happens to click the folder open,
+      // and Obsidian resolves links/embeds/search only against `fileMap` — so a
+      // link into an unexpanded subfolder silently fails to resolve. Deliberately
+      // NOT awaited: connect must stay fast, and the indexer yields between units.
+      this.startBackgroundIndex();
     }
+    // `lazyFolderLoad: false` needs no background pass — the walk above was
+    // already the full recursive tree, so `fileMap` is complete on return.
 
     const summary =
       `${result.filesAdded}f + ${result.foldersAdded}d built, ` +
@@ -1011,8 +1286,8 @@ export default class RemoteSshPlugin extends Plugin {
       new Notice(
         walk.hiddenCount > 0
           ? `Remote SSH: 0 visible files — all ${walk.hiddenCount} walked ` +
-            'entries are hidden dot-files (e.g. content under a “.”-prefixed ' +
-            'folder). Rename them if they should appear in the vault.'
+            'entries are hidden or excluded. Check the profile’s Allowed hidden ' +
+            'directories and Ignore directories settings.'
           : 'Remote SSH: 0 files found on the remote. Check the profile’s ' +
             'remotePath actually points at the vault (see console.log).',
         10_000,
@@ -1073,12 +1348,12 @@ export default class RemoteSshPlugin extends Plugin {
     }
     this.shadowSpawnInFlight = true;
 
-    // Shadow vaults live under ~/.obsidian-remote/vaults/ on every
-    // OS. os.homedir() resolves at runtime — no hardcoded user.
-    const baseDir = path.join(os.homedir(), '.obsidian-remote', 'vaults');
-
+    // Shadow vaults live under ~/.obsidian-remote/vaults/ on every OS,
+    // alongside ~/.obsidian-remote/state/ (never-synced per-device state).
     const registry = new ObsidianRegistry(ObsidianRegistry.defaultConfigPath());
-    const bootstrap = new ShadowVaultBootstrap(baseDir, sourcePluginDir, registry);
+    const bootstrap = new ShadowVaultBootstrap(
+      shadowVaultsDir(), sourcePluginDir, registry, shadowStateRoot(),
+    );
     const spawner = new WindowSpawner();
     const manager = new ShadowVaultManager(bootstrap, spawner);
 
@@ -1206,7 +1481,18 @@ export default class RemoteSshPlugin extends Plugin {
     const pull = (async () => {
       await client.connect(profile);
       await ShadowVaultBootstrap.pullSharedObsidianConfig(reader, remoteConfigDir, localConfigDir);
-      await ShadowVaultBootstrap.pullCommunityPlugins(reader, remoteConfigDir, localConfigDir);
+      // Same base as the shadow window's own round-trip will use (same
+      // device, same profile), so a removal another machine made is
+      // applied here too and the window boots on the converged list.
+      // `pullCommunityPlugins` never WRITES the base — only the push
+      // does, once both sides hold it — so this pre-spawn pull cannot
+      // make the real connect's push mistake this device's local
+      // additions for remote removals, and re-running the merge over the
+      // same base is idempotent: no removal is ever double-applied.
+      await ShadowVaultBootstrap.pullCommunityPlugins(
+        reader, remoteConfigDir, localConfigDir,
+        ShadowVaultBootstrap.communityPluginsBasePath(shadowStateRoot(), profile.id),
+      );
       const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
       await ShadowVaultBootstrap.pullPluginBinaries(reader, remoteConfigDir, localConfigDir, enabledIds);
     })();

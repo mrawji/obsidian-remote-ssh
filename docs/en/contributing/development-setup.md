@@ -11,8 +11,8 @@ How to get a working dev environment for the plugin and the daemon. Targets a co
 
 | Tool | Min version | Why |
 |---|---|---|
-| Node.js | **20.x** (per `plugin/package.json` `engines.node`) | Plugin build (esbuild), unit tests (vitest 4 needs 20.19+), npm scripts |
-| Go | **1.25.x** (per `server/go.mod` + CI) | Daemon binary build |
+| Node.js | **24.x** (LTS; CI floor is 22.22.2 per `plugin/package.json` `engines.node`) | Plugin build (esbuild), unit tests (jsdom 30 needs 22.22.2+), npm scripts |
+| Go | **1.26.x** (CI; `server/go.mod` sets the minimum; not 1.27, which drops macOS 12 remotes) | Daemon binary build |
 | Docker + docker compose | any recent | Integration tests use a sandbox sshd container |
 | `make` | any | `server/Makefile` orchestrates the Go cross-builds |
 | `gh` (GitHub CLI) | recent | PR management; not strictly required but heavily used in our flow |

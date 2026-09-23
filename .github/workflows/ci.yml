@@ -1,10 +1,14 @@
 name: CI
 
+# `pull_request` carries NO `branches:` filter on purpose. The gate
+# belongs wherever a PR is open, not only on the two release branches
+# — a PR into a long-lived feature track (`cli`, and any future one)
+# is exactly where an unreviewed regression can sit for weeks. Push
+# stays pinned to main/next: outside a PR there is nothing to gate.
 on:
   push:
     branches: [main, next]
   pull_request:
-    branches: [main, next]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,9 +24,9 @@ jobs:
         working-directory: plugin
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
@@ -52,9 +56,9 @@ jobs:
         working-directory: plugin
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
@@ -103,10 +107,9 @@ jobs:
   # behaviour drift, fs.cp polyfills, etc. — without the 9-job 3×3
   # OS×Node combinatorial explosion.
   #
-  # Node 18 is intentionally NOT in the matrix: Vitest 4.x requires
-  # Node 20.19+ (drops `require()` of ESM-only modules), so testing
-  # on 18 would just CI-fail without exercising real plugin code.
-  # `engines.node` is set to >=20 to reflect that.
+  # The other jobs run on Node 24 (current LTS). This job keeps the floor
+  # honest: jsdom 30 (undici 8) needs Node ^22.22.2, so 20 is out, and
+  # `engines.node` is set to >=22.22.2 to match.
   node-compat:
     name: Test (ubuntu, node-${{ matrix.node-version }})
     runs-on: ubuntu-latest
@@ -119,7 +122,7 @@ jobs:
         working-directory: plugin
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -145,9 +148,9 @@ jobs:
         working-directory: plugin
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
@@ -216,13 +219,14 @@ jobs:
         working-directory: server
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          # Bumped 1.22 → 1.25 to follow `server/go.mod`'s `go 1.25.0`
-          # directive after Dependabot pulled in `golang.org/x/image`
-          # v0.39.0 (which raised the floor). Pin major.minor only —
-          # actions/setup-go resolves to the latest patch.
-          go-version: '1.25'
+          # Kept at or above `server/go.mod`'s `go` directive (Dependabot's
+          # `golang.org/x/image` bumps raise that floor: v0.39.0 → 1.25,
+          # v0.46.0 → 1.26). Held at 1.26 on purpose: it is the last Go that
+          # runs on macOS 12, and 1.27 would drop macOS 12 remotes for the
+          # daemon. Pin major.minor only; setup-go resolves the latest patch.
+          go-version: '1.26'
           # Cache enables once server/go.sum exists (added when external deps
           # are introduced). Until then, the module has only stdlib references.
           cache: false

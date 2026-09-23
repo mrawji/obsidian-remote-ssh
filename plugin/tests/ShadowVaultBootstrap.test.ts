@@ -1217,6 +1217,350 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
   });
 });
 
+// ─── uninstall: 3-way merge against a per-device base ───────────────────
+//
+// The union above is MONOTONIC: `community-plugins.json` could only ever
+// GROW, so uninstalling a plugin on one device never reached the remote
+// and the next pull RESURRECTED it locally — a fleet-wide uninstall was
+// impossible (pinned by e2e/plugin-code-roundtrip.spec.ts test 6).
+//
+// The fix is a 3-way merge against a BASE: the converged list as of the
+// END of the last successful round-trip ON THIS DEVICE, stored outside
+// every vault at `~/.obsidian-remote/state/<profile-id>/`. `base \ local`
+// is a local uninstall, `base \ remote` a remote one; anything absent from
+// the base is an addition. With no base yet, a removal is indistinguishable
+// from never-had, so it degrades to the old union (nothing is lost).
+describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagation)', () => {
+  let scratchRoot: string;
+
+  beforeEach(() => {
+    scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cp-3way-'));
+  });
+  afterEach(() => {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+  });
+
+  const SELF = ShadowVaultBootstrap.SELF_PLUGIN_ID; // 'remote-ssh'
+  const CP = '.obsidian/community-plugins.json';
+
+  /** A shadow config dir seeded with `local`. */
+  function makeLocal(local: string[]): string {
+    const dir = path.join(scratchRoot, `vault-${Math.random().toString(36).slice(2)}`, '.obsidian');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'community-plugins.json'), JSON.stringify(local), 'utf-8');
+    return dir;
+  }
+  const readLocal = (dir: string): string[] =>
+    JSON.parse(fs.readFileSync(path.join(dir, 'community-plugins.json'), 'utf-8')) as string[];
+
+  /** The per-device base path, optionally pre-seeded (omitted = no base yet). */
+  function basePathFor(seed?: string[]): string {
+    const p = ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, 'profile-1');
+    if (seed) {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, JSON.stringify(seed), 'utf-8');
+    }
+    return p;
+  }
+  const readBase = (p: string): string[] =>
+    JSON.parse(fs.readFileSync(p, 'utf-8')) as string[];
+
+  /** In-memory remote. `initial === null` → the remote has no list at all. */
+  function makeRemote(initial: string[] | null): {
+    rw: SharedConfigReader & SharedConfigWriter;
+    read: () => string[] | null;
+  } {
+    const store: Record<string, string> = {};
+    if (initial !== null) store[CP] = JSON.stringify(initial);
+    return {
+      rw: {
+        exists: (p) => Promise.resolve(p in store),
+        read: (p) => Promise.resolve(store[p]),
+        write: (p, c) => { store[p] = c; return Promise.resolve(); },
+      },
+      read: () => (CP in store ? (JSON.parse(store[CP]) as string[]) : null),
+    };
+  }
+
+  /** One full connect round-trip: pull, then push — exactly what main.ts does. */
+  async function roundTrip(
+    rw: SharedConfigReader & SharedConfigWriter,
+    localConfigDir: string,
+    basePath: string,
+  ): Promise<void> {
+    await ShadowVaultBootstrap.pullCommunityPlugins(rw, '.obsidian', localConfigDir, basePath);
+    await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localConfigDir, basePath);
+  }
+
+  it('falls back to a UNION when there is no base yet (first run — nothing is lost)', async () => {
+    // Local has `templater`, the remote has `dataview`, and this device has
+    // never synced. Neither absence may be read as a removal.
+    const localDir = makeLocal([SELF, 'templater']);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor(); // no base on disk
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(readLocal(localDir)).toEqual(expect.arrayContaining([SELF, 'templater', 'dataview']));
+    expect(read()).toEqual(expect.arrayContaining([SELF, 'templater', 'dataview']));
+    // …and the round-trip has now RECORDED a base, so the next connect can
+    // infer removals.
+    expect(readBase(basePath)).toEqual(expect.arrayContaining([SELF, 'templater', 'dataview']));
+  });
+
+  it('propagates a LOCAL removal to the remote (the uninstall the e2e pins)', async () => {
+    // Steady state: both sides and the base agree on [remote-ssh, dataview].
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    // The user uninstalls `dataview` in this vault.
+    fs.writeFileSync(
+      path.join(localDir, 'community-plugins.json'), JSON.stringify([SELF]), 'utf-8',
+    );
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'the uninstall must reach the remote — otherwise no device can ever drop it')
+      .toEqual([SELF]);
+    expect(readLocal(localDir), 'and the pull must not resurrect it locally').toEqual([SELF]);
+    expect(readBase(basePath)).toEqual([SELF]);
+  });
+
+  it('profile ids that sanitise alike do not share one state dir', () => {
+    // The rewrite is lossy: `a/b` and `a?b` both cleaned to `a_b`, and ids
+    // with nothing usable all landed on the literal 'default'. Profiles that
+    // share a state dir share a merge base, which is how a plugin uninstalled
+    // on one profile disappears from another.
+    const paths = ['a/b', 'a?b', '///', '???']
+      .map((id) => ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, id));
+    expect(new Set(paths).size, 'every id needs its own state dir').toBe(paths.length);
+    for (const p of paths) {
+      expect(p.startsWith(path.join(scratchRoot, 'state') + path.sep)).toBe(true);
+    }
+    // Stable across calls, and a normal UUID id is untouched (no migration).
+    expect(ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, 'a/b')).toBe(paths[0]);
+    const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
+    expect(ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, uuid))
+      .toBe(path.join(scratchRoot, 'state', uuid, 'community-plugins.base.json'));
+  });
+
+  it('a corrupt local list is not an uninstall — the remote keeps its plugins', async () => {
+    // Obsidian rewrites community-plugins.json whenever a plugin is toggled,
+    // and the read is unlocked. A read that lands mid-write, or after a crash
+    // truncated the file, used to parse as [] — which with a base in play is
+    // "this device uninstalled everything", and push sent that to the remote
+    // and from there to every other device.
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    fs.writeFileSync(path.join(localDir, 'community-plugins.json'), '["remote-ssh", "data', 'utf-8');
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'an unreadable local list must never reach the remote').toEqual([SELF, 'dataview']);
+    expect(readBase(basePath), 'and the base must not move on a round we could not read')
+      .toEqual([SELF, 'dataview']);
+  });
+
+  it('a missing local list is an empty vault, not an unreadable one', async () => {
+    // ENOENT is a real state: nothing has ever been enabled here. It must
+    // still seed the remote, unlike a read that failed for any other reason.
+    const localDir = makeLocal([]);
+    fs.rmSync(path.join(localDir, 'community-plugins.json'));
+    const { rw, read } = makeRemote(null);
+    const basePath = basePathFor();
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'a fresh remote is seeded from an empty local list').toEqual([SELF]);
+  });
+
+  it('a local list that cannot be read at all is left alone', async () => {
+    // A directory where the file should be: readFileSync throws EISDIR, not
+    // ENOENT — the "I cannot trust this" case.
+    const localDir = makeLocal([SELF, 'dataview']);
+    const listPath = path.join(localDir, 'community-plugins.json');
+    fs.rmSync(listPath);
+    fs.mkdirSync(listPath);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'an unreadable local list must never reach the remote').toEqual([SELF, 'dataview']);
+    expect(ShadowVaultBootstrap.readEnabledPluginIds(localDir), 'and binaries round-trip nothing')
+      .toEqual([]);
+  });
+
+  it('a local list that is genuinely empty still propagates as an uninstall', async () => {
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    fs.writeFileSync(path.join(localDir, 'community-plugins.json'), '[]', 'utf-8');
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'an empty list is a real state and must still be honoured').toEqual([SELF]);
+  });
+
+  it('propagates a REMOTE removal into the local list (uninstalled on another device)', async () => {
+    // This device was offline while machine B uninstalled `dataview`, so its
+    // base is stale — which is exactly how the removal is detected.
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF]);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(readLocal(localDir), 'a plugin removed on another device must be dropped here')
+      .toEqual([SELF]);
+    expect(read()).toEqual([SELF]);
+    expect(readBase(basePath)).toEqual([SELF]);
+  });
+
+  it('still sends a LOCAL addition to the remote (existing behaviour preserved)', async () => {
+    const localDir = makeLocal([SELF, 'dataview', 'templater']); // templater just enabled
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read()).toEqual(expect.arrayContaining([SELF, 'dataview', 'templater']));
+    expect(readLocal(localDir)).toEqual(expect.arrayContaining([SELF, 'dataview', 'templater']));
+  });
+
+  it('still pulls a REMOTE addition into the local list (existing behaviour preserved)', async () => {
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw } = makeRemote([SELF, 'dataview', 'obsidian-git']); // enabled on machine B
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(readLocal(localDir)).toEqual(expect.arrayContaining([SELF, 'dataview', 'obsidian-git']));
+  });
+
+  it('never lets remote-ssh be removed — from either side', async () => {
+    // Both sides "uninstalled" it: the local list dropped it, the remote list
+    // omits it, and the base says both once had it. It must still survive —
+    // it IS the sync.
+    const localDir = makeLocal(['dataview']);          // no remote-ssh
+    const { rw, read } = makeRemote(['dataview']);     // no remote-ssh
+    const basePath = basePathFor([SELF, 'dataview']);  // base says both had it
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(readLocal(localDir), 'remote-ssh must never be uninstallable locally').toContain(SELF);
+    expect(read(), 'remote-ssh must never be uninstallable remotely').toContain(SELF);
+  });
+
+  it('resolves concurrent add-vs-remove in favour of the ADD (documented tie-break)', async () => {
+    // Machine B uninstalled `dataview` and pushed, so the remote no longer
+    // names it. Meanwhile this device installed `dataview` fresh — it is
+    // absent from THIS device's base, so it is an ADDITION, not a leftover.
+    // Add wins: losing a plugin you just installed is invisible data loss.
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF]);
+    const basePath = basePathFor([SELF]); // dataview never in this device's base
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(readLocal(localDir), 'a plugin this device just installed must not vanish')
+      .toEqual(expect.arrayContaining([SELF, 'dataview']));
+    expect(read(), 'and the addition must reach the remote')
+      .toEqual(expect.arrayContaining([SELF, 'dataview']));
+  });
+
+  it('does not infer removals from a remote it could not read (no base-driven wipe)', async () => {
+    // Transient SSH error mid-read. `base \ remote` must NOT be taken to mean
+    // "everything was uninstalled elsewhere".
+    const localDir = makeLocal([SELF, 'dataview', 'templater']);
+    const basePath = basePathFor([SELF, 'dataview', 'templater']);
+    const rw: SharedConfigReader & SharedConfigWriter = {
+      exists: () => Promise.resolve(true),
+      read: () => Promise.reject(new Error('SSH hiccup')),
+      write: () => Promise.reject(new Error('must not push a list built from an unread remote')),
+    };
+
+    await ShadowVaultBootstrap.pullCommunityPlugins(rw, '.obsidian', localDir, basePath);
+    const r = await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localDir, basePath);
+
+    expect(r.pushed).toBe(false);
+    expect(readLocal(localDir), 'the local list must survive an unreadable remote intact')
+      .toEqual([SELF, 'dataview', 'templater']);
+    expect(readBase(basePath), 'and the base must be left alone so the merge retries next connect')
+      .toEqual([SELF, 'dataview', 'templater']);
+  });
+
+  it('does not infer removals when the remote has no list yet (absent ≠ emptied)', async () => {
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote(null); // fresh remote, no file at all
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(readLocal(localDir)).toEqual([SELF, 'dataview']);
+    expect(read(), 'a fresh remote is seeded from local, not emptied by the base')
+      .toEqual([SELF, 'dataview']);
+  });
+
+  it('is idempotent across pre-spawn pull + connect pull + connect push (no double-apply)', async () => {
+    // preSpawnPull pulls with the SAME base and must not commit it — otherwise
+    // the connect's push would read this device's local additions as remote
+    // removals and delete them.
+    const localDir = makeLocal([SELF, 'dataview', 'templater']);        // templater added here
+    const { rw, read } = makeRemote([SELF, 'dataview', 'obsidian-git']); // git added on B
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    // pre-spawn: pull only — must NOT commit the base
+    await ShadowVaultBootstrap.pullCommunityPlugins(rw, '.obsidian', localDir, basePath);
+    expect(readBase(basePath), 'a pull must never commit the base').toEqual([SELF, 'dataview']);
+
+    // …then the real connect.
+    await roundTrip(rw, localDir, basePath);
+
+    const converged = [SELF, 'dataview', 'templater', 'obsidian-git'];
+    expect(readLocal(localDir)).toEqual(expect.arrayContaining(converged));
+    expect(read(), 'the local addition must survive the pre-spawn pull + push sequence')
+      .toEqual(expect.arrayContaining(converged));
+
+    // A second connect over the now-committed base changes nothing.
+    await roundTrip(rw, localDir, basePath);
+    expect(readLocal(localDir)).toEqual(expect.arrayContaining(converged));
+    expect(read()).toEqual(expect.arrayContaining(converged));
+  });
+
+  it('discards a stale base when the shadow vault is bootstrapped fresh (deleted-vault recovery)', async () => {
+    // The user deletes ~/.obsidian-remote/vaults/<v> and reconnects. A
+    // leftover base would make the fresh `["remote-ssh"]` seed look like a
+    // mass uninstall and strip the remote — so a first bootstrap drops it.
+    const baseDir = path.join(scratchRoot, 'vaults');
+    const sourceDir = path.join(scratchRoot, 'source-plugin');
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const profile = makeProfile({ id: 'profile-1' });
+
+    const stalePath = basePathFor([SELF, 'dataview']);
+    expect(fs.existsSync(stalePath)).toBe(true);
+
+    const configPath = path.join(scratchRoot, 'obsidian.json');
+    fs.writeFileSync(configPath, JSON.stringify({ vaults: {} }), 'utf-8');
+    const boot = new ShadowVaultBootstrap(
+      baseDir, sourceDir, new ObsidianRegistry(configPath), scratchRoot,
+    );
+    const { layout } = await boot.bootstrap(profile, [profile]);
+
+    expect(fs.existsSync(stalePath), 'a first bootstrap must discard the stale base').toBe(false);
+
+    // …so the round-trip degrades to a union and the remote keeps dataview.
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    await roundTrip(rw, layout.configDir, stalePath);
+    expect(read()).toEqual(expect.arrayContaining([SELF, 'dataview']));
+    expect(readLocal(layout.configDir)).toEqual(expect.arrayContaining([SELF, 'dataview']));
+  });
+});
+
 describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-marketplace)', () => {
   function makeLocalConfigDir(): string {
     const dir = path.join(

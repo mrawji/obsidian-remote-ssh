@@ -86,14 +86,19 @@ func ReadFrame(r *bufio.Reader, max int) ([]byte, error) {
 	return body, nil
 }
 
-// WriteFrame writes body as one framed message to w.
+// WriteFrame writes body as one framed message to w, in a single Write.
+//
+// One Write, not two: sshd relays each write on the daemon socket as its own
+// SSH packet, over a TCP connection that runs with Nagle on for a non-tty
+// session. The body packet would then wait for the peer's delayed ACK of the
+// header packet (up to 40 ms on Linux), on every reply.
 func WriteFrame(w io.Writer, body []byte) error {
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))
-	if _, err := io.WriteString(w, header); err != nil {
-		return fmt.Errorf("rpc: write header: %w", err)
-	}
-	if _, err := w.Write(body); err != nil {
-		return fmt.Errorf("rpc: write body: %w", err)
+	frame := make([]byte, 0, len(header)+len(body))
+	frame = append(frame, header...)
+	frame = append(frame, body...)
+	if _, err := w.Write(frame); err != nil {
+		return fmt.Errorf("rpc: write frame: %w", err)
 	}
 	if flusher, ok := w.(interface{ Flush() error }); ok {
 		if err := flusher.Flush(); err != nil {

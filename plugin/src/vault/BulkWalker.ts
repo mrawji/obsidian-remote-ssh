@@ -40,9 +40,13 @@ export interface BulkWalkerDeps {
    * Directory basenames to prune from the walk (e.g. `node_modules`,
    * `.git`). Passed straight through to `fs.walk`'s `ignore` so the
    * daemon never descends/transfers them. Only the fast path honours
-   * this; the per-folder fallback (SFTP / no daemon) does not yet.
+   * this server-side; the SFTP fallback prunes before descending.
    */
   ignoreDirs?: string[];
+  /** Exact vault-relative dot-folder paths that may appear in the tree. */
+  allowedHiddenDirs?: string[];
+  /** Configuration is never part of the note tree, even when explicitly allowed. */
+  configDir?: string;
 }
 
 /** Outcome telemetry from a single `walk()` call. */
@@ -70,7 +74,15 @@ export interface BulkWalkResult {
   /** When `fallback-list` because of a fast-path error, the error message; else null. */
   fastPathError: string | null;
   /**
-   * Count of entries dropped by the hidden-file (dot-prefix) filter before
+   * Folders the fallback could not list (permissions, a vanished dir, a
+   * timeout). Their children are simply ABSENT from `entries`, which is
+   * indistinguishable from "that folder is empty" — so a caller that treats
+   * a walk as the truth about the remote (reconcile: removing what the walk
+   * did not return) must refuse to do so unless this is 0.
+   */
+  listErrors: number;
+  /**
+   * Count of encountered entries dropped by the visibility filter before
    * `entries` was returned. Lets the caller tell a genuinely empty remote
    * apart from "everything walked was hidden" (e.g. all content nested under
    * a dot-dir) instead of firing a misleading "0 files — check remotePath".
@@ -135,6 +147,7 @@ export class BulkWalker {
           entries: visible,
           hiddenCount: result.entries.length - visible.length,
           walkMs: Date.now() - start,
+          listErrors: 0,
           // `truncated` here means we stopped at the page guard on a
           // pathological tree — surface it so populate can Notice the
           // partial load instead of silently showing a clipped vault.
@@ -167,23 +180,26 @@ export class BulkWalker {
   }
 
   /**
-   * Drop dot-prefixed entries so hidden files/dirs never reach the File
-   * Explorer — matching Obsidian's own default of hiding dot-names. An entry
-   * is hidden when ANY of its path segments starts with `.`, so a dot-DIR
-   * (`.julia`, `.git`, …) hides its whole subtree. The vault config dir
-   * (`.obsidian`) is deliberately included: Obsidian loads config directly
-   * off the local shadow disk, NOT from this walked model, so dropping it
-   * costs nothing AND keeps every client's per-device `<configDir>/user/<id>/`
-   * subtree out of the tree (a foreign client's state must never surface as
-   * editable files). Applies to the full walk AND every lazy per-folder
-   * deepen (both route through here).
+   * True when the daemon's paginated `fs.walk` is available, i.e. a full
+   * recursive `walk('', true)` costs one RPC per 50 000-entry page rather than
+   * one `adapter.list` round-trip per directory.
+   *
+   * Callers that must CHOOSE a traversal strategy up-front need this, because
+   * `walk()` only reports which path it took (`BulkWalkResult.source`) after the
+   * expensive part is already done. `BackgroundIndexer` uses it to pick between
+   * one recursive walk and a yielding folder-at-a-time BFS.
    */
-  private visibleEntries(entries: RemoteEntry[]): RemoteEntry[] {
-    return entries.filter((e) => !BulkWalker.isHiddenPath(e.path));
+  hasFastPath(): boolean {
+    return this.canUseFastPath();
   }
 
-  private static isHiddenPath(vaultPath: string): boolean {
-    return vaultPath.split('/').some((seg) => seg.startsWith('.'));
+  /** Shared by full indexing and lazy expansion; allowances never override exclusions. */
+  private visibleEntries(entries: RemoteEntry[]): RemoteEntry[] {
+    return entries.filter((e) => this.isVisible(e.path, e.isDirectory));
+  }
+
+  private isVisible(vaultPath: string, isDirectory: boolean): boolean {
+    return pathVisibility(vaultPath, isDirectory, this.deps);
   }
 
   // ─── internals ──────────────────────────────────────────────────────────
@@ -253,8 +269,10 @@ export class BulkWalker {
     source: 'fallback-list';
     truncated: false;
     pages: number;
+    listErrors: number;
   }> {
     const entries: RemoteEntry[] = [];
+    let listErrors = 0;
     const queue: string[] = [rootPath];
     while (queue.length > 0) {
       const folder = queue.shift()!;
@@ -263,18 +281,56 @@ export class BulkWalker {
         listing = await this.deps.adapter.list(folder);
       } catch (e) {
         logger.warn(`BulkWalker.fallbackPath: list("${folder}") failed: ${errorMessage(e)}`);
+        listErrors++;
         continue;
       }
       for (const sub of listing.folders) {
         if (!sub) continue;
         entries.push({ path: sub, isDirectory: true, ctime: 0, mtime: 0, size: 0 });
-        if (recursive) queue.push(sub);   // one level only when non-recursive
+        if (recursive && this.isVisible(sub, true)) queue.push(sub);
       }
       for (const file of listing.files) {
         if (!file) continue;
         entries.push({ path: file, isDirectory: false, ctime: 0, mtime: 0, size: 0 });
       }
     }
-    return { entries, source: 'fallback-list', truncated: false, pages: 0 };
+    return { entries, source: 'fallback-list', truncated: false, pages: 0, listErrors };
   }
+}
+
+export interface VisibilityRules {
+  ignoreDirs?: readonly string[];
+  allowedHiddenDirs?: readonly string[];
+  configDir?: string;
+}
+
+/**
+ * Whether a vault-relative path may appear in the vault model.
+ *
+ * Shared, because a path has to be judged in two places: by the walk that
+ * discovers it, and by the tree snapshot that restores it at startup — and a
+ * snapshot was captured under whatever the rules were LAST session. If the two
+ * disagreed, a folder the user has since ignored (or stopped allowing) would
+ * come back at every launch and only go away once a background index finished.
+ */
+export function pathVisibility(
+  vaultPath: string,
+  isDirectory: boolean,
+  rules: VisibilityRules,
+): boolean {
+  const configDir = rules.configDir ?? '.obsidian';
+  if (vaultPath === configDir || vaultPath.startsWith(configDir + '/')) return false;
+  const parts = vaultPath.split('/');
+  for (let i = 0; i < parts.length; i++) {
+    const segment = parts[i];
+    if (!segment || segment === '.' || segment === '..') return false;
+    const directory = i < parts.length - 1 || isDirectory;
+    if (directory && rules.ignoreDirs?.includes(segment)) return false;
+    if (!segment.startsWith('.')) continue;
+    // Only directories can be allowed. A parent allowance does not expose
+    // nested dot-names, and .obsidian stays reserved at every depth.
+    if (segment === '.obsidian' || !directory ||
+        !rules.allowedHiddenDirs?.includes(parts.slice(0, i + 1).join('/'))) return false;
+  }
+  return true;
 }

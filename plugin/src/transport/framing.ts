@@ -37,13 +37,20 @@ export class FramedDuplex extends EventEmitter {
     stream.on('error', err => this.emit('error', err));
   }
 
-  /** Write one framed message. Returns false if the downstream buffer is full (standard backpressure hint). */
+  /**
+   * Write one framed message. Returns false if the downstream buffer is full
+   * (standard backpressure hint).
+   *
+   * Header and body go out in ONE write. Over an SSH channel each write
+   * becomes its own packet, and the TCP under a non-tty session runs with
+   * Nagle on: a second small packet waits for the ACK of the first, which the
+   * peer delays by up to 40 ms. Two writes per frame put that stall on every
+   * request (#513, e2e/scale.spec.ts: ~41 ms per `vault.readBinary`).
+   */
   writeMessage(body: Buffer): boolean {
     if (this.closed) throw new Error('FramedDuplex: closed');
     const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'ascii');
-    const ok1 = this.stream.write(header);
-    const ok2 = this.stream.write(body);
-    return ok1 && ok2;
+    return this.stream.write(Buffer.concat([header, body]));
   }
 
   /** Shut the wire down. Subsequent writeMessage calls throw. */

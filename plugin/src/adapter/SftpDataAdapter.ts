@@ -816,7 +816,24 @@ export class SftpDataAdapter {
 
     if (cached) {
       const s = await this.client.stat(remote);
-      if (s.mtime === cached.mtime) {
+      // Revalidate on mtime AND size. mtime alone is not enough: SFTP reports
+      // it at 1-second resolution (`SftpClient`: `mtime: stats.mtime * 1000`),
+      // so two edits inside the same wall-clock second collapse onto the same
+      // value — and we would serve a cached copy of a file that no longer
+      // exists on the server, then let the user save it back over the real one.
+      // `stat` already hands us the size (it is used just below to size the
+      // transfer), so comparing it costs nothing and catches every same-second
+      // edit that changed the length.
+      //
+      // Not a theoretical race: `reflect.spec.ts` sleeps 1.1 s between remote
+      // edits to keep itself green — this bug wearing a workaround. Pinned by
+      // `e2e/cache-pressure.spec.ts`.
+      //
+      // A same-second edit that preserves the byte length is still invisible
+      // here; closing that needs a content hash or a server-side change
+      // counter. This removes the common case, cheaply.
+      const sizeMatches = s.size === undefined || s.size === cached.data.byteLength;
+      if (s.mtime === cached.mtime && sizeMatches) {
         this.readCache.get(remote); // bump LRU on hit
         return cached.data;
       }

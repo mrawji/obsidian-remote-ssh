@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { logger } from '../util/logger';
 import type { SshProfile, PendingPluginSuggestion } from '../types';
 import type { ObsidianRegistry } from './ObsidianRegistry';
@@ -119,6 +120,14 @@ export class ShadowVaultBootstrap {
     /** Absolute path to THIS running plugin's directory (source for symlink/copy). */
     private readonly sourcePluginDir: string,
     private readonly registry: ObsidianRegistry,
+    /**
+     * Root of this device's never-synced sync state (e.g.
+     * `~/.obsidian-remote/`), parent of the `state/` dir that holds the
+     * community-plugins base snapshots — see
+     * {@link ShadowVaultBootstrap.communityPluginsBasePath}. Defaults to
+     * `baseDir`'s parent, which is exactly that on every real call site.
+     */
+    private readonly stateRoot: string = path.dirname(baseDir),
   ) {}
 
   bootstrap(profile: SshProfile, allProfiles: ReadonlyArray<SshProfile>): Promise<BootstrapResult> {
@@ -146,6 +155,18 @@ export class ShadowVaultBootstrap {
     // through a confirmation modal in the shadow window. Detect now
     // before the `readBaseDataJson` call below side-effects state.
     const isFirstBootstrap = !fs.existsSync(layout.pluginDataFile);
+
+    // A first bootstrap means this device has no shadow vault for the
+    // profile — either it never had one, or the user deleted it (the
+    // documented recovery step). Either way any base snapshot left over
+    // from a previous incarnation is STALE, and keeping it would be
+    // actively destructive: the fresh shadow's list is the `["remote-ssh"]`
+    // seed below, so every id in that old base would look like a local
+    // uninstall and the first push would strip the user's whole
+    // enabled-plugin list off the remote. Drop it — the round-trip then
+    // falls back to the union (nothing lost) and re-establishes a base on
+    // the first successful push.
+    if (isFirstBootstrap) this.discardCommunityPluginsBase(profile.id);
 
     // `community-plugins.json` always starts as `["remote-ssh"]` only.
     // Inheriting source's full enabled list at bootstrap time was too
@@ -228,6 +249,21 @@ export class ShadowVaultBootstrap {
   }
 
   /**
+   * Delete this device's community-plugins base snapshot for `profileId`
+   * (see the call site in `bootstrapSync`). Best-effort — an absent file
+   * is the normal case, and a failure only means the next round-trip
+   * falls back to the union.
+   */
+  private discardCommunityPluginsBase(profileId: string): void {
+    const basePath = ShadowVaultBootstrap.communityPluginsBasePath(this.stateRoot, profileId);
+    try {
+      fs.rmSync(basePath, { force: true });
+    } catch (e) {
+      logger.warn(`ShadowVaultBootstrap: could not discard stale ${basePath} (${errorMessage(e)})`);
+    }
+  }
+
+  /**
    * Compute the shadow paths for a profile without doing any I/O: the
    * pure `<name>--<tail>` layout, before any collision ` (n)` suffix
    * (which only resolveLayout applies). A thin, side-effect-free path
@@ -247,6 +283,14 @@ export class ShadowVaultBootstrap {
     // `obsidianmd/hardcoded-config-path` happy. Once the shadow window
     // opens and the user customises `configDir`, subsequent reads use
     // `app.vault.configDir` like the rest of the plugin.
+    //
+    // KNOWN GAP (#553, reverted): a user who renames the config folder
+    // makes this disagree with the live value, so the pre-spawn pull
+    // reads and writes a directory Obsidian no longer uses. Detecting it
+    // from disk was tried and reverted — an ambiguous detection can seed a
+    // fresh `community-plugins.json` at the wrong path and push it over
+    // the user's real list. A safe version needs the detection to fail
+    // closed (skip the pre-spawn pull) rather than guess.
     const configDir = path.join(vaultDir, '.' + 'obsidian');
     const pluginDir = path.join(configDir, 'plugins', 'remote-ssh');
     const pluginDataFile = path.join(pluginDir, 'data.json');
@@ -602,31 +646,110 @@ export class ShadowVaultBootstrap {
     return { pushed, skipped, errored };
   }
 
-  // ─── community-plugins list round-trip (#429 / #342) ─────────────────────
+  // ─── community-plugins list round-trip (#429 / #342 / uninstall) ─────────
   //
   // `community-plugins.json` is the *enabled community plugins* list.
   // It deliberately does NOT join SHARED_OBSIDIAN_CONFIG_FILES (whose
   // pull/push copy bytes verbatim): a remote list that omitted
   // `remote-ssh` would, written verbatim, disable the very plugin doing
-  // the sync. Instead these two methods round-trip the list with a
-  // forced `remote-ssh` union, so a plugin enabled on one machine
-  // reaches another machine's shadow vault and reopening no longer
-  // "loses" installed plugins. The marketplace installer re-fetches any
-  // binaries the list names but that aren't staged locally yet.
+  // the sync. Instead these two methods round-trip the list so a plugin
+  // enabled on one machine reaches another machine's shadow vault and
+  // reopening no longer "loses" installed plugins. The marketplace
+  // installer re-fetches any binaries the list names but that aren't
+  // staged locally yet.
+  //
+  // Convergence is a 3-WAY MERGE against a per-device BASE snapshot, not
+  // a union. The union was MONOTONIC — the list could only ever GROW —
+  // so an uninstall on one device never reached the remote, and the next
+  // connect's pull RESURRECTED the plugin locally: a fleet-wide uninstall
+  // was impossible. A union cannot tell "I never had it" from "I removed
+  // it"; only a base can. The base is the converged list as it stood at
+  // the END of the last successful round-trip ON THIS DEVICE (see
+  // {@link communityPluginsBasePath} for where it lives and why).
+  //
+  //     added   = local  \ base   -> add to remote
+  //     removed = base   \ local  -> remove from remote
+  //     added   = remote \ base   -> add to local
+  //     removed = base   \ remote -> remove from local
+  //
+  // Rules, all encoded in {@link mergePluginIds}:
+  //
+  //  - `remote-ssh` (SELF_PLUGIN_ID) is NEVER removable from either side.
+  //  - NO BASE YET (first run, or a shadow vault that was deleted and
+  //    re-bootstrapped): a removal is indistinguishable from never-had,
+  //    so we fall back to the old UNION. Safe — nothing is lost; removals
+  //    simply don't propagate until a base exists, which the first
+  //    successful push then writes.
+  //  - A device that was OFFLINE while another device removed a plugin
+  //    has a stale base, so `base \ remote` sees the removal and drops it
+  //    locally. Correct — that is the whole point of the base.
+  //  - TIE-BREAK — concurrent ADD on A vs REMOVE on B: **ADD WINS**. It
+  //    falls out of the definition: an id in neither the base nor either
+  //    side's removal set (`base \ local`, `base \ remote`) is by
+  //    definition an addition, and additions are unioned in. Rationale:
+  //    re-uninstalling a plugin someone else re-installed is one click;
+  //    silently losing a plugin you just installed is invisible data loss.
+  //
+  // The base is committed by the PUSH only, once BOTH sides hold the
+  // converged list. `pullCommunityPlugins` deliberately never writes it:
+  // a pull-only caller (`preSpawnPull`) would otherwise record the pulled
+  // list as the base, and the push later in the real connect would then
+  // read `base \ remote` as a *remote removal* of everything this device
+  // had locally added — deleting the user's own additions. Never writing
+  // the base on pull also keeps the merge idempotent (a second pull over
+  // the same base+remote recomputes the same list), so the
+  // pre-spawn-pull → connect-pull → connect-push sequence cannot
+  // double-apply a removal.
 
   /** The plugin's own id — always kept enabled across a round-trip. */
   static readonly SELF_PLUGIN_ID = 'remote-ssh';
 
   /**
-   * Pull the remote enabled-plugin list into the shadow vault, merged
-   * with the local list and with `remote-ssh` forced on. A remote list
-   * that's absent or not a valid id array leaves the local list
-   * untouched (never clobbered).
+   * Absolute path to THIS DEVICE's base snapshot of the enabled-plugin
+   * list for `profileId`:
+   *
+   *   <stateRoot>/state/<profile-id>/community-plugins.base.json
+   *
+   * i.e. `~/.obsidian-remote/state/<id>/…`, a SIBLING of the shadow
+   * `vaults/` dir — deliberately outside every vault:
+   *
+   *  - It must be PER-DEVICE and must NOT sync. A base that synced would
+   *    record another machine's view and removals would ping-pong.
+   *  - It must not live under a vault's `<configDir>/`: everything there
+   *    is write-through-mirrored to the remote by
+   *    `SftpDataAdapter.writeThroughConfig`, and `PathMapper` redirects
+   *    the four core config files (plus `plugins/&lowast;/data.json`) per
+   *    device. A new file there would either be shared (wrong) or entangle
+   *    with that machinery.
+   *  - Outside the vault root entirely also keeps it invisible to Obsidian
+   *    and out of the populate.
+   *
+   * NOT under `vaults/` itself: `findShadowByProfileId` enumerates that
+   * dir looking for shadow vaults, and `uniqueVaultDir` could collide with
+   * a profile literally named "state".
+   */
+  static communityPluginsBasePath(stateRoot: string, profileId: string): string {
+    return path.join(
+      stateRoot, 'state', sanitiseStateKey(profileId), 'community-plugins.base.json',
+    );
+  }
+
+  /**
+   * Pull the remote enabled-plugin list into the shadow vault, 3-way
+   * merged against this device's base (see the section comment above)
+   * with `remote-ssh` forced on. A remote list that's absent or not a
+   * valid id array leaves the local list untouched (never clobbered)
+   * and — crucially — contributes NO removals: a remote we could not read
+   * must never look like "every plugin was uninstalled elsewhere".
+   *
+   * `basePath` is optional; omitting it (or pointing at a base that does
+   * not exist yet) degrades to the historical UNION behaviour.
    */
   static async pullCommunityPlugins(
     reader: SharedConfigReader,
     remoteConfigDir: string,
     localConfigDir: string,
+    basePath?: string | null,
   ): Promise<{ pulled: boolean; merged: string[] }> {
     const basename = 'community-plugins.json';
     const remoteRel = `${remoteConfigDir}/${basename}`;
@@ -634,6 +757,12 @@ export class ShadowVaultBootstrap {
 
     fs.mkdirSync(localConfigDir, { recursive: true });
     const local = ShadowVaultBootstrap.readPluginIdList(localPath);
+    if (local === null) {
+      // Same rule as for an unreadable remote: a list we could not read gets
+      // no say. Writing a merge now would overwrite whatever is really there.
+      logger.warn(`pullCommunityPlugins: local ${basename} unreadable; leaving it alone this round`);
+      return { pulled: false, merged: [] };
+    }
 
     let remote: string[] | null = null;
     try {
@@ -649,38 +778,59 @@ export class ShadowVaultBootstrap {
       logger.warn(`pullCommunityPlugins: ${basename} skipped (${errorMessage(e)})`);
     }
 
-    const merged = ShadowVaultBootstrap.mergePluginIds(
-      local, remote ?? [], ShadowVaultBootstrap.SELF_PLUGIN_ID,
-    );
+    const base = ShadowVaultBootstrap.readPluginIdBase(basePath);
+    const merged = remote === null
+      // Nothing readable on the remote → it gets no say this round. Keep
+      // the local list as-is (only forcing `remote-ssh` on); do NOT let
+      // `base \ remote` infer removals from a list we never saw.
+      ? ShadowVaultBootstrap.mergePluginIds(local, local, null, ShadowVaultBootstrap.SELF_PLUGIN_ID)
+      : ShadowVaultBootstrap.mergePluginIds(local, remote, base, ShadowVaultBootstrap.SELF_PLUGIN_ID);
+
     const changed =
       merged.length !== local.length || merged.some((id, i) => id !== local[i]);
     if (changed) ShadowVaultBootstrap.writePluginIdListAtomic(localPath, merged);
 
-    logger.info(`pullCommunityPlugins: merged [${merged.join(', ')}] (changed=${changed})`);
+    logger.info(
+      `pullCommunityPlugins: merged [${merged.join(', ')}] ` +
+      `(changed=${changed}, base=${base ? `[${base.join(', ')}]` : 'none'})`,
+    );
     return { pulled: remote !== null, merged };
   }
 
   /**
-   * Push the local enabled-plugin list to the remote, unioned with the
-   * remote's CURRENT list and with `remote-ssh` forced on.
+   * Push the local enabled-plugin list to the remote — 3-way merged
+   * against the remote's CURRENT list and this device's base, with
+   * `remote-ssh` forced on — then record the converged list as the new
+   * base (both sides now hold it).
    *
-   * Self-protecting against clobber: it re-reads the remote first and
-   * unions, so a stale/minimal local list (e.g. after a transient pull
-   * read-failure earlier in the same connect) can never drop a plugin
-   * another machine enabled. If the remote HAS the file but it can't be
-   * read or parsed, it aborts rather than overwrite what it couldn't
-   * see. A genuinely-absent remote file is seeded from local.
+   * Still self-protecting against clobber: it re-reads the remote first,
+   * so a plugin another machine enabled (absent from the base AND from
+   * this device's list = a remote *addition*) is preserved. If the remote
+   * HAS the file but it can't be read or parsed, it aborts rather than
+   * overwrite what it couldn't see — and leaves the base alone, so a
+   * pending removal is simply retried on the next connect. A genuinely
+   * absent remote file is seeded from local (no removals inferred: an
+   * absent remote is not an emptied one).
    */
   static async pushCommunityPlugins(
     rw: SharedConfigReader & SharedConfigWriter,
     remoteConfigDir: string,
     localConfigDir: string,
+    basePath?: string | null,
   ): Promise<{ pushed: boolean }> {
     const basename = 'community-plugins.json';
     const remoteRel = `${remoteConfigDir}/${basename}`;
     const local = ShadowVaultBootstrap.readPluginIdList(path.join(localConfigDir, basename));
+    if (local === null) {
+      // An unreadable local list must never reach the remote. With a base in
+      // play it would read as "this device uninstalled everything", and the
+      // next pull on every other device would uninstall them too.
+      logger.warn('pushCommunityPlugins: local list unreadable; not pushing (avoid clobber)');
+      return { pushed: false };
+    }
 
-    let remote: string[] = [];
+    /** null = the remote has no list at all (fresh remote) — NOT an empty one. */
+    let remote: string[] | null = null;
     try {
       if (await rw.exists(remoteRel)) {
         const parsed = ShadowVaultBootstrap.parsePluginIdList(await rw.read(remoteRel));
@@ -695,13 +845,25 @@ export class ShadowVaultBootstrap {
       return { pushed: false };
     }
 
-    const ids = ShadowVaultBootstrap.mergePluginIds(remote, local, ShadowVaultBootstrap.SELF_PLUGIN_ID);
-    // No-op when the remote already equals the union — avoid churn.
-    if (remote.length === ids.length && remote.every((id, i) => id === ids[i])) {
+    const base = ShadowVaultBootstrap.readPluginIdBase(basePath);
+    const ids = remote === null
+      // Seed a fresh remote from local. No base removals: "the remote has
+      // no list" is not "the remote deleted everything".
+      ? ShadowVaultBootstrap.mergePluginIds(local, local, null, ShadowVaultBootstrap.SELF_PLUGIN_ID)
+      : ShadowVaultBootstrap.mergePluginIds(local, remote, base, ShadowVaultBootstrap.SELF_PLUGIN_ID);
+
+    // No-op when the remote already equals the converged list — avoid
+    // churn. The base is still committed: both sides DO hold `ids`, and
+    // without this the steady state would never record a base at all.
+    if (remote !== null && remote.length === ids.length && remote.every((id, i) => id === ids[i])) {
+      ShadowVaultBootstrap.writePluginIdBase(basePath, ids);
       return { pushed: false };
     }
     try {
       await rw.write(remoteRel, JSON.stringify(ids) + '\n');
+      // Only now do BOTH sides hold `ids` — commit the base. A write that
+      // throws leaves the old base, so the merge is retried next connect.
+      ShadowVaultBootstrap.writePluginIdBase(basePath, ids);
       logger.info(`pushCommunityPlugins: pushed [${ids.join(', ')}]`);
       return { pushed: true };
     } catch (e) {
@@ -875,26 +1037,130 @@ export class ShadowVaultBootstrap {
    * round-trips via {@link pullPluginBinaries}/{@link pushPluginBinaries}.
    */
   static readEnabledPluginIds(localConfigDir: string): string[] {
-    return ShadowVaultBootstrap.readPluginIdList(path.join(localConfigDir, 'community-plugins.json'));
+    // Binaries only: an unreadable list means "round-trip nothing this time",
+    // which costs a retry, not data.
+    return ShadowVaultBootstrap.readPluginIdList(path.join(localConfigDir, 'community-plugins.json')) ?? [];
   }
 
-  /** Read a local community-plugins.json into an id array ([] when absent/malformed). */
-  private static readPluginIdList(localPath: string): string[] {
+  /**
+   * A local community-plugins.json as an id array, or **null** when it could
+   * not be read or did not parse.
+   *
+   * The difference matters as much here as it does for the remote. Once a
+   * merge base exists, `[]` means "this device uninstalled everything", and
+   * `pushCommunityPlugins` propagates that to the remote and from there to
+   * every other device. An unreadable file is not that: Obsidian rewrites
+   * this file whenever the user toggles a plugin, and the read is a plain
+   * `readFileSync` with no lock, so a read that lands mid-write — or after a
+   * crash left the file truncated — must mean "no data this round", never
+   * "everything is gone".
+   */
+  private static readPluginIdList(localPath: string): string[] | null {
+    let raw: string;
     try {
-      return ShadowVaultBootstrap.parsePluginIdList(fs.readFileSync(localPath, 'utf-8')) ?? [];
-    } catch {
-      return [];
+      raw = fs.readFileSync(localPath, 'utf-8');
+    } catch (e) {
+      // ENOENT is a legitimate empty state: no plugins have ever been
+      // enabled in this vault. Anything else (EACCES, EIO, a directory)
+      // is a read we cannot trust.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+      logger.warn(`readPluginIdList: cannot read ${localPath} (${errorMessage(e)})`);
+      return null;
     }
+    const parsed = ShadowVaultBootstrap.parsePluginIdList(raw);
+    if (parsed === null) {
+      logger.warn(`readPluginIdList: ${localPath} is not a valid id array; treating as unreadable`);
+    }
+    return parsed;
   }
 
-  /** Order-preserving union of `local` + `remote`, with `required` guaranteed present. */
-  private static mergePluginIds(local: string[], remote: string[], required: string): string[] {
+  /**
+   * The 3-way converged enabled-plugin list.
+   *
+   * `base` is what BOTH sides held at the end of the last successful
+   * round-trip on this device (null = none recorded yet). An id is
+   * REMOVED iff it is in the base but has since disappeared from a side
+   * that once had it (`base \ local` ∪ `base \ remote`); everything else
+   * present on either side is kept — so an id absent from the base is an
+   * ADDITION and always survives (the add-wins tie-break). `required`
+   * (`remote-ssh`) is never removable and is always present.
+   *
+   * With `base === null` the removal set is empty and this degrades
+   * EXACTLY to the historical order-preserving union of local + remote —
+   * the documented first-run fallback (nothing can be lost, but a removal
+   * cannot be inferred either).
+   *
+   * Order is local-first, then remote-only additions, then `required`:
+   * deterministic and identical in the pull and the push, so once both
+   * sides converge the push's equality check sees a true no-op.
+   */
+  private static mergePluginIds(
+    local: string[],
+    remote: string[],
+    base: string[] | null,
+    required: string,
+  ): string[] {
+    const removed = new Set<string>();
+    if (base) {
+      const inLocal = new Set(local);
+      const inRemote = new Set(remote);
+      for (const id of base) {
+        if (!inLocal.has(id) || !inRemote.has(id)) removed.add(id);
+      }
+    }
+    // The one plugin that may never be uninstalled — it IS the sync.
+    removed.delete(required);
+
     const out: string[] = [];
     const seen = new Set<string>();
     for (const id of [...local, ...remote, required]) {
-      if (!seen.has(id)) { seen.add(id); out.push(id); }
+      if (removed.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
     }
     return out;
+  }
+
+  /**
+   * This device's base snapshot ([] is meaningful — "both sides were
+   * empty"), or null when there is no usable base: no path given, the
+   * file doesn't exist yet (first run / freshly re-bootstrapped shadow),
+   * or it is malformed. null means "fall back to the union" — never
+   * "everything was removed", which is why a malformed base is degraded
+   * rather than treated as empty.
+   */
+  private static readPluginIdBase(basePath: string | null | undefined): string[] | null {
+    if (!basePath) return null;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(basePath, 'utf-8');
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn(`communityPlugins base: unreadable ${basePath} (${errorMessage(e)}); falling back to union`);
+      }
+      return null;
+    }
+    const parsed = ShadowVaultBootstrap.parsePluginIdList(raw);
+    if (parsed === null) {
+      logger.warn(`communityPlugins base: malformed ${basePath}; falling back to union`);
+    }
+    return parsed;
+  }
+
+  /**
+   * Record the converged list as this device's new base. Best-effort: a
+   * failure here only costs the NEXT connect its removal inference (it
+   * degrades to a union), so it must never fail the round-trip that has
+   * already written both sides.
+   */
+  private static writePluginIdBase(basePath: string | null | undefined, ids: string[]): void {
+    if (!basePath) return;
+    try {
+      fs.mkdirSync(path.dirname(basePath), { recursive: true });
+      ShadowVaultBootstrap.writePluginIdListAtomic(basePath, ids);
+    } catch (e) {
+      logger.warn(`communityPlugins base: failed to record ${basePath} (${errorMessage(e)})`);
+    }
   }
 
   /** Atomic (tmp + rename) write of an id array as JSON. */
@@ -1258,6 +1524,26 @@ export class ShadowVaultBootstrap {
 
     return useSymlink ? 'symlink' : 'copy';
   }
+}
+
+/**
+ * Filesystem-safe form of a profile id for the per-device `state/<key>/`
+ * dir. Ids are normally UUIDs (already safe), but they come from
+ * data.json and are not validated anywhere, so a hand-edited id must not
+ * be able to escape `state/` via `..` or a path separator.
+ */
+export function sanitiseStateKey(profileId: string): string {
+  const id = profileId ?? '';
+  const cleaned = id.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
+  const usable = cleaned !== '' && !/^\.+$/.test(cleaned);
+  // An id that needed no rewriting keys on itself — which is every normal
+  // profile, since ids are UUIDs. Anything else gets a hash of the ORIGINAL
+  // id appended, because the rewrite is lossy: `a/b` and `a?b` both clean to
+  // `a_b`, and two profiles sharing one state dir share a merge base — which
+  // is how a plugin uninstalled on one profile disappears from another.
+  if (usable && cleaned === id) return cleaned;
+  const hash = createHash('sha256').update(id).digest('hex').slice(0, 16);
+  return usable ? `${cleaned}-${hash}` : `id-${hash}`;
 }
 
 /**

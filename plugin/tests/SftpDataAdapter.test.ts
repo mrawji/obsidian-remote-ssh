@@ -1497,6 +1497,57 @@ describe('SftpDataAdapter — writer reflect (#341)', () => {
   });
 });
 
+// ─── cache revalidation: mtime alone is not enough ──────────────────────────
+//
+// SFTP reports mtime at 1-SECOND resolution (`SftpClient`: `stats.mtime * 1000`),
+// so two edits inside the same wall-clock second land on the SAME mtime. A cache
+// that revalidates on mtime alone then serves a copy of a file that no longer
+// exists on the server — and the user saves it back over the real one. `stat`
+// already returns the size, so comparing it closes the common case for free.
+// The E2E form of this lives in `e2e/cache-pressure.spec.ts`.
+describe('SftpDataAdapter — cache revalidation compares size, not just mtime', () => {
+  let readCache: ReadCache;
+  let dirCache: DirCache;
+
+  beforeEach(() => {
+    readCache = new ReadCache({ maxBytes: 4096 });
+    dirCache = new DirCache({ ttlMs: 10_000 });
+  });
+
+  it('refetches when the remote size changed but the mtime did NOT', async () => {
+    const fake = makeFakeClient({
+      files: { '/v/a.md': { data: Buffer.from('old'), mtime: 5000 } },
+    });
+    const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+
+    expect(await adapter.read('a.md')).toBe('old'); // populates the cache
+
+    // A same-second edit: different bytes, DIFFERENT length, mtime unchanged.
+    fake.files['/v/a.md'] = { data: Buffer.from('a-much-longer-body'), mtime: 5000 };
+
+    expect(
+      await adapter.read('a.md'),
+      'served the STALE cached copy: the mtime matched, but the size did not',
+    ).toBe('a-much-longer-body');
+  });
+
+  it('still serves from cache — no refetch — when mtime AND size both match', async () => {
+    const fake = makeFakeClient({
+      files: { '/v/a.md': { data: Buffer.from('same'), mtime: 5000 } },
+    });
+    const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+
+    expect(await adapter.read('a.md')).toBe('same');
+    const fetches = fake.spies.readBinary.mock.calls.length;
+
+    expect(await adapter.read('a.md')).toBe('same');
+    expect(
+      fake.spies.readBinary.mock.calls.length,
+      'a matching mtime+size must still be a cache hit — the size check must not defeat caching',
+    ).toBe(fetches);
+  });
+});
+
 // ─── config write-through (#342 / #429) ─────────────────────────────────────
 //
 // Obsidian loads community plugins at startup and each `onload()` calls

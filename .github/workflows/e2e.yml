@@ -21,13 +21,18 @@ name: E2E smoke (Playwright + Obsidian)
 
 on:
   pull_request:
-    # Both release branches. `next` is where features (and the
-    # connect-lifecycle / connect-failure specs) land first — gating
-    # it here is what stops a broken connect reaching stable again
-    # (1.0.49 shipped connect-broken because nothing exercised the
-    # real connect path on a next PR). Mark "Obsidian E2E smoke" as a
-    # required check on next in branch protection to make it binding.
-    branches: [main, next]
+    # No `branches:` filter — every open PR, whatever its base.
+    # `next` is where features (and the connect-lifecycle /
+    # connect-failure specs) land first, and gating there is what
+    # stops a broken connect reaching stable again (1.0.49 shipped
+    # connect-broken because nothing exercised the real connect path
+    # on a next PR). But a feature track like `cli` accumulates the
+    # same risk for weeks before it ever opens a PR into `next`, so
+    # restricting the gate to the release branches just delays the
+    # signal. Mark "Obsidian E2E smoke" as a required check on next
+    # in branch protection to make it binding.
+    #
+    # The paths filter stays: it is what keeps docs-only PRs free.
     paths:
       # Plugin or daemon source — anything that could change the
       # Obsidian-side behaviour the spec drives.
@@ -62,7 +67,27 @@ concurrency:
 
 jobs:
   e2e:
-    name: Obsidian E2E smoke
+    # Sharded across runners. Obsidian is single-instance, so ONE machine can
+    # only ever drive one window (`workers: 1` in playwright.config.ts is not
+    # tunable) — but that constraint is per MACHINE. Fanning the suite out over
+    # three runners collapses ~30 min of serial work to the slowest shard.
+    #
+    # ALL THREE SHARDS RUN ON EVERY PR. This is a speed change, not a coverage
+    # change: a suite you only run sometimes is a suite you don't trust.
+    #
+    # Second, load-bearing benefit: each runner brings up its OWN docker sshd,
+    # so shards cannot contaminate each other's remote vault. We hit exactly
+    # that — a fixture plugin left behind in the remote community-plugins.json
+    # by one spec reddened `sync.spec` in another. Isolation by construction
+    # beats remembering to clean up.
+    #
+    # fail-fast: false — one shard going red must not cancel the others, or we
+    # lose the rest of the picture on every failure.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [core, features, stress]
+    name: E2E (${{ matrix.shard }})
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -70,15 +95,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: false
 
       - run: npm ci
@@ -144,17 +169,22 @@ jobs:
         env:
           OBSIDIAN_PATH: ~/obsidian/squashfs-root/obsidian
           DISPLAY: ':99'
-        run: npm run test:e2e
+        # Only this shard's group. The groups are defined as Playwright
+        # `projects` in e2e/playwright.config.ts and together cover every spec —
+        # nothing is dropped, it is just spread across runners.
+        run: npx playwright test --config e2e/playwright.config.ts --project=${{ matrix.shard }}
 
       - name: Tear down test sshd
         if: always()
         run: npm run sshd:stop
 
+      # Artifact names must be unique per shard — three jobs uploading the same
+      # name in one run is an upload conflict, and the reports would clobber.
       - name: Upload Playwright report
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-report-${{ github.run_id }}
+          name: e2e-report-${{ matrix.shard }}-${{ github.run_id }}
           path: plugin/e2e-results/
           retention-days: 14
 
@@ -162,6 +192,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-screenshots-${{ github.run_id }}
+          name: e2e-screenshots-${{ matrix.shard }}-${{ github.run_id }}
           path: plugin/test-results/
           retention-days: 14

@@ -31,15 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: false
 
       - run: npm ci
@@ -109,6 +109,11 @@ jobs:
         env:
           OBSIDIAN_PATH: ~/obsidian/squashfs-root/obsidian
           DISPLAY: ':99'
+          # demo.spec.ts is `testIgnore`d by default so the recorder never
+          # runs inside the behavioural E2E suite. This is the one place that
+          # opts it back in. Without this the walkthrough would silently match
+          # ZERO tests and the GIF would never regenerate.
+          E2E_DEMO: '1'
         run: npx playwright test --config e2e/playwright.config.ts demo.spec.ts
 
       - name: Stitch screencast frames into a GIF (two-pass palettegen)

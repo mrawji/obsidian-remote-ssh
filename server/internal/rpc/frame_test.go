@@ -117,3 +117,27 @@ func TestWriteFrame_Bytes(t *testing.T) {
 		t.Errorf("output = %q, want %q", buf.String(), want)
 	}
 }
+
+// countingWriter records how many Write calls a frame took.
+type countingWriter struct {
+	bytes.Buffer
+	writes int
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.writes++
+	return c.Buffer.Write(p)
+}
+
+func TestWriteFrame_SingleWrite(t *testing.T) {
+	var w countingWriter
+	if err := WriteFrame(&w, []byte(`{"x":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if w.writes != 1 {
+		t.Errorf("WriteFrame used %d writes, want 1 (a split frame stalls on Nagle + delayed ACK)", w.writes)
+	}
+	if w.String() != "Content-Length: 7\r\n\r\n{\"x\":1}" {
+		t.Errorf("output = %q", w.String())
+	}
+}

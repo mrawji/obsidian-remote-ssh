@@ -7,6 +7,7 @@ import {
 } from './helpers/obsidian';
 import { scaffoldTestVault, type ScaffoldResult } from './helpers/vault-scaffold';
 import { RemoteVerifier } from './helpers/remote-verifier';
+import { assertSshdReachable } from './helpers/sshd';
 
 /**
  * M11 (#125) — remote-write reflection scenarios.
@@ -22,9 +23,12 @@ import { RemoteVerifier } from './helpers/remote-verifier';
  * plugin), then asserts that the connected Obsidian window's File
  * Explorer reflects the change within `REFLECT_TIMEOUT_MS`.
  *
- * Skipped en bloc when:
- *   - the Docker test sshd is unreachable (no key file or no port 2222)
- *   - the plugin failed to connect to the remote vault
+ * This suite HARD-FAILS — it never skips. It used to `test.skip` both
+ * when sshd was down and when `connectAndOpenShadow` THREW, so a
+ * genuinely broken connect reported CI green: exactly the failure mode
+ * `helpers/sshd.ts` exists to stop ("that is how 1.0.49 shipped
+ * broken"). The connect-* specs were migrated to `assertSshdReachable`;
+ * this spec and `sync.spec.ts` were left behind. Not any more.
  *
  * Run: `npm run test:e2e:reflect`
  */
@@ -41,14 +45,20 @@ const REFLECT_TIMEOUT_MS = 15_000;
 let obsidian: ObsidianHandle;
 let scaffold: ScaffoldResult;
 let remote: RemoteVerifier;
-let connected = false;
 
 test.beforeAll(async () => {
+  // HARD-FAIL, never skip: a down sshd is a broken harness and a broken
+  // connect is a broken plugin. Both must be red, not green-by-skipping.
+  await assertSshdReachable();
+
   remote = new RemoteVerifier();
   const remoteOk = await remote.connect();
   if (!remoteOk) {
-    test.skip(true, 'Docker test sshd is not running — skipping reflect tests');
-    return;
+    throw new Error(
+      'RemoteVerifier could not connect to the docker test sshd even though ' +
+      'the port is open — check the test key / container state. This spec ' +
+      'hard-fails rather than skipping.',
+    );
   }
 
   scaffold = scaffoldTestVault();
@@ -62,12 +72,11 @@ test.beforeAll(async () => {
   // The previous heuristic (`items > 0`) was a false positive:
   // local_demo*.md from the scaffold seed was always non-zero, so
   // `connected` was true even when the connect command was a no-op.
-  try {
-    obsidian = await connectAndOpenShadow(obsidian, scaffold.vaultPath);
-    connected = true;
-  } catch (e) {
-    test.skip(true, `connectAndOpenShadow failed: ${String(e)}`);
-  }
+  //
+  // Deliberately NOT wrapped in try/catch: if the connect flow throws,
+  // the plugin is broken and this suite must go RED. Swallowing it into
+  // a `test.skip` is what let a broken connect ship green.
+  obsidian = await connectAndOpenShadow(obsidian, scaffold.vaultPath);
 });
 
 test.afterAll(async () => {
@@ -91,9 +100,9 @@ test.afterAll(async () => {
 });
 
 test.describe('Remote → Obsidian reflection (M11)', () => {
-  test.beforeEach(() => {
-    if (!connected) test.skip(true, 'Not connected to remote');
-  });
+  // No `beforeEach` skip gate: reaching here means `beforeAll` completed,
+  // which means the connect succeeded. If it didn't, beforeAll threw and
+  // the whole suite is already red — which is the point.
 
   test('1 — create: remote-written file appears in File Explorer', async () => {
     const file = `${STAMP}-create.md`;

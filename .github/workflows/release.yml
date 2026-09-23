@@ -121,9 +121,9 @@ jobs:
         working-directory: plugin
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
       - run: npm ci
@@ -154,9 +154,9 @@ jobs:
       manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: false
       - uses: sigstore/cosign-installer@v3
         with:
@@ -250,9 +250,9 @@ jobs:
         with:
           fetch-depth: 0  # needed for changelog generation
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: npm
           cache-dependency-path: plugin/package-lock.json
 

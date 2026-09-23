@@ -17,6 +17,7 @@ Feature-by-feature walkthroughs for things you'll use during normal day-to-day e
 | [[en/user-guide/conflicts\|Conflict handling]] | mtime-precondition writes, what happens when two clients race, **and the missing automatic backup-on-overwrite caveat** |
 | [[en/user-guide/terminal-pane\|Terminal pane]] | The xterm.js panel for opening a shell on the remote host |
 | [[en/user-guide/plugin-compatibility\|Plugin compatibility]] | Which Obsidian community plugins work cleanly + the known sharp edges (Dataview, Templater, Excalidraw…) |
+| [[en/user-guide/vault-size\|Vault size]] | How big a remote vault this handles: measured first-connect and restart times, and where the wall is |
 
 ## Reading order
 

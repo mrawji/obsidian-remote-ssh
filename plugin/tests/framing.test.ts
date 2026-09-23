@@ -44,6 +44,18 @@ function collectMessages(framed: FramedDuplex): { messages: Buffer[]; closed: bo
 }
 
 describe('FramedDuplex', () => {
+  it('writes header and body in ONE write (a split frame stalls on Nagle + delayed ACK)', () => {
+    const writes: Buffer[] = [];
+    const stream = {
+      on: () => stream,
+      write: (chunk: Buffer) => { writes.push(chunk); return true; },
+      end: () => { /* noop */ },
+    } as unknown as import('stream').Duplex;
+    new FramedDuplex(stream).writeMessage(Buffer.from('{"x":1}', 'utf8'));
+    expect(writes).toHaveLength(1);
+    expect(writes[0].toString('utf8')).toBe('Content-Length: 7\r\n\r\n{"x":1}');
+  });
+
   it('round-trips a single message across a duplex pair', async () => {
     const pair = duplexPair();
     const server = new FramedDuplex(pair.a);
