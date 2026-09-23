@@ -1485,7 +1485,7 @@ export class ShadowVaultBootstrap {
  * data.json and are not validated anywhere, so a hand-edited id must not
  * be able to escape `state/` via `..` or a path separator.
  */
-function sanitiseStateKey(profileId: string): string {
+export function sanitiseStateKey(profileId: string): string {
   const cleaned = (profileId ?? '').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
   if (!cleaned || /^\.+$/.test(cleaned)) return 'default';
   return cleaned;

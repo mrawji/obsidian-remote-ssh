@@ -25,10 +25,18 @@ import { VaultModelBuilder } from './vault/VaultModelBuilder';
 import { FsChangeListener } from './vault/FsChangeListener';
 import { BulkWalker } from './vault/BulkWalker';
 import { LazyFolderLoader } from './vault/LazyFolderLoader';
-import { BackgroundIndexer, type IndexProgress } from './vault/BackgroundIndexer';
+import { BackgroundIndexer, type IndexComplete, type IndexProgress } from './vault/BackgroundIndexer';
+import {
+  collectModelEntries,
+  deleteTreeSnapshot,
+  readTreeSnapshot,
+  treeSnapshotPath,
+  writeTreeSnapshot,
+} from './vault/TreeSnapshot';
+import type { RemoteEntry } from './vault/VaultModelBuilder';
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
-import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
+import { ShadowVaultBootstrap, sanitiseStateKey } from './shadow/ShadowVaultBootstrap';
 import type { SharedConfigReader, BootstrapResult } from './shadow/ShadowVaultBootstrap';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
 import { ShadowVaultManager } from './shadow/ShadowVaultManager';
@@ -129,6 +137,9 @@ export default class RemoteSshPlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+    // Before anything else that awaits: Obsidian runs metadataCache.initialize()
+    // right after every plugin's onload resolves (see TreeSnapshot).
+    await this.restoreTreeSnapshot();
 
     logger.setDebug(this.settings.enableDebugLog);
     logger.setMaxLines(this.settings.maxLogLines);
@@ -924,6 +935,135 @@ export default class RemoteSshPlugin extends Plugin {
   private backgroundIndexer: BackgroundIndexer | null = null;
 
   /**
+   * Files put into the model from the tree snapshot at startup, before any
+   * connect. Null when no snapshot was restored this session.
+   */
+  private snapshotFiles: Set<string> | null = null;
+  /** Whether the post-connect metadata catch-up for snapshot files has run. */
+  private snapshotMetadataChecked = false;
+
+  /** The profile whose tree snapshot applies to this vault, if any. */
+  private snapshotProfile(): SshProfile | null {
+    const id = this.settings.autoConnectProfileId;
+    // The snapshot is only ever reconciled by the background index, which runs
+    // in lazy mode; the eager walk has nothing to reconcile it with.
+    if (!id || this.settings.lazyFolderLoad === false) return null;
+    return this.settings.profiles.find((p) => p.id === id) ?? null;
+  }
+
+  private treeSnapshotFile(profileId: string): string {
+    return treeSnapshotPath(shadowStateRoot(), sanitiseStateKey(profileId));
+  }
+
+  /** The vault's note tree as it stands, without the root and the config dir. */
+  private modelEntries(): RemoteEntry[] {
+    return collectModelEntries(this.app.vault.getAllLoadedFiles(), this.app.vault.configDir);
+  }
+
+  /**
+   * Put last session's remote tree into the vault model during `onload`, so
+   * Obsidian's metadataCache.initialize() keeps its cached index instead of
+   * deleting every note it cannot see on the shadow disk (#513). Reconciled
+   * against the real remote once the background index has walked it.
+   */
+  private async restoreTreeSnapshot(): Promise<void> {
+    const profile = this.snapshotProfile();
+    if (!profile) return;
+    try {
+      const entries = readTreeSnapshot(
+        this.treeSnapshotFile(profile.id), profile.remotePath, this.app.vault.configDir,
+      );
+      if (!entries || entries.length === 0) return;
+      const start = Date.now();
+      const result = await new VaultModelBuilder(this.app.vault, { TFile, TFolder }).build(entries);
+      this.snapshotFiles = new Set(entries.filter((e) => !e.isDirectory).map((e) => e.path));
+      logger.info(
+        `TreeSnapshot: restored ${result.filesAdded}f + ${result.foldersAdded}d ` +
+        `before metadataCache.initialize (${Date.now() - start}ms)`,
+      );
+    } catch (e) {
+      // A bad snapshot must never stop the plugin loading: without it the
+      // vault just starts empty and fills in on connect, as before.
+      logger.warn(`TreeSnapshot: restore failed (${errorMessage(e)}); starting without it`);
+    }
+  }
+
+  /**
+   * Once connected, fire `modify` for restored files that need a real read.
+   *
+   * Two groups, both created by the same gap: between `onload` (where the
+   * snapshot lands in the model) and the adapter patch (which happens after
+   * layout ready), the only adapter is Obsidian's native one, pointed at a
+   * shadow disk that holds no notes.
+   *
+   *  - Notes with NO metadata: their cached stat didn't match the snapshot,
+   *    so `metadataCache.initialize()` tried to read them, through the native
+   *    adapter, and failed.
+   *  - Notes OPEN in a tab: Obsidian restores the workspace layout in that
+   *    same window and loads each open file's content the same way. The read
+   *    fails and the editor shows nothing. These notes usually DO have valid
+   *    metadata (that is the whole point of the snapshot), so the check above
+   *    would skip them and the tab would stay blank until reopened by hand.
+   */
+  private reindexSnapshotFilesWithoutMetadata(): void {
+    if (!this.snapshotFiles || this.snapshotMetadataChecked) return;
+    this.snapshotMetadataChecked = true;
+    const builder = new VaultModelBuilder(this.app.vault, { TFile, TFolder });
+    const open = new Set<string>();
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const file = (leaf.view as { file?: { path?: string } } | undefined)?.file;
+      if (file?.path) open.add(file.path);
+    });
+    let queued = 0;
+    let reopened = 0;
+    for (const p of this.snapshotFiles) {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile) || f.extension !== 'md') continue;
+      const needsMetadata = !this.app.metadataCache.getFileCache(f);
+      const isOpen = open.has(p);
+      if (!needsMetadata && !isOpen) continue;
+      if (!builder.modifyOne(p)) continue;
+      if (needsMetadata) queued++;
+      if (isOpen) reopened++;
+    }
+    logger.info(
+      `TreeSnapshot: ${queued} of ${this.snapshotFiles.size} restored files queued for re-index, ` +
+      `${reopened} open tab(s) refreshed`,
+    );
+  }
+
+  /**
+   * A background pass finished. After a daemon walk the model matches the
+   * remote with real mtime/size, so it becomes next launch's snapshot. After
+   * the SFTP fallback it can't: its stats are 0, and a snapshot restored at
+   * startup would carry a daemon session's stats, which metadataCache would
+   * trust as "unchanged". Zero those so every restored note is re-read, and
+   * drop the snapshot.
+   */
+  private onIndexComplete(indexer: BackgroundIndexer, r: IndexComplete): void {
+    if (this.backgroundIndexer !== indexer) return;
+    const profile = this.conn.activeProfile;
+    if (!profile) return;
+    const file = this.treeSnapshotFile(profile.id);
+    if (r.viaFastPath) {
+      try {
+        const entries = this.modelEntries();
+        writeTreeSnapshot(file, profile.remotePath, entries);
+        logger.info(`TreeSnapshot: saved ${entries.length} entries`);
+      } catch (e) {
+        logger.warn(`TreeSnapshot: save failed (${errorMessage(e)})`);
+      }
+      return;
+    }
+    if (this.snapshotFiles) {
+      const builder = new VaultModelBuilder(this.app.vault, { TFile, TFolder });
+      for (const p of this.snapshotFiles) builder.modifyOne(p, { ctime: 0, mtime: 0, size: 0 });
+      this.snapshotFiles = null;
+    }
+    deleteTreeSnapshot(file);
+  }
+
+  /**
    * Start (or restart) the background full-index pass that completes the vault
    * model behind the lazy root-level populate.
    *
@@ -942,6 +1082,14 @@ export default class RemoteSshPlugin extends Plugin {
       // user later expands them in File Explorer.
       markLoaded: (path) => this.lazyLoader?.markLoaded(path),
       onProgress: (p) => this.onIndexProgress(indexer, p),
+      // Reconcile, not just fill in: the model may hold snapshot entries the
+      // remote has changed or dropped since last session.
+      modelAtStart: () => this.modelEntries(),
+      currentStat: (path) => {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        return f instanceof TFile ? f.stat : null;
+      },
+      onComplete: (r) => this.onIndexComplete(indexer, r),
     });
     this.backgroundIndexer = indexer;
     void indexer.start();
@@ -1047,6 +1195,7 @@ export default class RemoteSshPlugin extends Plugin {
    */
   async populateVaultFromRemote(label: string = 'remote'): Promise<string> {
     const start = Date.now();
+    this.reindexSnapshotFilesWithoutMetadata();
 
     // Phase E1-α.2: prefer the daemon's `fs.walk` (one RPC, real
     // mtime+size per entry) when the active session is RPC AND the

@@ -74,6 +74,14 @@ export interface BulkWalkResult {
   /** When `fallback-list` because of a fast-path error, the error message; else null. */
   fastPathError: string | null;
   /**
+   * Folders the fallback could not list (permissions, a vanished dir, a
+   * timeout). Their children are simply ABSENT from `entries`, which is
+   * indistinguishable from "that folder is empty" — so a caller that treats
+   * a walk as the truth about the remote (reconcile: removing what the walk
+   * did not return) must refuse to do so unless this is 0.
+   */
+  listErrors: number;
+  /**
    * Count of encountered entries dropped by the visibility filter before
    * `entries` was returned. Lets the caller tell a genuinely empty remote
    * apart from "everything walked was hidden" (e.g. all content nested under
@@ -139,6 +147,7 @@ export class BulkWalker {
           entries: visible,
           hiddenCount: result.entries.length - visible.length,
           walkMs: Date.now() - start,
+          listErrors: 0,
           // `truncated` here means we stopped at the page guard on a
           // pathological tree — surface it so populate can Notice the
           // partial load instead of silently showing a clipped vault.
@@ -274,8 +283,10 @@ export class BulkWalker {
     source: 'fallback-list';
     truncated: false;
     pages: number;
+    listErrors: number;
   }> {
     const entries: RemoteEntry[] = [];
+    let listErrors = 0;
     const queue: string[] = [rootPath];
     while (queue.length > 0) {
       const folder = queue.shift()!;
@@ -284,6 +295,7 @@ export class BulkWalker {
         listing = await this.deps.adapter.list(folder);
       } catch (e) {
         logger.warn(`BulkWalker.fallbackPath: list("${folder}") failed: ${errorMessage(e)}`);
+        listErrors++;
         continue;
       }
       for (const sub of listing.folders) {
@@ -296,6 +308,6 @@ export class BulkWalker {
         entries.push({ path: file, isDirectory: false, ctime: 0, mtime: 0, size: 0 });
       }
     }
-    return { entries, source: 'fallback-list', truncated: false, pages: 0 };
+    return { entries, source: 'fallback-list', truncated: false, pages: 0, listErrors };
   }
 }

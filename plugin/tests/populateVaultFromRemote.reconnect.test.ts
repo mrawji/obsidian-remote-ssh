@@ -43,6 +43,7 @@ async function scenario(transport: 'rpc' | 'sftp', rootOnly: boolean) {
   });
   Object.assign(app.vault, { fileMap, getRoot: () => root,
     getAbstractFileByPath: (path: string) => fileMap[path] ?? null, trigger,
+    getAllLoadedFiles: () => [root, ...Object.values(fileMap)], configDir: '.obsidian',
     adapter: { list } });
   const rpcCall = vi.fn(async (method: string, params: WalkParams): Promise<WalkResult> => {
     expect(method).toBe('fs.walk');
