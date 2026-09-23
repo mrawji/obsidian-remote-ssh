@@ -83,6 +83,29 @@ describe('BulkWalker', () => {
     ]);
   });
 
+  it('reports what the ignore list excluded, so a vanished folder is explainable', async () => {
+    // Until 1.1.8 the SFTP walk did not apply ignoreDirs at all. A vault with a
+    // real folder called `build` now loses it on upgrade, and the only signal
+    // the user gets is this count.
+    const adapter = makeAdapter({
+      '': { folders: ['build', 'notes'], files: ['README.md'] },
+      'notes': { folders: ['notes/node_modules'], files: ['notes/a.md'] },
+    });
+    const walker = new BulkWalker({ adapter, ignoreDirs: ['node_modules', 'build'] });
+
+    const result = await walker.walk();
+    expect(result.entries.map(e => e.path)).toEqual(['notes', 'README.md', 'notes/a.md']);
+    expect(result.excludedCount).toBe(2);
+    expect(result.excludedDirs.sort()).toEqual(['build', 'node_modules']);
+  });
+
+  it('reports nothing excluded when the ignore list matched nothing', async () => {
+    const adapter = makeAdapter({ '': { folders: ['notes'], files: ['README.md'] }, 'notes': { folders: [], files: [] } });
+    const result = await new BulkWalker({ adapter, ignoreDirs: ['node_modules'] }).walk();
+    expect(result.excludedCount).toBe(0);
+    expect(result.excludedDirs).toEqual([]);
+  });
+
   it('does not descend into hidden or ignored SFTP directories, even when explicitly allowed', async () => {
     const adapter = makeAdapter({
       '': { folders: ['.herdr', '.cache', 'vendor'], files: ['README.md'] },
