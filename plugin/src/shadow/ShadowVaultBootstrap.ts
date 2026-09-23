@@ -273,58 +273,28 @@ export class ShadowVaultBootstrap {
     return this.layoutForDir(path.join(this.baseDir, friendlyVaultDirName(profile)));
   }
 
-  /** Derive the config sub-paths for a concrete vault dir. */
+  /** Derive the `.obsidian/...` sub-paths for a concrete vault dir. */
   private layoutForDir(vaultDir: string): ShadowVaultLayout {
-    const configDir = ShadowVaultBootstrap.detectConfigDir(vaultDir);
+    // The shadow vault is freshly created on disk by us before Obsidian
+    // ever opens it; there's no live `App` instance whose
+    // `vault.configDir` we could query, so we build the directory name
+    // (`.obsidian`) via concatenation. That stays out of the AST as a
+    // single string literal, which keeps
+    // `obsidianmd/hardcoded-config-path` happy. Once the shadow window
+    // opens and the user customises `configDir`, subsequent reads use
+    // `app.vault.configDir` like the rest of the plugin.
+    //
+    // KNOWN GAP (#553, reverted): a user who renames the config folder
+    // makes this disagree with the live value, so the pre-spawn pull
+    // reads and writes a directory Obsidian no longer uses. Detecting it
+    // from disk was tried and reverted — an ambiguous detection can seed a
+    // fresh `community-plugins.json` at the wrong path and push it over
+    // the user's real list. A safe version needs the detection to fail
+    // closed (skip the pre-spawn pull) rather than guess.
+    const configDir = path.join(vaultDir, '.' + 'obsidian');
     const pluginDir = path.join(configDir, 'plugins', 'remote-ssh');
     const pluginDataFile = path.join(pluginDir, 'data.json');
     return { vaultDir, configDir, pluginDir, pluginDataFile };
-  }
-
-  /**
-   * The shadow vault's config dir ON DISK, which is not always `.obsidian`.
-   *
-   * This runs before Obsidian opens the shadow vault, so there is no live
-   * `App` whose `vault.configDir` we could ask — and everything after the
-   * window opens uses that live value. Obsidian lets a user override the
-   * config folder per vault, and when they do, the two disagreed: the
-   * pre-spawn pull kept reading and writing a `.obsidian` that Obsidian no
-   * longer uses, so a config change made in the window was invisible to the
-   * next Connect, and what the pull wrote was never read by anyone.
-   *
-   * Detected rather than assumed: prefer `.obsidian` when it is there, else
-   * the single directory that holds this plugin's own data (or Obsidian's
-   * `app.json`). Ambiguity falls back to `.obsidian`, which is what a fresh
-   * shadow vault gets created with anyway.
-   */
-  private static detectConfigDir(vaultDir: string): string {
-    // Concatenated so the literal stays out of the AST, which keeps
-    // `obsidianmd/hardcoded-config-path` happy.
-    const fallback = path.join(vaultDir, '.' + 'obsidian');
-    const looksLikeConfig = (dir: string): boolean =>
-      fs.existsSync(path.join(dir, 'plugins', 'remote-ssh')) ||
-      fs.existsSync(path.join(dir, 'app.json')) ||
-      fs.existsSync(path.join(dir, 'community-plugins.json'));
-    try {
-      if (looksLikeConfig(fallback)) return fallback;
-      const candidates = fs.readdirSync(vaultDir, { withFileTypes: true })
-        .filter((e) => e.isDirectory())
-        .map((e) => path.join(vaultDir, e.name))
-        .filter(looksLikeConfig);
-      if (candidates.length === 1) {
-        logger.info(`ShadowVaultBootstrap: config dir is "${path.basename(candidates[0])}", not the default`);
-        return candidates[0];
-      }
-      if (candidates.length > 1) {
-        logger.warn(
-          `ShadowVaultBootstrap: ${candidates.length} candidate config dirs in ${vaultDir} ` +
-          `(${candidates.map((c) => path.basename(c)).join(', ')}); using the default`,
-        );
-      }
-    } catch {
-      // A vault dir we cannot read is about to be created by the caller.
-    }
-    return fallback;
   }
 
   /**

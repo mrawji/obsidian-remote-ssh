@@ -83,29 +83,6 @@ describe('BulkWalker', () => {
     ]);
   });
 
-  it('reports what the ignore list excluded, so a vanished folder is explainable', async () => {
-    // Until 1.1.8 the SFTP walk did not apply ignoreDirs at all. A vault with a
-    // real folder called `build` now loses it on upgrade, and the only signal
-    // the user gets is this count.
-    const adapter = makeAdapter({
-      '': { folders: ['build', 'notes'], files: ['README.md'] },
-      'notes': { folders: ['notes/node_modules'], files: ['notes/a.md'] },
-    });
-    const walker = new BulkWalker({ adapter, ignoreDirs: ['node_modules', 'build'] });
-
-    const result = await walker.walk();
-    expect(result.entries.map(e => e.path)).toEqual(['notes', 'README.md', 'notes/a.md']);
-    expect(result.excludedCount).toBe(2);
-    expect(result.excludedDirs.sort()).toEqual(['build', 'node_modules']);
-  });
-
-  it('reports nothing excluded when the ignore list matched nothing', async () => {
-    const adapter = makeAdapter({ '': { folders: ['notes'], files: ['README.md'] }, 'notes': { folders: [], files: [] } });
-    const result = await new BulkWalker({ adapter, ignoreDirs: ['node_modules'] }).walk();
-    expect(result.excludedCount).toBe(0);
-    expect(result.excludedDirs).toEqual([]);
-  });
-
   it('does not descend into hidden or ignored SFTP directories, even when explicitly allowed', async () => {
     const adapter = makeAdapter({
       '': { folders: ['.herdr', '.cache', 'vendor'], files: ['README.md'] },
@@ -386,26 +363,25 @@ describe('pathVisibility (shared by the walk and the tree snapshot)', () => {
   };
 
   it('keeps an ordinary note', () => {
-    expect(pathVisibility('notes/a.md', false, rules)).toEqual({ visible: true, excludedBy: null });
+    expect(pathVisibility('notes/a.md', false, rules)).toBe(true);
   });
 
-  it('names the ignore entry that excluded a path', () => {
-    expect(pathVisibility('build/x.md', false, rules)).toEqual({ visible: false, excludedBy: 'build' });
-    expect(pathVisibility('a/node_modules/b.md', false, rules))
-      .toEqual({ visible: false, excludedBy: 'node_modules' });
+  it('drops a path under an ignored directory, at any depth', () => {
+    expect(pathVisibility('build/x.md', false, rules)).toBe(false);
+    expect(pathVisibility('a/node_modules/b.md', false, rules)).toBe(false);
   });
 
   it('hides dot-names unless the exact folder is allowed, and never the config dir', () => {
-    expect(pathVisibility('.secret/a.md', false, rules).visible).toBe(false);
-    expect(pathVisibility('.herdr/a.md', false, rules).visible).toBe(true);
+    expect(pathVisibility('.secret/a.md', false, rules)).toBe(false);
+    expect(pathVisibility('.herdr/a.md', false, rules)).toBe(true);
     // An allowed parent does not expose a nested dot-folder.
-    expect(pathVisibility('.herdr/.git/config', false, rules).visible).toBe(false);
-    expect(pathVisibility('.obsidian/app.json', false, rules).visible).toBe(false);
+    expect(pathVisibility('.herdr/.git/config', false, rules)).toBe(false);
+    expect(pathVisibility('.obsidian/app.json', false, rules)).toBe(false);
   });
 
   it('rejects traversal and empty segments', () => {
     for (const p of ['../escape.md', 'a/../b.md', 'a//b.md', './a.md']) {
-      expect(pathVisibility(p, false, rules).visible, p).toBe(false);
+      expect(pathVisibility(p, false, rules), p).toBe(false);
     }
   });
 });

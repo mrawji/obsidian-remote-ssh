@@ -985,25 +985,35 @@ export default class RemoteSshPlugin extends Plugin {
         allowedHiddenDirs: profile.allowedHiddenDirs,
         configDir: this.app.vault.configDir,
       };
-      const entries = stored.filter((e) => pathVisibility(e.path, e.isDirectory, rules).visible);
+      const entries = stored.filter((e) => pathVisibility(e.path, e.isDirectory, rules));
       const dropped = stored.length - entries.length;
       if (entries.length === 0) return;
+      // BEFORE the insert, not after. `buildChunked` mutates `vault.fileMap`
+      // chunk by chunk, so a failure partway leaves entries in the model — and
+      // everything that later repairs a restored entry is gated on this set:
+      // the post-connect re-index of notes with no metadata, and the stat
+      // zeroing that is the ONLY thing correcting a restored stat on an SFTP
+      // session. Assigning it afterwards meant a partial restore left stale
+      // entries that nothing would ever reconcile.
+      this.snapshotFiles = new Set(entries.filter((e) => !e.isDirectory).map((e) => e.path));
       // Chunked, not `build()`: this runs inside `onload`, which Obsidian
       // awaits before it loads the vault, and a one-tick insert of tens of
       // thousands of entries — each firing `vault.trigger('create')` — freezes
       // the window for as long as it takes.
       const result = await new VaultModelBuilder(this.app.vault, { TFile, TFolder })
         .buildChunked(entries);
-      this.snapshotFiles = new Set(entries.filter((e) => !e.isDirectory).map((e) => e.path));
       logger.info(
         `TreeSnapshot: restored ${result.filesAdded}f + ${result.foldersAdded}d ` +
         `before metadataCache.initialize (${Date.now() - start}ms` +
         `${dropped > 0 ? `, ${dropped} entries dropped by current ignore/allow settings` : ''})`,
       );
     } catch (e) {
-      // A bad snapshot must never stop the plugin loading: without it the
-      // vault just starts empty and fills in on connect, as before.
-      logger.warn(`TreeSnapshot: restore failed (${errorMessage(e)}); starting without it`);
+      // Never stop the plugin loading over a snapshot. What the vault holds
+      // afterwards depends on where this threw: nothing yet (the file was
+      // unreadable), or the entries some chunks managed to insert. Either is
+      // safe — `snapshotFiles` is already set, so the post-connect catch-up
+      // covers whatever landed, and the background index reconciles the rest.
+      logger.warn(`TreeSnapshot: restore failed (${errorMessage(e)}); continuing without the rest`);
     }
   }
 
@@ -1267,26 +1277,6 @@ export default class RemoteSshPlugin extends Plugin {
       logger.warn(
         `populateVaultFromRemote(${label}): first 5 errors: ` +
         JSON.stringify(result.errors.slice(0, 5), null, 2),
-      );
-    }
-
-    // Until 1.1.8 the SFTP walk ignored `walkIgnoreDirs` entirely, so a vault
-    // with a real folder called `build` / `dist` / `vendor` saw it in the File
-    // Explorer. Now it is pruned like every other ignored name — which is the
-    // right default for a shared remote root, but it must not look like the
-    // folder was deleted. Say it once per connect, with the names.
-    if (walk.excludedCount > 0 && label !== 'debug') {
-      const names = walk.excludedDirs.slice(0, 4).join(', ');
-      const more = walk.excludedDirs.length > 4 ? `, +${walk.excludedDirs.length - 4} more` : '';
-      logger.info(
-        `populateVaultFromRemote(${label}): ${walk.excludedCount} entries excluded by ` +
-        `Ignore directories (${walk.excludedDirs.join(', ')})`,
-      );
-      new Notice(
-        `Remote SSH: ${walk.excludedCount} entries hidden by this profile’s ` +
-        `Ignore directories (${names}${more}). If one of those is a real folder ` +
-        'of yours, remove the name in profile settings and reconnect.',
-        10_000,
       );
     }
 
