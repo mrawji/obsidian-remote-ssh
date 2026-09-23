@@ -88,6 +88,16 @@ export interface BulkWalkResult {
    * a dot-dir) instead of firing a misleading "0 files — check remotePath".
    */
   hiddenCount: number;
+  /**
+   * Of `hiddenCount`, the entries dropped because a path segment matched
+   * `ignoreDirs` — as opposed to being a dot-name. These are names a user can
+   * legitimately have given a real folder (`build`, `dist`, `vendor`), and
+   * until 1.1.8 the SFTP fallback did not prune them at all, so a vault that
+   * upgraded can suddenly be missing a folder. The caller surfaces this.
+   */
+  excludedCount: number;
+  /** The `ignoreDirs` names that actually matched, for the message. */
+  excludedDirs: string[];
 }
 
 /**
@@ -146,6 +156,8 @@ export class BulkWalker {
           ...result,
           entries: visible,
           hiddenCount: result.entries.length - visible.length,
+          excludedCount: this.excludedPaths.size,
+          excludedDirs: [...this.excluded],
           walkMs: Date.now() - start,
           listErrors: 0,
           // `truncated` here means we stopped at the page guard on a
@@ -162,6 +174,8 @@ export class BulkWalker {
           ...fallback,
           entries: visible,
           hiddenCount: fallback.entries.length - visible.length,
+          excludedCount: this.excludedPaths.size,
+          excludedDirs: [...this.excluded],
           walkMs: Date.now() - start,
           fastPathError: message,
         };
@@ -174,6 +188,8 @@ export class BulkWalker {
       ...fallback,
       entries: visible,
       hiddenCount: fallback.entries.length - visible.length,
+      excludedCount: this.excludedPaths.size,
+      excludedDirs: [...this.excluded],
       walkMs: Date.now() - start,
       fastPathError: null,
     };
@@ -193,6 +209,13 @@ export class BulkWalker {
     return this.canUseFastPath();
   }
 
+  /** Names from `ignoreDirs` that this walk actually dropped something for. */
+  private excluded = new Set<string>();
+  /** Paths dropped for that reason. A path is visibility-checked more than
+   *  once (once to filter it, once to decide whether to descend), so count
+   *  paths, not calls. */
+  private excludedPaths = new Set<string>();
+
   /** Shared by full indexing and lazy expansion; allowances never override exclusions. */
   private visibleEntries(entries: RemoteEntry[]): RemoteEntry[] {
     return entries.filter((e) => this.isVisible(e.path, e.isDirectory));
@@ -206,7 +229,11 @@ export class BulkWalker {
       const segment = parts[i];
       if (!segment || segment === '.' || segment === '..') return false;
       const directory = i < parts.length - 1 || isDirectory;
-      if (directory && this.deps.ignoreDirs?.includes(segment)) return false;
+      if (directory && this.deps.ignoreDirs?.includes(segment)) {
+        this.excluded.add(segment);
+        this.excludedPaths.add(vaultPath);
+        return false;
+      }
       if (!segment.startsWith('.')) continue;
       // Only directories can be allowed. A parent allowance does not expose
       // nested dot-names, and .obsidian stays reserved at every depth.

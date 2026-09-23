@@ -1251,6 +1251,26 @@ export default class RemoteSshPlugin extends Plugin {
       );
     }
 
+    // Until 1.1.8 the SFTP walk ignored `walkIgnoreDirs` entirely, so a vault
+    // with a real folder called `build` / `dist` / `vendor` saw it in the File
+    // Explorer. Now it is pruned like every other ignored name — which is the
+    // right default for a shared remote root, but it must not look like the
+    // folder was deleted. Say it once per connect, with the names.
+    if (walk.excludedCount > 0 && label !== 'debug') {
+      const names = walk.excludedDirs.slice(0, 4).join(', ');
+      const more = walk.excludedDirs.length > 4 ? `, +${walk.excludedDirs.length - 4} more` : '';
+      logger.info(
+        `populateVaultFromRemote(${label}): ${walk.excludedCount} entries excluded by ` +
+        `Ignore directories (${walk.excludedDirs.join(', ')})`,
+      );
+      new Notice(
+        `Remote SSH: ${walk.excludedCount} entries hidden by this profile’s ` +
+        `Ignore directories (${names}${more}). If one of those is a real folder ` +
+        'of yours, remove the name in profile settings and reconnect.',
+        10_000,
+      );
+    }
+
     // Don't let a failed/clipped populate look like a working-but-empty
     // vault (the silent "remote files won't open" symptom). Surface it.
     if (walk.entries.length === 0) {
