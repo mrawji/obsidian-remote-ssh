@@ -76,6 +76,21 @@ describe('CertificateAgent identities', () => {
     expect(key.equals(null)).toBe(false);
   });
 
+  it('does not offer an identity it cannot sign for', async () => {
+    // Every offered identity costs one of the server's MaxAuthTries, so a
+    // FIDO key we cannot use must not eat one — and the failure notice tells
+    // the user these are never offered, which has to be true.
+    agent = await startFakeAgent({
+      identities: [
+        { type: 'sk-ssh-ed25519@openssh.com', comment: 'yubikey' },
+        { type: 'ssh-ed25519', comment: 'laptop' },
+        { type: CERT, comment: 'work-cert' },
+      ],
+    });
+    const keys = await identities(new CertificateAgent(agent.socketPath));
+    expect(keys.map((k) => k.type)).toEqual(['ssh-ed25519', CERT]);
+  });
+
   it('reports an agent it cannot reach rather than offering nothing', async () => {
     const a = new CertificateAgent('/nonexistent/agent.sock', { timeoutMs: 200 });
     await expect(identities(a)).rejects.toThrow();
@@ -100,6 +115,33 @@ describe('CertificateAgent signing', () => {
     expect(agent.signRequests[0].keyBlob.equals(keyBlob(CERT))).toBe(true);
     expect(agent.signRequests[0].data.equals(data)).toBe(true);
     expect(sig.equals(signatureBlob('ssh-ed25519'))).toBe(true);
+  });
+
+  it('hands ssh2 the RAW signature for a plain key, as ssh2\'s own agent does', async () => {
+    // ssh2's stock authPK writes `string(algorithm) string(signature)` itself
+    // and expects raw bytes for the second field, so returning the agent's
+    // whole blob here glues a second algorithm name inside the signature and
+    // every server rejects it. Found in review; this is the regression test.
+    agent = await startFakeAgent({
+      identities: [{ type: 'ssh-ed25519', comment: 'laptop' }],
+      signature: signatureBlob('ssh-ed25519'),
+    });
+    const a = new CertificateAgent(agent.socketPath);
+    const [key] = await identities(a);
+
+    const sig = await sign(a, key, Buffer.from('x'));
+    expect(sig.equals(Buffer.alloc(64, 9)), 'the signature bytes alone').toBe(true);
+    expect(sig.equals(signatureBlob('ssh-ed25519')), 'not the tagged blob').toBe(false);
+  });
+
+  it('rejects a plain-key signature it cannot unwrap', async () => {
+    agent = await startFakeAgent({
+      identities: [{ type: 'ssh-ed25519', comment: 'laptop' }],
+      signature: Buffer.from([0, 0, 0, 80, 1, 2, 3]),  // says 80 bytes, has 3
+    });
+    const a = new CertificateAgent(agent.socketPath);
+    const [key] = await identities(a);
+    await expect(sign(a, key, Buffer.from('x'))).rejects.toThrow(/malformed signature/i);
   });
 
   it('sets no signature flags for an Ed25519 certificate', async () => {

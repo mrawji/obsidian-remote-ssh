@@ -88,6 +88,12 @@ export function sshString(value: Buffer | string): Buffer {
 }
 
 const DEFAULT_TIMEOUT_MS = 2_000;
+/**
+ * Largest reply we will buffer. A real agent's identity list is a few KB;
+ * anything claiming more is a process on the socket path trying to make us
+ * allocate, and the length field is the first thing it controls.
+ */
+const MAX_FRAME_BYTES = 256 * 1024;
 /** A sane ceiling; a real agent holds a handful, not thousands. */
 const MAX_IDENTITIES = 1024;
 
@@ -166,6 +172,10 @@ export function agentRoundTrip(
       if (length < 0) {
         if (buf.length < 4) return;
         length = buf.readUInt32BE(0);
+        if (length > MAX_FRAME_BYTES) {
+          finish(new Error(`SSH agent announced an implausible ${length}-byte reply`));
+          return;
+        }
       }
       if (buf.length < 4 + length) return;
       finish(null, buf.subarray(4, 4 + length));

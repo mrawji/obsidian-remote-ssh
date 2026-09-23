@@ -3,6 +3,7 @@ import {
   agentRoundTrip,
   baseKeyType,
   isCertificateType,
+  isUsableIdentity,
   listAgentIdentityBlobs,
   sshString,
   type AgentQueryOptions,
@@ -81,11 +82,6 @@ export function parsedKeySymbol(): symbol | null {
   return cachedSymbol;
 }
 
-/** Exposed for tests: forget the cached symbol. */
-export function resetParsedKeySymbolCache(): void {
-  cachedSymbol = undefined;
-}
-
 /** The subset of a parsed key that ssh2's publickey auth actually touches. */
 export interface AgentPublicKey {
   type: string;
@@ -130,12 +126,18 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
       cb(new Error('Cannot offer agent identities: ssh2 internals changed'));
       return;
     }
-    listAgentIdentityBlobs(this.socketPath, this.opts).then((identities) => {
+    listAgentIdentityBlobs(this.socketPath, this.opts).then((all) => {
+      // An identity we cannot sign for still costs a round trip and one of
+      // the server's MaxAuthTries (commonly 6), so it must not be offered —
+      // which is also what the failure diagnosis tells the user happens.
+      const offered = all.filter((i) => isUsableIdentity(i.type));
+      const skipped = all.filter((i) => !isUsableIdentity(i.type));
       logger.info(
-        `CertificateAgent: offering ${identities.length} identities — ` +
-        identities.map((i) => i.type).join(', '),
+        `CertificateAgent: offering ${offered.length} of ${all.length} identities — ` +
+        `${offered.map((i) => i.type).join(', ') || '(none)'}` +
+        (skipped.length ? `; skipped ${skipped.map((i) => i.type).join(', ')}` : ''),
       );
-      cb(undefined, identities.map(
+      cb(undefined, offered.map(
         (i) => makeAgentKey(i.type, i.comment, i.blob, marker) as unknown as ParsedKey,
       ));
     }).catch((e) => cb(e instanceof Error ? e : new Error(String(e))));
@@ -157,7 +159,7 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
     ]);
 
     agentRoundTrip(this.socketPath, request, this.opts)
-      .then((body) => callback(null, parseSignResponse(body)))
+      .then((body) => callback(null, signatureFor(key.type, parseSignResponse(body))))
       .catch((e) => callback(e instanceof Error ? e : new Error(String(e))));
   }
 }
@@ -179,9 +181,34 @@ function rsaFlags(type: string, hash: string | undefined): Buffer {
 }
 
 /**
+ * Which half of the agent's answer each consumer needs.
+ *
+ * ssh2's own agent client strips the algorithm name before handing a
+ * signature back, because its `authPK` writes `string(algorithm)
+ * string(signature)` itself and expects the raw bytes for the second field
+ * (`ssh2/lib/agent.js`: "We strip the algorithm from OpenSSH's output").
+ * Returning the whole blob there produces a signature field with a second
+ * algorithm name glued inside it, which every server rejects — so plain keys
+ * must be stripped exactly as ssh2 does.
+ *
+ * A certificate is the exception: `certificateAuth` builds that packet
+ * itself, and the blob's algorithm is precisely the value ssh2 gets wrong,
+ * so it needs the answer intact.
+ */
+function signatureFor(keyType: string, blob: Buffer): Buffer {
+  if (isCertificateType(keyType)) return blob;
+  if (blob.length < 4) throw new Error('malformed signature (no algorithm)');
+  const algoLen = blob.readUInt32BE(0);
+  if (4 + algoLen + 4 > blob.length) throw new Error('malformed signature (truncated algorithm)');
+  const sigLen = blob.readUInt32BE(4 + algoLen);
+  const start = 4 + algoLen + 4;
+  if (start + sigLen > blob.length) throw new Error('malformed signature (truncated)');
+  return blob.subarray(start, start + sigLen);
+}
+
+/**
  * The body of a SIGN_RESPONSE: one SSH signature blob, itself
- * `string(algorithm) string(signature)`. Returned whole — the algorithm name
- * inside it is what the server verifies against.
+ * `string(algorithm) string(signature)`.
  */
 function parseSignResponse(body: Buffer): Buffer {
   if (body.length < 1) throw new Error('empty signature reply from the SSH agent');

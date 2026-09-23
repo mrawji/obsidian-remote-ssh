@@ -123,6 +123,23 @@ describe('listAgentIdentities', () => {
       .rejects.toThrow(/did not answer/i);
   });
 
+  it('refuses to buffer a reply of implausible size', async () => {
+    // The length field is the first thing a process on the socket path
+    // controls; trusting it means allocating whatever it asks for.
+    const sock = await fakeAgent(Buffer.alloc(1));
+    // Announce 4 GiB, send almost nothing.
+    const server = track(net.createServer((conn) => {
+      conn.once('data', () => conn.write(Buffer.from([0xff, 0xff, 0xff, 0xff, 12])));
+    }));
+    const huge = agentSocketPath();
+    if (process.platform !== 'win32' && fs.existsSync(huge)) fs.unlinkSync(huge);
+    await new Promise<void>((r) => server.listen(huge, r));
+    void sock;
+
+    await expect(listAgentIdentities(huge, { timeoutMs: 1_000 }))
+      .rejects.toThrow(/implausible/i);
+  });
+
   it('rejects an answer it does not recognise', async () => {
     const sock = await fakeAgent(Buffer.from([99]));
     await expect(listAgentIdentities(sock)).rejects.toThrow(/unexpected/i);
