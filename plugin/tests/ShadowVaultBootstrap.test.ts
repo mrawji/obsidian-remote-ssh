@@ -1327,6 +1327,55 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     expect(readBase(basePath)).toEqual([SELF]);
   });
 
+  it('profile ids that sanitise alike do not share one state dir', () => {
+    // The rewrite is lossy: `a/b` and `a?b` both cleaned to `a_b`, and ids
+    // with nothing usable all landed on the literal 'default'. Profiles that
+    // share a state dir share a merge base, which is how a plugin uninstalled
+    // on one profile disappears from another.
+    const paths = ['a/b', 'a?b', '///', '???']
+      .map((id) => ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, id));
+    expect(new Set(paths).size, 'every id needs its own state dir').toBe(paths.length);
+    for (const p of paths) {
+      expect(p.startsWith(path.join(scratchRoot, 'state') + path.sep)).toBe(true);
+    }
+    // Stable across calls, and a normal UUID id is untouched (no migration).
+    expect(ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, 'a/b')).toBe(paths[0]);
+    const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
+    expect(ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, uuid))
+      .toBe(path.join(scratchRoot, 'state', uuid, 'community-plugins.base.json'));
+  });
+
+  it('a corrupt local list is not an uninstall — the remote keeps its plugins', async () => {
+    // Obsidian rewrites community-plugins.json whenever a plugin is toggled,
+    // and the read is unlocked. A read that lands mid-write, or after a crash
+    // truncated the file, used to parse as [] — which with a base in play is
+    // "this device uninstalled everything", and push sent that to the remote
+    // and from there to every other device.
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    fs.writeFileSync(path.join(localDir, 'community-plugins.json'), '["remote-ssh", "data', 'utf-8');
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'an unreadable local list must never reach the remote').toEqual([SELF, 'dataview']);
+    expect(readBase(basePath), 'and the base must not move on a round we could not read')
+      .toEqual([SELF, 'dataview']);
+  });
+
+  it('a local list that is genuinely empty still propagates as an uninstall', async () => {
+    const localDir = makeLocal([SELF, 'dataview']);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    fs.writeFileSync(path.join(localDir, 'community-plugins.json'), '[]', 'utf-8');
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'an empty list is a real state and must still be honoured').toEqual([SELF]);
+  });
+
   it('propagates a REMOTE removal into the local list (uninstalled on another device)', async () => {
     // This device was offline while machine B uninstalled `dataview`, so its
     // base is stale — which is exactly how the removal is detected.
