@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { BulkWalker, type AdapterListSlice, type RpcConnectionSlice } from '../src/vault/BulkWalker';
+import { BulkWalker, pathVisibility, type AdapterListSlice, type RpcConnectionSlice } from '../src/vault/BulkWalker';
 import type { WalkResult } from '../src/proto/types';
 
 /**
@@ -375,5 +375,37 @@ describe('BulkWalker', () => {
     const walker = new BulkWalker({ adapter });
     const result = await walker.walk('');
     expect(result.walkMs).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('pathVisibility (shared by the walk and the tree snapshot)', () => {
+  const rules = {
+    ignoreDirs: ['node_modules', 'build'],
+    allowedHiddenDirs: ['.herdr'],
+    configDir: '.obsidian',
+  };
+
+  it('keeps an ordinary note', () => {
+    expect(pathVisibility('notes/a.md', false, rules)).toEqual({ visible: true, excludedBy: null });
+  });
+
+  it('names the ignore entry that excluded a path', () => {
+    expect(pathVisibility('build/x.md', false, rules)).toEqual({ visible: false, excludedBy: 'build' });
+    expect(pathVisibility('a/node_modules/b.md', false, rules))
+      .toEqual({ visible: false, excludedBy: 'node_modules' });
+  });
+
+  it('hides dot-names unless the exact folder is allowed, and never the config dir', () => {
+    expect(pathVisibility('.secret/a.md', false, rules).visible).toBe(false);
+    expect(pathVisibility('.herdr/a.md', false, rules).visible).toBe(true);
+    // An allowed parent does not expose a nested dot-folder.
+    expect(pathVisibility('.herdr/.git/config', false, rules).visible).toBe(false);
+    expect(pathVisibility('.obsidian/app.json', false, rules).visible).toBe(false);
+  });
+
+  it('rejects traversal and empty segments', () => {
+    for (const p of ['../escape.md', 'a/../b.md', 'a//b.md', './a.md']) {
+      expect(pathVisibility(p, false, rules).visible, p).toBe(false);
+    }
   });
 });

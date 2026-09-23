@@ -34,6 +34,7 @@ import {
   writeTreeSnapshot,
 } from './vault/TreeSnapshot';
 import type { RemoteEntry } from './vault/VaultModelBuilder';
+import { pathVisibility } from './vault/BulkWalker';
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
 import { ShadowVaultBootstrap, sanitiseStateKey } from './shadow/ShadowVaultBootstrap';
@@ -970,16 +971,34 @@ export default class RemoteSshPlugin extends Plugin {
     const profile = this.snapshotProfile();
     if (!profile) return;
     try {
-      const entries = readTreeSnapshot(
+      const stored = readTreeSnapshot(
         this.treeSnapshotFile(profile.id), profile.remotePath, this.app.vault.configDir,
       );
-      if (!entries || entries.length === 0) return;
+      if (!stored || stored.length === 0) return;
       const start = Date.now();
-      const result = await new VaultModelBuilder(this.app.vault, { TFile, TFolder }).build(entries);
+      // The snapshot was captured under LAST session's ignore / allowed-hidden
+      // settings. Judge every entry by the CURRENT ones, or a folder the user
+      // has since ignored comes back at every launch and only goes away once
+      // the background index has walked the whole remote.
+      const rules = {
+        ignoreDirs: profile.walkIgnoreDirs ?? [...DEFAULT_WALK_IGNORE_DIRS],
+        allowedHiddenDirs: profile.allowedHiddenDirs,
+        configDir: this.app.vault.configDir,
+      };
+      const entries = stored.filter((e) => pathVisibility(e.path, e.isDirectory, rules).visible);
+      const dropped = stored.length - entries.length;
+      if (entries.length === 0) return;
+      // Chunked, not `build()`: this runs inside `onload`, which Obsidian
+      // awaits before it loads the vault, and a one-tick insert of tens of
+      // thousands of entries — each firing `vault.trigger('create')` — freezes
+      // the window for as long as it takes.
+      const result = await new VaultModelBuilder(this.app.vault, { TFile, TFolder })
+        .buildChunked(entries);
       this.snapshotFiles = new Set(entries.filter((e) => !e.isDirectory).map((e) => e.path));
       logger.info(
         `TreeSnapshot: restored ${result.filesAdded}f + ${result.foldersAdded}d ` +
-        `before metadataCache.initialize (${Date.now() - start}ms)`,
+        `before metadataCache.initialize (${Date.now() - start}ms` +
+        `${dropped > 0 ? `, ${dropped} entries dropped by current ignore/allow settings` : ''})`,
       );
     } catch (e) {
       // A bad snapshot must never stop the plugin loading: without it the

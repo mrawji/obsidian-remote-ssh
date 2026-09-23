@@ -222,25 +222,13 @@ export class BulkWalker {
   }
 
   private isVisible(vaultPath: string, isDirectory: boolean): boolean {
-    const configDir = this.deps.configDir ?? '.obsidian';
-    if (vaultPath === configDir || vaultPath.startsWith(configDir + '/')) return false;
-    const parts = vaultPath.split('/');
-    for (let i = 0; i < parts.length; i++) {
-      const segment = parts[i];
-      if (!segment || segment === '.' || segment === '..') return false;
-      const directory = i < parts.length - 1 || isDirectory;
-      if (directory && this.deps.ignoreDirs?.includes(segment)) {
-        this.excluded.add(segment);
-        this.excludedPaths.add(vaultPath);
-        return false;
-      }
-      if (!segment.startsWith('.')) continue;
-      // Only directories can be allowed. A parent allowance does not expose
-      // nested dot-names, and .obsidian stays reserved at every depth.
-      if (segment === '.obsidian' || !directory ||
-          !this.deps.allowedHiddenDirs?.includes(parts.slice(0, i + 1).join('/'))) return false;
+    const verdict = pathVisibility(vaultPath, isDirectory, this.deps);
+    if (verdict.visible) return true;
+    if (verdict.excludedBy !== null) {
+      this.excluded.add(verdict.excludedBy);
+      this.excludedPaths.add(vaultPath);
     }
-    return true;
+    return false;
   }
 
   // ─── internals ──────────────────────────────────────────────────────────
@@ -337,4 +325,51 @@ export class BulkWalker {
     }
     return { entries, source: 'fallback-list', truncated: false, pages: 0, listErrors };
   }
+}
+
+/** What the visibility rules decide, and (for the ignore list) which name did it. */
+export interface VisibilityVerdict {
+  visible: boolean;
+  /** The `ignoreDirs` entry that excluded this path, or null for any other reason. */
+  excludedBy: string | null;
+}
+
+export interface VisibilityRules {
+  ignoreDirs?: readonly string[];
+  allowedHiddenDirs?: readonly string[];
+  configDir?: string;
+}
+
+/**
+ * Whether a vault-relative path may appear in the vault model.
+ *
+ * Shared, because a path has to be judged in two places: by the walk that
+ * discovers it, and by the tree snapshot that restores it at startup — and a
+ * snapshot was captured under whatever the rules were LAST session. If the two
+ * disagreed, a folder the user has since ignored (or stopped allowing) would
+ * come back at every launch and only go away once a background index finished.
+ */
+export function pathVisibility(
+  vaultPath: string,
+  isDirectory: boolean,
+  rules: VisibilityRules,
+): VisibilityVerdict {
+  const hidden: VisibilityVerdict = { visible: false, excludedBy: null };
+  const configDir = rules.configDir ?? '.obsidian';
+  if (vaultPath === configDir || vaultPath.startsWith(configDir + '/')) return hidden;
+  const parts = vaultPath.split('/');
+  for (let i = 0; i < parts.length; i++) {
+    const segment = parts[i];
+    if (!segment || segment === '.' || segment === '..') return hidden;
+    const directory = i < parts.length - 1 || isDirectory;
+    if (directory && rules.ignoreDirs?.includes(segment)) {
+      return { visible: false, excludedBy: segment };
+    }
+    if (!segment.startsWith('.')) continue;
+    // Only directories can be allowed. A parent allowance does not expose
+    // nested dot-names, and .obsidian stays reserved at every depth.
+    if (segment === '.obsidian' || !directory ||
+        !rules.allowedHiddenDirs?.includes(parts.slice(0, i + 1).join('/'))) return hidden;
+  }
+  return { visible: true, excludedBy: null };
 }
