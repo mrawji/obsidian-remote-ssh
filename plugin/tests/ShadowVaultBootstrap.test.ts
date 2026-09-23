@@ -1364,6 +1364,36 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
       .toEqual([SELF, 'dataview']);
   });
 
+  it('a missing local list is an empty vault, not an unreadable one', async () => {
+    // ENOENT is a real state: nothing has ever been enabled here. It must
+    // still seed the remote, unlike a read that failed for any other reason.
+    const localDir = makeLocal([]);
+    fs.rmSync(path.join(localDir, 'community-plugins.json'));
+    const { rw, read } = makeRemote(null);
+    const basePath = basePathFor();
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'a fresh remote is seeded from an empty local list').toEqual([SELF]);
+  });
+
+  it('a local list that cannot be read at all is left alone', async () => {
+    // A directory where the file should be: readFileSync throws EISDIR, not
+    // ENOENT — the "I cannot trust this" case.
+    const localDir = makeLocal([SELF, 'dataview']);
+    const listPath = path.join(localDir, 'community-plugins.json');
+    fs.rmSync(listPath);
+    fs.mkdirSync(listPath);
+    const { rw, read } = makeRemote([SELF, 'dataview']);
+    const basePath = basePathFor([SELF, 'dataview']);
+
+    await roundTrip(rw, localDir, basePath);
+
+    expect(read(), 'an unreadable local list must never reach the remote').toEqual([SELF, 'dataview']);
+    expect(ShadowVaultBootstrap.readEnabledPluginIds(localDir), 'and binaries round-trip nothing')
+      .toEqual([]);
+  });
+
   it('a local list that is genuinely empty still propagates as an uninstall', async () => {
     const localDir = makeLocal([SELF, 'dataview']);
     const { rw, read } = makeRemote([SELF, 'dataview']);
