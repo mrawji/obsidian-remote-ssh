@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { logger } from '../util/logger';
 import type { SshProfile, PendingPluginSuggestion } from '../types';
 import type { ObsidianRegistry } from './ObsidianRegistry';
@@ -748,6 +749,12 @@ export class ShadowVaultBootstrap {
 
     fs.mkdirSync(localConfigDir, { recursive: true });
     const local = ShadowVaultBootstrap.readPluginIdList(localPath);
+    if (local === null) {
+      // Same rule as for an unreadable remote: a list we could not read gets
+      // no say. Writing a merge now would overwrite whatever is really there.
+      logger.warn(`pullCommunityPlugins: local ${basename} unreadable; leaving it alone this round`);
+      return { pulled: false, merged: [] };
+    }
 
     let remote: string[] | null = null;
     try {
@@ -806,6 +813,13 @@ export class ShadowVaultBootstrap {
     const basename = 'community-plugins.json';
     const remoteRel = `${remoteConfigDir}/${basename}`;
     const local = ShadowVaultBootstrap.readPluginIdList(path.join(localConfigDir, basename));
+    if (local === null) {
+      // An unreadable local list must never reach the remote. With a base in
+      // play it would read as "this device uninstalled everything", and the
+      // next pull on every other device would uninstall them too.
+      logger.warn('pushCommunityPlugins: local list unreadable; not pushing (avoid clobber)');
+      return { pushed: false };
+    }
 
     /** null = the remote has no list at all (fresh remote) — NOT an empty one. */
     let remote: string[] | null = null;
@@ -1015,16 +1029,41 @@ export class ShadowVaultBootstrap {
    * round-trips via {@link pullPluginBinaries}/{@link pushPluginBinaries}.
    */
   static readEnabledPluginIds(localConfigDir: string): string[] {
-    return ShadowVaultBootstrap.readPluginIdList(path.join(localConfigDir, 'community-plugins.json'));
+    // Binaries only: an unreadable list means "round-trip nothing this time",
+    // which costs a retry, not data.
+    return ShadowVaultBootstrap.readPluginIdList(path.join(localConfigDir, 'community-plugins.json')) ?? [];
   }
 
-  /** Read a local community-plugins.json into an id array ([] when absent/malformed). */
-  private static readPluginIdList(localPath: string): string[] {
+  /**
+   * A local community-plugins.json as an id array, or **null** when it could
+   * not be read or did not parse.
+   *
+   * The difference matters as much here as it does for the remote. Once a
+   * merge base exists, `[]` means "this device uninstalled everything", and
+   * `pushCommunityPlugins` propagates that to the remote and from there to
+   * every other device. An unreadable file is not that: Obsidian rewrites
+   * this file whenever the user toggles a plugin, and the read is a plain
+   * `readFileSync` with no lock, so a read that lands mid-write — or after a
+   * crash left the file truncated — must mean "no data this round", never
+   * "everything is gone".
+   */
+  private static readPluginIdList(localPath: string): string[] | null {
+    let raw: string;
     try {
-      return ShadowVaultBootstrap.parsePluginIdList(fs.readFileSync(localPath, 'utf-8')) ?? [];
-    } catch {
-      return [];
+      raw = fs.readFileSync(localPath, 'utf-8');
+    } catch (e) {
+      // ENOENT is a legitimate empty state: no plugins have ever been
+      // enabled in this vault. Anything else (EACCES, EIO, a directory)
+      // is a read we cannot trust.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+      logger.warn(`readPluginIdList: cannot read ${localPath} (${errorMessage(e)})`);
+      return null;
     }
+    const parsed = ShadowVaultBootstrap.parsePluginIdList(raw);
+    if (parsed === null) {
+      logger.warn(`readPluginIdList: ${localPath} is not a valid id array; treating as unreadable`);
+    }
+    return parsed;
   }
 
   /**
@@ -1486,9 +1525,17 @@ export class ShadowVaultBootstrap {
  * be able to escape `state/` via `..` or a path separator.
  */
 export function sanitiseStateKey(profileId: string): string {
-  const cleaned = (profileId ?? '').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
-  if (!cleaned || /^\.+$/.test(cleaned)) return 'default';
-  return cleaned;
+  const id = profileId ?? '';
+  const cleaned = id.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
+  const usable = cleaned !== '' && !/^\.+$/.test(cleaned);
+  // An id that needed no rewriting keys on itself — which is every normal
+  // profile, since ids are UUIDs. Anything else gets a hash of the ORIGINAL
+  // id appended, because the rewrite is lossy: `a/b` and `a?b` both clean to
+  // `a_b`, and two profiles sharing one state dir share a merge base — which
+  // is how a plugin uninstalled on one profile disappears from another.
+  if (usable && cleaned === id) return cleaned;
+  const hash = createHash('sha256').update(id).digest('hex').slice(0, 16);
+  return usable ? `${cleaned}-${hash}` : `id-${hash}`;
 }
 
 /**
