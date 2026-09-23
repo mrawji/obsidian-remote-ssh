@@ -4,6 +4,8 @@ import type { Duplex } from 'stream';
 import type { RemoteEntry, RemoteStat, SshProfile } from '../types';
 import { TMP_SUFFIX } from '../constants';
 import { AuthResolver } from './AuthResolver';
+import { CertificateAgent, canSpeakToAgent } from './CertificateAgent';
+import { enableCertificateAuth } from './certificateAuth';
 import { HostKeyStore, type HostKeyMismatchHandler } from './HostKeyStore';
 import { createJumpTunnel } from './JumpHostTunnel';
 import { createProxyCommandTunnel } from './ProxyCommandTunnel';
@@ -194,6 +196,9 @@ export class SftpClient {
     }
 
     const client = new Client();
+    // ssh2 cannot finish an OpenSSH certificate authentication on its own
+    // (#536). Inert unless an identity turns out to be a certificate.
+    enableCertificateAuth(client);
     await new Promise<void>((resolve, reject) => {
       // Use Obsidian's `activeWindow` timers as required by
       // `obsidianmd/prefer-active-window-timers`. The vitest setup
@@ -283,6 +288,13 @@ export class SftpClient {
         ...(this.kbdInteractiveHandler ? { tryKeyboard: true } : {}),
         ...(sock ? { sock } : {}),
         ...authConfig,
+        // ssh2's own agent client drops any identity it cannot parse, which
+        // is every OpenSSH certificate (#536). Speak to the agent ourselves
+        // instead — except for Pageant and Cygwin sockets, whose framing
+        // ssh2 handles and we do not.
+        ...(typeof authConfig.agent === 'string' && canSpeakToAgent(authConfig.agent)
+          ? { agent: new CertificateAgent(authConfig.agent) }
+          : {}),
       };
 
       client.connect(config);
