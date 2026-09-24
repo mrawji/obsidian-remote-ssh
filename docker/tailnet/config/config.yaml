@@ -1,0 +1,67 @@
+# headscale: a self-hosted Tailscale control plane, used only to build a
+# throwaway tailnet for the test suite.
+#
+# Nothing here talks to Tailscale Inc. — no account, no auth key, no network
+# access beyond pulling the image. The tailnet exists for the lifetime of
+# `npm run tailnet:start` and is thrown away by `npm run tailnet:stop`.
+#
+# `server_url` uses the compose service name because the nodes reach the
+# control plane over the compose network, not from the host.
+server_url: http://headscale:8080
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
+grpc_listen_addr: 0.0.0.0:50443
+grpc_allow_insecure: false
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+# The embedded DERP relay means the tailnet has no external dependency.
+# Both nodes sit on the same compose network and negotiate a direct
+# WireGuard path anyway, so DERP is only ever a fallback here.
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "headscale"
+    region_name: "Headscale Embedded DERP"
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+
+disable_check_updates: true
+
+node:
+  ephemeral:
+    inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+log:
+  level: info
+  format: text
+
+policy:
+  mode: file
+  path: /etc/headscale/acl.hujson
+
+dns:
+  magic_dns: true
+  # Do not touch the container's own resolver — we only need MagicDNS for
+  # names inside the tailnet.
+  override_local_dns: false
+  base_domain: tailnet.test
+  nameservers:
+    global: []

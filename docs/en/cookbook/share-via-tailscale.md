@@ -90,6 +90,47 @@ Then re-tag the host:
 sudo tailscale up --advertise-tags=tag:obsidian-vault
 ```
 
+## Is this actually tested?
+
+Yes. The integration suite runs a second time on every PR against an sshd
+that publishes no port at all and is reachable only across a private
+WireGuard mesh, addressed by its MagicDNS name — the "SSH integration
+(tailnet)" job. So "the plugin needs no special handling" is not a claim
+about one connection; it is the whole suite passing over that path. See
+[Testing strategy → Test environments](../contributing/testing-strategy.md).
+
+## If you enable Tailscale SSH
+
+`tailscale up --ssh` is a different thing from the setup above. It makes
+`tailscaled` *itself* answer port 22 for tailnet traffic, taking your
+identity from the WireGuard peer and checking it against the tailnet's SSH
+policy. Your own `sshd` is bypassed for connections arriving over the
+tailnet.
+
+The plugin still works. Point a profile at the host as usual and leave
+`Authentication` on `Private key`: Tailscale SSH accepts the connection
+without looking at the key, and serves SFTP.
+
+That was measured, not assumed — against `tailscale up --ssh` on Tailscale
+**1.102.4**, with a key the server had never seen: it authenticated and SFTP
+round-tripped. It is one observation on one version, and this path is not in
+CI, so treat it as "known to have worked" rather than a guarantee.
+
+Two caveats, both upstream and both worth knowing before you switch:
+
+- **A chatty login banner can corrupt file transfers.** Tailscale SSH serves
+  SFTP inside a login shell, so anything your `/etc/motd` or shell rc prints
+  lands in the SFTP stream
+  ([tailscale#12452](https://github.com/tailscale/tailscale/issues/12452)).
+  Create an empty `~/.hushlogin` on the remote, or keep the MOTD quiet.
+- **File permissions are not applied at creation**
+  ([tailscale#5735](https://github.com/tailscale/tailscale/issues/5735)).
+  Harmless for notes; relevant if you keep scripts in the vault.
+
+Unlike the setup above, this path is not covered by CI. If you would rather
+avoid both caveats, leave Tailscale SSH off and let the plugin talk to your
+ordinary `sshd`, which is what the rest of this page describes.
+
 ## See also
 
 - [[en/user-guide/jump-host|User guide → Jump hosts]] — for cases where Tailscale isn't an option

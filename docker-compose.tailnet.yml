@@ -1,0 +1,135 @@
+# A second environment for the same test suite: the sshd from
+# `docker-compose.yml`, moved inside a private tailnet.
+#
+# Why this exists
+# ---------------
+# `docs/en/cookbook/share-via-tailscale.md` tells people to reach their vault
+# over Tailscale, and the claim underneath it is that the plugin needs no
+# special handling — the host is just an SSH host on a different path. That
+# claim was never executed. This file makes it executable: the same
+# `docker/test-sshd` image, the same keypair, the same tests, but the only
+# route to port 22 runs through WireGuard.
+#
+# It is deliberately NOT a separate test suite. `npm run test:integration:tailnet`
+# runs the ordinary integration tests with `ORSSH_TEST_ENV=tailnet`, which
+# only changes where `plugin/test-env/target.ts` points them.
+#
+# No Tailscale account
+# --------------------
+# `headscale` is a self-hosted control plane, so the tailnet is built from
+# nothing but the two images below — no auth key, no tailnet, no login. That
+# also means it can run in CI without a secret.
+#
+# Shape
+# -----
+#   headscale ── control plane (+ embedded DERP)
+#   ts-vault  ── tailnet node; sshd shares its network namespace
+#   sshd      ── docker/test-sshd, listening on ts-vault's localhost only
+#   ts-client ── tailnet node exposing a SOCKS5 port to the host, which is
+#                how the test process (outside the tailnet) gets in
+#
+# The host reaches the vault with a `ProxyCommand` through ts-client's SOCKS5
+# port. That is a real plugin feature (`SshProfile.proxyCommand`) and the
+# documented way to reach a tailnet from a process that is not itself a
+# tailnet member.
+
+name: obsidian-remote-ssh-tailnet
+
+services:
+  headscale:
+    # Pinned together with the tailscale image below: headscale 0.29.x
+    # refuses clients older than v1.80, and each headscale minor moves that
+    # floor. Bump the pair, never one alone.
+    image: headscale/headscale:v0.29.4
+    container_name: orst-tailnet-headscale
+    command: serve
+    networks: [tailnet]
+    volumes:
+      - ./docker/tailnet/config:/etc/headscale:ro
+      - tailnet-headscale:/var/lib/headscale
+    restart: "no"
+
+  ts-vault:
+    image: tailscale/tailscale:v1.102.4
+    container_name: orst-tailnet-vault
+    hostname: vault
+    networks: [tailnet]
+    # Userspace networking: no /dev/net/tun, no NET_ADMIN, no privileged
+    # container. Inbound tailnet traffic is proxied to the same port on the
+    # container's own localhost — which is where `sshd` below is listening,
+    # because it shares this container's network namespace.
+    environment:
+      TS_USERSPACE: "true"
+      TS_AUTHKEY: file:/run/tailnet/authkey-vault
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # Register once, then never again. headscale here speaks plain HTTP,
+      # and a tailscaled that re-registers after a restart forces an HTTPS
+      # dial ("forcing port 443 dial due to recent noise dial") that nothing
+      # answers — the container then exits and the whole environment is
+      # silently down. Skipping `tailscale up` when state already exists
+      # avoids the re-registration entirely.
+      TS_AUTH_ONCE: "true"
+      TS_EXTRA_ARGS: --login-server=http://headscale:8080 --hostname=vault
+    volumes:
+      - ./docker/tailnet/run:/run/tailnet:ro
+      - tailnet-vault-state:/var/lib/tailscale
+    depends_on: [headscale]
+    restart: "no"
+
+  sshd:
+    # The same image the local environment builds, unmodified — that is the
+    # point. `network_mode: service:` puts it on ts-vault's loopback, so the
+    # only way in is through the tailnet.
+    build: ./docker/test-sshd
+    image: obsidian-remote-ssh-test-sshd:latest
+    container_name: orst-tailnet-sshd
+    network_mode: "service:ts-vault"
+    volumes:
+      - ./docker/keys/id_test.pub:/home/tester/.ssh/authorized_keys:ro
+      - ./docker/test-vault:/home/tester/vault
+    depends_on: [ts-vault]
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "ss -lnt | grep ':22 '"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  ts-client:
+    image: tailscale/tailscale:v1.102.4
+    container_name: orst-tailnet-client
+    hostname: client
+    networks: [tailnet]
+    ports:
+      # Bound to loopback: the SOCKS5 port is a way into the test tailnet and
+      # has no authentication, so it must not be reachable off this machine.
+      - "127.0.0.1:1055:1055"
+    environment:
+      TS_USERSPACE: "true"
+      TS_AUTHKEY: file:/run/tailnet/authkey-client
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_AUTH_ONCE: "true"
+      TS_SOCKS5_SERVER: :1055
+      # Without this the SOCKS5 server cannot resolve MagicDNS names and
+      # every CONNECT to `vault.tailnet.test` comes back as a bare "general
+      # failure". Connecting by `100.x` address works either way, but then
+      # the tests would hard-code an address headscale hands out in
+      # registration order — and would stop testing name resolution, which
+      # is what a Tailscale user actually types.
+      TS_ACCEPT_DNS: "true"
+      TS_EXTRA_ARGS: --login-server=http://headscale:8080 --hostname=client
+    volumes:
+      - ./docker/tailnet/run:/run/tailnet:ro
+      - tailnet-client-state:/var/lib/tailscale
+    depends_on: [headscale]
+    restart: "no"
+
+networks:
+  tailnet:
+
+volumes:
+  tailnet-headscale:
+  tailnet-vault-state:
+  tailnet-client-state:

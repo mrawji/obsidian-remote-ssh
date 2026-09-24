@@ -2,15 +2,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
-
 /**
- * Connection coordinates for the Docker test sshd — same as the
- * integration test helpers to reuse the same container.
+ * Connection coordinates for the test sshd — the same source the integration
+ * helpers use, so both suites aim at whichever environment is selected.
  */
-const TEST_HOST = '127.0.0.1';
-const TEST_PORT = 2222;
-const TEST_USER = 'tester';
-const TEST_VAULT_REMOTE = `/home/${TEST_USER}/vault`;
+import { TEST_USER, TEST_VAULT, targetConnection } from '../../test-env/target';
+
+const TEST_VAULT_REMOTE = TEST_VAULT;
 
 const PLUGIN_ID = 'remote-ssh';
 
@@ -152,13 +150,16 @@ export function scaffoldTestVault(opts: ScaffoldOptions = {}): ScaffoldResult {
       {
         id: profileId,
         name: 'E2E Test',
-        host: TEST_HOST,
-        port: TEST_PORT,
+        ...targetConnection(),
         username: TEST_USER,
         authMethod: 'privateKey',
         privateKeyPath,
         remotePath,
         transport,
+        // After the spread, deliberately: E2E keeps its own, larger budget.
+        // A spec's connect races an Obsidian window booting on a CI runner,
+        // which is a different thing to wait for than the integration
+        // suite's bare `SftpClient.connect()`.
         connectTimeoutMs: 30_000,
         keepaliveIntervalMs: 10_000,
         keepaliveCountMax: 3,
