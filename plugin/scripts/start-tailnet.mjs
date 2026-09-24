@@ -47,6 +47,16 @@ const VAULT_HOST = 'vault.tailnet.test';
 const SOCKS5_PORT = 1055;
 const READY_TIMEOUT_MS = 180_000;
 
+/**
+ * The last thing the proxy said, so a timeout can report a cause.
+ *
+ * Declared here, not beside `waitFor` with the other helpers: the readiness
+ * probe runs during the top-level await above, before the rest of this
+ * module body is evaluated, so a `let` further down is still in its
+ * temporal dead zone when the first stderr chunk arrives.
+ */
+let lastProxyError = '';
+
 fs.mkdirSync(keyDir, { recursive: true });
 fs.mkdirSync(runDir, { recursive: true });
 fs.mkdirSync(path.join(repoRoot, 'docker', 'test-vault'), { recursive: true });
@@ -154,9 +164,6 @@ function sshBannerReachable() {
     proxy.on('exit', () => { clearTimeout(timer); finish(seen.includes('SSH-')); });
   });
 }
-
-/** The last thing the proxy said, so a timeout can report a cause. */
-let lastProxyError = '';
 
 async function waitFor(what, timeoutMs, check) {
   const deadline = Date.now() + timeoutMs;

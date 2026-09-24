@@ -42,7 +42,16 @@ afterEach(() => {
 /** Start a fake proxy on an ephemeral port; `onConn` decides how it misbehaves. */
 function fakeProxy(onConn: (sock: net.Socket) => void): Promise<number> {
   return new Promise((resolve) => {
-    const server = net.createServer(onConn);
+    const server = net.createServer((sock) => {
+      // Every case here ends with the script exiting while this side is
+      // still open. POSIX reports that as EOF; Windows sends an RST, which
+      // surfaces as an `error` event — and an unhandled one fails the whole
+      // file even though every assertion passed. The reset IS the expected
+      // outcome, so it is swallowed rather than asserted on.
+      sock.on('error', () => { /* peer went away, which is the point */ });
+      onConn(sock);
+    });
+    server.on('error', () => { /* closed underneath us in afterEach */ });
     servers.push(server);
     server.listen(0, '127.0.0.1', () => resolve((server.address() as net.AddressInfo).port));
   });
