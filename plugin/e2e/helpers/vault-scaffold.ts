@@ -2,15 +2,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
-
 /**
- * Connection coordinates for the Docker test sshd — same as the
- * integration test helpers to reuse the same container.
+ * Connection coordinates for the test sshd — the same source the integration
+ * helpers use, so both suites aim at whichever environment is selected.
  */
-const TEST_HOST = '127.0.0.1';
-const TEST_PORT = 2222;
-const TEST_USER = 'tester';
-const TEST_VAULT_REMOTE = `/home/${TEST_USER}/vault`;
+import {
+  TEST_HOST, TEST_PORT, TEST_USER, TEST_VAULT, TEST_PROXY_COMMAND,
+} from '../../test-env/target';
+
+const TEST_VAULT_REMOTE = TEST_VAULT;
 
 const PLUGIN_ID = 'remote-ssh';
 
@@ -159,6 +159,11 @@ export function scaffoldTestVault(opts: ScaffoldOptions = {}): ScaffoldResult {
         privateKeyPath,
         remotePath,
         transport,
+        // Present only in the tailnet environment, where the host is not
+        // reachable from this machine by any other route. Omitted entirely
+        // otherwise, so the local environment's profile is byte-identical
+        // to what it has always been.
+        ...(TEST_PROXY_COMMAND ? { proxyCommand: TEST_PROXY_COMMAND } : {}),
         connectTimeoutMs: 30_000,
         keepaliveIntervalMs: 10_000,
         keepaliveCountMax: 3,

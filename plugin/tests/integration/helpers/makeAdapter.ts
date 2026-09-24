@@ -1,4 +1,6 @@
-import * as path from 'node:path';
+import {
+  TEST_ENV, TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, targetConnection,
+} from '../../../test-env/target';
 import { SftpClient } from '../../../src/ssh/SftpClient';
 import { AuthResolver } from '../../../src/ssh/AuthResolver';
 import { SecretStore } from '../../../src/ssh/SecretStore';
@@ -11,36 +13,37 @@ import { PathMapper } from '../../../src/path/PathMapper';
 import type { SshProfile } from '../../../src/types';
 
 /**
- * Connection coordinates for the docker test sshd. Mirrors the
- * constants in `ssh.integration.test.ts` so multi-client tests can
- * reuse the same container without duplicating fixture knowledge.
+ * Connection coordinates for the test sshd. Re-exported from
+ * `test-env/target.ts`, which decides between the directly-published
+ * container and the one that is only reachable across the test tailnet —
+ * see that file for what the environments are and why.
  */
-export const TEST_HOST = '127.0.0.1';
-export const TEST_PORT = 2222;
-export const TEST_USER = 'tester';
-export const TEST_VAULT = `/home/${TEST_USER}/vault`;
-
-export const TEST_PRIVATE_KEY = path.resolve(
-  __dirname, '..', '..', '..', '..', 'docker', 'keys', 'id_test',
-);
+export {
+  TEST_HOST, TEST_PORT, TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY,
+} from '../../../test-env/target';
 
 /**
- * Build an SSH profile pointed at the docker test sshd. Each call
- * gets a unique `id` so callers wiring multiple clients don't
- * accidentally share profile-keyed state (host key TOFU bookkeeping,
- * secret refs).
+ * Build an SSH profile pointed at the test sshd. Each call gets a
+ * unique `id` so callers wiring multiple clients don't accidentally
+ * share profile-keyed state (host key TOFU bookkeeping, secret refs).
+ *
+ * `targetConnection()` supplies host/port and, where the environment
+ * needs one, a `proxyCommand` — so a test never has to know which
+ * environment it is running against.
  */
 export function buildTestProfile(label: string): SshProfile {
   return {
     id:                  `integration-${label}`,
     name:                `Docker test sshd (${label})`,
-    host:                TEST_HOST,
-    port:                TEST_PORT,
+    ...targetConnection(),
     username:            TEST_USER,
     authMethod:          'privateKey',
     privateKeyPath:      TEST_PRIVATE_KEY,
     remotePath:          TEST_VAULT,
-    connectTimeoutMs:    10_000,
+    // A tailnet connection sets up WireGuard and spawns a proxy process
+    // before the SSH handshake starts, which the old 10s budget did not
+    // allow for on a cold container.
+    connectTimeoutMs:    TEST_ENV === 'tailnet' ? 30_000 : 10_000,
     keepaliveIntervalMs: 0,
     keepaliveCountMax:   0,
   };

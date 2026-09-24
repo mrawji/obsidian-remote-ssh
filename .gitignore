@@ -29,6 +29,8 @@ plugin/test-results/
 # bind-mounted vault contents written by integration tests.
 docker/keys/id_test
 docker/keys/id_test.pub
+# headscale preauth keys, minted per run by `npm run tailnet:start`.
+docker/tailnet/run/
 docker/test-vault/*
 !docker/test-vault/.gitkeep
 !docker/test-vault/remote_demo*.md

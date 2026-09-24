@@ -39,6 +39,77 @@ flowchart TB
 because Linux containers aren't available on macOS / Windows GitHub
 runners.
 
+## Test environments
+
+The integration and E2E suites do not name a host. They ask
+`plugin/test-env/target.ts`, and `ORSSH_TEST_ENV` picks between two
+environments that serve the *same* sshd image with the *same* keypair:
+
+| `ORSSH_TEST_ENV` | Compose file | How the suite reaches sshd |
+|---|---|---|
+| `local` (default) | `docker-compose.yml` | published on `127.0.0.1:2222` |
+| `tailnet` | `docker-compose.tailnet.yml` | MagicDNS name over WireGuard, through a SOCKS5 `ProxyCommand` |
+
+```bash
+npm run tailnet:start            # ~15s cold: control plane, two nodes, sshd
+npm run test:integration:tailnet
+npm run test:e2e:tailnet
+npm run tailnet:stop             # down -v; the tailnet is disposable
+```
+
+### Why a second environment
+
+[`share-via-tailscale.md`](../cookbook/share-via-tailscale.md) tells users
+to run their vault over Tailscale, on the argument that the plugin needs no
+special handling because the host is just an SSH host on a different path.
+That is a claim about every read, write, watch and reconnect in the suite —
+not about one connection — so it is checked by running the suite over that
+path rather than by adding a single Tailscale test.
+
+### What it is made of
+
+`headscale` is a self-hosted Tailscale control plane, so the tailnet is
+built from two container images and nothing else: **no Tailscale account, no
+auth key, no secret**, which is also why the job runs on a fork's PR. The
+vault's sshd publishes no port at all — it shares a network namespace with
+an unprivileged `tailscale` node, so the only route to port 22 is the mesh.
+A second node exposes a SOCKS5 port that `plugin/scripts/socks5-connect.mjs`
+turns into a `ProxyCommand`.
+
+That last part is worth being precise about: the suite exercises the plugin's
+own `proxyCommand` support over a real WireGuard link with real MagicDNS
+resolution. It does not simulate a user whose machine is itself a tailnet
+member — for them the plugin sees an ordinary hostname and needs no proxy,
+which is the easier case of the two.
+
+### Readiness, and what "up" does not mean
+
+`npm run tailnet:start` waits for an actual SSH banner to come back through
+the tailnet. A node is up long before it has registered, learned its peers
+and accepted MagicDNS, and a suite started in that window fails with
+`Connection lost before handshake` — a failure that looks like the plugin's
+fault and is not.
+
+### Known limits
+
+- Link shaping (`applyNetProfile`, the `wan` profile) needs `NET_ADMIN`,
+  which the tailnet node does not have. `applyNetProfile` throws there
+  rather than quietly measuring an unshaped link; run those measurements
+  with `ORSSH_TEST_ENV=local`.
+- `certificate-auth.e2e.test.ts` is skipped in the tailnet environment. It
+  drives a bare ssh2 `Client` with no `ProxyCommand`, and what it asserts —
+  which bytes the certificate handshake puts on the wire — cannot be changed
+  by the route to the server.
+- **Do not restart the headscale container.** It speaks plain HTTP, and a
+  `tailscaled` whose control connection drops retries over HTTPS on 443
+  ("forcing port 443 dial due to recent noise dial"), which nothing answers.
+  Every node then loses its netmap and goes offline — including nodes that
+  were never restarted. The scripts never restart it; if you do, run
+  `npm run tailnet:stop && npm run tailnet:start`. Restarting a *node* is
+  fine (`TS_AUTH_ONCE` keeps it from re-registering).
+- The ACL is read at startup, so a policy change also needs a full
+  stop/start rather than a headscale restart.
+
 ## Phase A — Multi-client convergence
 
 The shadow-vault model assumes a user can have several Obsidian

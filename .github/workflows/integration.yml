@@ -52,14 +52,18 @@ jobs:
       - name: Run integration tests
         run: npm run test:integration
 
-      - name: Tear down test sshd
-        if: always()
-        run: npm run sshd:stop
-
+      # Before the teardown, not after: `sshd:stop` runs `docker compose
+      # down -v`, which removes the container. Collected afterwards this
+      # step always produced an empty artifact, so a failed run arrived with
+      # nothing to read.
       - name: Upload sshd logs on failure
         if: failure()
         run: docker logs obsidian-remote-ssh-test-sshd > sshd-logs.txt 2>&1 || true
         working-directory: ${{ github.workspace }}
+
+      - name: Tear down test sshd
+        if: always()
+        run: npm run sshd:stop
 
       - name: Attach sshd logs
         if: failure()
@@ -67,3 +71,73 @@ jobs:
         with:
           name: sshd-logs
           path: sshd-logs.txt
+
+  # The same suite, against an sshd that publishes no port at all: its only
+  # route is a private WireGuard mesh built by a self-hosted headscale
+  # control plane (`docker-compose.tailnet.yml`).
+  #
+  # `docs/en/cookbook/share-via-tailscale.md` tells users to run their vault
+  # over Tailscale on the argument that the plugin needs no special handling.
+  # That is a claim about every read, write and reconnect in the suite, so it
+  # is checked by running the suite, not by one connection test.
+  #
+  # No Tailscale account and no secret: headscale is the control plane, so
+  # this works on a fork's PR exactly as it does here. A separate job rather
+  # than a matrix dimension, so a tailnet-only failure is immediately legible
+  # as "the Tailscale path broke", not "integration is flaky".
+  integration-tailnet:
+    name: SSH integration (tailnet)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - run: npm ci
+
+      - name: Build server daemon
+        run: npm run build:server
+
+      # Brings up headscale, mints the nodes' preauth keys, starts the
+      # tailnet, and waits for a real SSH banner to come back through it —
+      # "container is up" is not readiness here.
+      - name: Bring up the test tailnet
+        run: npm run tailnet:start
+
+      - name: Run integration tests over the tailnet
+        run: npm run test:integration:tailnet
+
+      # Before the teardown: `tailnet:stop` does `down -v`, which removes the
+      # containers these logs live in.
+      - name: Collect tailnet logs on failure
+        if: failure()
+        run: |
+          for c in orst-tailnet-headscale orst-tailnet-vault \
+                   orst-tailnet-client orst-tailnet-sshd; do
+            echo "=== $c ==="
+            docker logs "$c" 2>&1 || true
+          done > tailnet-logs.txt
+        working-directory: ${{ github.workspace }}
+
+      - name: Tear down the test tailnet
+        if: always()
+        run: npm run tailnet:stop
+
+      - name: Attach tailnet logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tailnet-logs
+          path: tailnet-logs.txt

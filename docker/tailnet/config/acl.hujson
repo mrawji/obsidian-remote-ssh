@@ -1,0 +1,12 @@
+// Every node may reach every node. The tailnet is a test fixture with two
+// members and no secrets; narrowing this would only add a way for the suite
+// to fail for reasons that have nothing to do with the plugin.
+//
+// Note there is no `ssh` block: the vault node does NOT run Tailscale SSH.
+// It runs the ordinary `docker/test-sshd` image, with the same keypair the
+// local environment uses — the tailnet is transport here, nothing more.
+{
+  "acls": [
+    { "action": "accept", "src": ["*"], "dst": ["*:*"] },
+  ],
+}

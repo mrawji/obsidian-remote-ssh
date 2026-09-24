@@ -1,15 +1,12 @@
 import { Client, type FileEntryWithStats, type SFTPWrapper } from 'ssh2';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { createProxyCommandTunnel } from '../../src/ssh/ProxyCommandTunnel';
+import {
+  TEST_HOST, TEST_PORT, TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, TEST_PROXY_COMMAND,
+} from '../../test-env/target';
 
-const TEST_HOST = '127.0.0.1';
-const TEST_PORT = 2222;
-const TEST_USER = 'tester';
-const TEST_VAULT_REMOTE = `/home/${TEST_USER}/vault`;
-
-const PRIVATE_KEY_PATH = path.resolve(
-  __dirname, '..', '..', '..', 'docker', 'keys', 'id_test',
-);
+const TEST_VAULT_REMOTE = TEST_VAULT;
+const PRIVATE_KEY_PATH = TEST_PRIVATE_KEY;
 
 /**
  * Direct SSH/SFTP connection to the Docker test sshd for verifying
@@ -47,6 +44,18 @@ export class RemoteVerifier {
         port: TEST_PORT,
         username: TEST_USER,
         privateKey: fs.readFileSync(PRIVATE_KEY_PATH),
+        // The ground-truth check has to reach the remote the same way the
+        // plugin does. In the tailnet environment there is no route to the
+        // host from here except through the tunnel, so this verifier would
+        // report "remote unreachable" — indistinguishable, to a spec, from
+        // the plugin having written nothing.
+        ...(TEST_PROXY_COMMAND
+          ? {
+            sock: createProxyCommandTunnel(TEST_PROXY_COMMAND, {
+              host: TEST_HOST, port: TEST_PORT, user: TEST_USER,
+            }),
+          }
+          : {}),
       });
     });
   }

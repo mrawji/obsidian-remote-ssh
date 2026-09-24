@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
 import * as os from 'node:os';
+import {
+  TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, TEST_ENV, targetConnection,
+} from '../../test-env/target';
 import { SftpClient } from '../../src/ssh/SftpClient';
 import { AuthResolver } from '../../src/ssh/AuthResolver';
 import { SecretStore } from '../../src/ssh/SecretStore';
@@ -19,17 +21,16 @@ import type { SshProfile } from '../../src/types';
  * `npm run test:integration` from a fresh checkout fails loud at
  * the first describe but `npm test` (unit) keeps working.
  */
-const REPO_ROOT      = path.resolve(__dirname, '..', '..', '..');
-const PRIVATE_KEY    = path.join(REPO_ROOT, 'docker', 'keys', 'id_test');
-const TEST_HOST      = '127.0.0.1';
-const TEST_PORT      = 2222;
-const TEST_USER      = 'tester';
+// Host, port and (where the environment needs one) a ProxyCommand come from
+// `test-env/target.ts`, so `ORSSH_TEST_ENV=tailnet` points this file at the
+// sshd that is only reachable across the test tailnet.
+const PRIVATE_KEY    = TEST_PRIVATE_KEY;
 // In-container path: `/home/tester/vault` — bind-mounted from
 // `docker/test-vault/` on the host. Each test file gets a unique
 // subdir so parallel runs (within the file) don't clobber each
 // other; the file as a whole runs serially via vitest's
 // fileParallelism: false.
-const REMOTE_VAULT   = `/home/${TEST_USER}/vault`;
+const REMOTE_VAULT   = TEST_VAULT;
 
 if (!fs.existsSync(PRIVATE_KEY)) {
   throw new Error(
@@ -42,13 +43,12 @@ function buildProfile(): SshProfile {
   return {
     id:                  'integration-test',
     name:                'Docker test sshd',
-    host:                TEST_HOST,
-    port:                TEST_PORT,
+    ...targetConnection(),
     username:            TEST_USER,
     authMethod:          'privateKey',
     privateKeyPath:      PRIVATE_KEY,
     remotePath:          REMOTE_VAULT,
-    connectTimeoutMs:    10_000,
+    connectTimeoutMs:    TEST_ENV === 'tailnet' ? 30_000 : 10_000,
     keepaliveIntervalMs: 0,
     keepaliveCountMax:   0,
   };

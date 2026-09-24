@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { SSHD_CONTAINER as CONTAINER, TEST_ENV } from '../../test-env/target';
 
 /**
  * Network shaping and byte counting for the test sshd container (#513 scale
@@ -11,7 +12,17 @@ import { execFileSync } from 'node:child_process';
  * unshaped.
  */
 
-export const CONTAINER = 'obsidian-remote-ssh-test-sshd';
+/**
+ * The sshd container of whichever environment is selected
+ * (`test-env/target.ts`). In the tailnet environment sshd shares the tailnet
+ * node's network namespace, so shaping `eth0` there shapes the WireGuard
+ * path itself — the link the test means to slow down.
+ *
+ * Shaping needs `NET_ADMIN`, which only the local environment's sshd has;
+ * `applyNetProfile` therefore refuses rather than silently measuring an
+ * unshaped link. The unshaped `lan` profile works in both.
+ */
+export { SSHD_CONTAINER as CONTAINER } from '../../test-env/target';
 const IFACE = 'eth0';
 
 export interface NetProfile {
@@ -38,6 +49,16 @@ export function applyNetProfile(p: NetProfile): void {
   // `del` fails when no qdisc is set; that's the state we want anyway.
   try { dockerExec(['tc', 'qdisc', 'del', 'dev', IFACE, 'root']); } catch { /* none set */ }
   if (p.delayMs === null && p.rateMbit === null) return;
+  if (TEST_ENV === 'tailnet') {
+    // The tailnet node runs without NET_ADMIN, so `tc` cannot shape here.
+    // Refusing beats continuing: a run that reported "wan" while measuring
+    // an unshaped link would be worse than no measurement at all.
+    throw new Error(
+      `Cannot apply the "${p.name}" net profile in the tailnet environment: ` +
+      'its sshd shares a network namespace with an unprivileged tailscale ' +
+      'node. Run link-shaping measurements with ORSSH_TEST_ENV=local.',
+    );
+  }
   const args = ['tc', 'qdisc', 'add', 'dev', IFACE, 'root', 'netem'];
   if (p.delayMs !== null) args.push('delay', `${p.delayMs}ms`);
   if (p.rateMbit !== null) args.push('rate', `${p.rateMbit}mbit`);
