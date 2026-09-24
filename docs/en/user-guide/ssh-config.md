@@ -29,6 +29,8 @@ ssh-add ~/.ssh/id_ed25519      # picks up id_ed25519-cert.pub beside it
 ssh-add -l                     # both the key and the certificate should be listed
 ```
 
+On **Windows**, this applies to the OpenSSH agent (the `\\.\pipe\openssh-ssh-agent` named pipe). **Pageant and Cygwin agents keep going through the SSH library's own client**, which drops certificates — so a certificate held by Pageant still will not work. Use the OpenSSH agent if you need one.
+
 **FIDO security keys** (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) are still **skipped** — the plugin's SSH library cannot parse them. An agent holding only those fails with "SSH authentication failed" while `ssh` on the same machine succeeds; the plugin names the skipped identities in that notice and in its log so you can tell it apart from a wrong username or a server-side rejection. Tracking issue: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
 
 ## What the plugin reads from `~/.ssh/`
