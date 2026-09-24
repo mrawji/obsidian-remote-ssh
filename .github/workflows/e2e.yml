@@ -183,8 +183,15 @@ jobs:
       # gets uploaded from: 200 lines in the job log cannot be lined up against
       # a trace, and a tail drops exactly the early handshake a connect failure
       # turns on. `sshd -e` sends its account to stderr, so 2>&1 is the log.
+      #
+      # `working-directory` is set because `defaults.run` puts every `run`
+      # step in `plugin/`, while `upload-artifact` resolves its path against
+      # the workspace. Without it this step wrote `plugin/plugin/e2e-results/`
+      # and the upload looked in `plugin/e2e-results/` — so the log this
+      # comment describes has never actually been attached to a failed run.
       - name: Capture test sshd log on failure
         if: failure()
+        working-directory: ${{ github.workspace }}
         run: |
           mkdir -p plugin/e2e-results
           docker logs --timestamps obsidian-remote-ssh-test-sshd \
@@ -210,5 +217,137 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: e2e-screenshots-${{ matrix.shard }}-${{ github.run_id }}
+          path: plugin/test-results/
+          retention-days: 14
+
+  # The same specs, against a vault reachable only across a private tailnet
+  # (`docker-compose.tailnet.yml`). The integration suite already runs that
+  # way on every PR; this is the other half — a real Obsidian window, whose
+  # every read and write leaves through a `ProxyCommand`.
+  #
+  # Manual only, for now, and deliberately one shard.
+  #
+  # The E2E helpers were wired for this environment in #576 but had never
+  # been executed: `probeTailnet` in `e2e/helpers/sshd.ts`, the `sock:` branch
+  # in `remote-verifier.ts`, and the seeded profile's `proxyCommand` are all
+  # code that typechecks and has never run. Gating a required check on code
+  # in that state is how you get a red `next` for a harness bug. So: prove it
+  # green by hand first, then decide whether it earns a schedule.
+  #
+  # One shard because the point is to exercise the wiring, not to re-cover
+  # the suite — `core` drives connect, read, write and reconnect, which is
+  # every path the proxy sits under. Widening it is a later, cheaper call.
+  e2e-tailnet:
+    if: github.event_name == 'workflow_dispatch'
+    name: E2E (tailnet, core)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium
+
+      - name: Build plugin
+        run: node esbuild.config.mjs production
+
+      - name: Build server daemon
+        run: npm run build:server
+
+      # Waits for a real SSH banner to come back through the tailnet, not
+      # merely for the containers to exist.
+      - name: Bring up the test tailnet
+        run: npm run tailnet:start
+
+      - name: Cache Obsidian AppImage
+        id: obsidian-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/obsidian/Obsidian.AppImage
+          key: obsidian-appimage-1.8.9-v2
+
+      - name: Download Obsidian AppImage
+        if: steps.obsidian-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/obsidian
+          curl -fL -o ~/obsidian/Obsidian.AppImage \
+            "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.8.9/Obsidian-1.8.9.AppImage" \
+            || curl -fL -o ~/obsidian/Obsidian.AppImage \
+            "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.7.7/Obsidian-1.7.7.AppImage"
+          chmod +x ~/obsidian/Obsidian.AppImage
+
+      - name: Verify AppImage is a real ELF binary
+        run: |
+          file ~/obsidian/Obsidian.AppImage
+          file ~/obsidian/Obsidian.AppImage | grep -q 'ELF .* executable'
+
+      - name: Extract AppImage (no FUSE in CI)
+        run: |
+          cd ~/obsidian
+          ./Obsidian.AppImage --appimage-extract
+          ls -la squashfs-root/
+
+      - name: Start Xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          Xvfb :99 -screen 0 1280x1024x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Run E2E core specs over the tailnet
+        env:
+          OBSIDIAN_PATH: ~/obsidian/squashfs-root/obsidian
+          DISPLAY: ':99'
+          ORSSH_TEST_ENV: tailnet
+        run: npx playwright test --config e2e/playwright.config.ts --project=core
+
+      # All four containers, not just sshd: in this environment a connect can
+      # fail because sshd never saw it, because the peer was not routable yet,
+      # or because the control plane never handed out a netmap — and only the
+      # tailscale/headscale logs tell those apart.
+      - name: Capture tailnet logs on failure
+        if: failure()
+        run: |
+          mkdir -p plugin/e2e-results
+          for c in orst-tailnet-headscale orst-tailnet-vault \
+                   orst-tailnet-client orst-tailnet-sshd; do
+            echo "=== $c ==="
+            docker logs --timestamps "$c" 2>&1 || true
+          done > plugin/e2e-results/tailnet.log
+          echo "captured $(wc -l < plugin/e2e-results/tailnet.log) lines"
+        working-directory: ${{ github.workspace }}
+
+      - name: Tear down the test tailnet
+        if: always()
+        run: npm run tailnet:stop
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-report-tailnet-${{ github.run_id }}
+          path: plugin/e2e-results/
+          retention-days: 14
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-screenshots-tailnet-${{ github.run_id }}
           path: plugin/test-results/
           retention-days: 14
