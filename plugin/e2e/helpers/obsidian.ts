@@ -270,6 +270,7 @@ export async function connectAndWaitForShadowVault(
   throw new Error(
     `connectAndWaitForShadowVault: no shadow vault after ${attempts} connect ` +
     `attempt(s) in ${timeoutMs}ms — ${lastErr instanceof Error ? lastErr.message : String(lastErr)}\n` +
+    `  plugin under test: v${evidence.installedVersion}\n` +
     `  plugin log (tail): ${evidence.logTail}\n` +
     `  visible modal buttons: ${evidence.modalButtons}`,
   );
@@ -283,7 +284,24 @@ export async function connectAndWaitForShadowVault(
 async function collectConnectEvidence(
   page: Page,
   scaffoldVaultPath: string,
-): Promise<{ logTail: string; modalButtons: string }> {
+): Promise<{ logTail: string; modalButtons: string; installedVersion: string }> {
+  // Which build is actually under test. A version that does not match the
+  // working tree means the run is not testing what the reader thinks it is —
+  // a stale artefact, or a CI job on a commit other than the expected one.
+  let installedVersion = '<no manifest>';
+  try {
+    const manifestPath = path.join(
+      scaffoldVaultPath, '.obsidian', 'plugins', 'remote-ssh', 'manifest.json',
+    );
+    if (fs.existsSync(manifestPath)) {
+      installedVersion = String(
+        JSON.parse(fs.readFileSync(manifestPath, 'utf8')).version ?? '<unset>',
+      );
+    }
+  } catch (e) {
+    installedVersion = `<unreadable: ${String(e)}>`;
+  }
+
   let logTail = '<no plugin log>';
   try {
     const logPath = path.join(
@@ -306,7 +324,7 @@ async function collectConnectEvidence(
   } catch (e) {
     modalButtons = `<unreadable: ${String(e)}>`;
   }
-  return { logTail, modalButtons };
+  return { logTail, modalButtons, installedVersion };
 }
 
 /**
