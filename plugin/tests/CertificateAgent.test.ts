@@ -308,6 +308,28 @@ describe('key type helpers', () => {
     expect(canSpeakToAgent('', 'linux')).toBe(false);
   });
 
+  it('finds the marker even where ssh2 refuses ed25519', async () => {
+    // `eddsaSupported` in ssh2 is decided at runtime — it signs and verifies a
+    // sample key on load and can come out false. The first version of this
+    // looked the marker up by parsing an ed25519 key, so on such a machine it
+    // returned null and EVERY agent user lost authentication, certificates or
+    // not. CI reproduced exactly that.
+    vi.resetModules();
+    const ssh2 = await import('ssh2');
+    const real = ssh2.utils.parseKey;
+    const spy = vi.spyOn(ssh2.utils, 'parseKey').mockImplementation(((data: unknown, pass?: unknown) => {
+      const text = typeof data === 'string' ? data : '';
+      if (text.startsWith('ssh-ed25519')) return new Error('Unsupported key format');
+      return (real as (d: unknown, p?: unknown) => unknown)(data, pass);
+    }) as typeof ssh2.utils.parseKey);
+
+    const fresh = await import('../src/ssh/CertificateAgent');
+    expect(fresh.parsedKeySymbol()).toBeTypeOf('symbol');
+
+    spy.mockRestore();
+    vi.resetModules();
+  });
+
   it('finds the marker ssh2 stamps on a parsed key', () => {
     // If a future ssh2 stops using it, this fails here rather than at a
     // user's connect, and the agent falls back to stock behaviour.
