@@ -142,7 +142,10 @@ type SignCallback = (err: Error | null, signature?: Buffer) => void;
 export class CertificateAgent extends BaseAgent<ParsedKey> {
   constructor(
     private readonly socketPath: string,
+    /** Budget for LISTING identities. Signing has its own — see below. */
     private readonly opts: AgentQueryOptions = {},
+    /** Budget for a SIGNATURE, which may be waiting on a person. */
+    private readonly signTimeoutMs: number = SIGN_TIMEOUT_MS,
   ) {
     super();
   }
@@ -179,7 +182,13 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
 
   sign(pubKey: ParsedKey, data: Buffer, options: unknown, cb?: unknown): void {
     const callback = (typeof options === 'function' ? options : cb) as SignCallback | undefined;
-    if (!callback) return;
+    if (!callback) {
+      // ssh2 always passes one today. If that ever changes, returning quietly
+      // would leave its auth state machine waiting for a signature that never
+      // comes — a hang with nothing in the log to explain it.
+      logger.warn('CertificateAgent.sign called with no callback; ignoring the request');
+      return;
+    }
     const hash = typeof options === 'object' && options !== null
       ? (options as { hash?: string }).hash
       : undefined;
@@ -192,11 +201,11 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
       rsaFlags(key.type, hash),
     ]);
 
-    // Not `this.opts`: that budget is for listing identities. A signature can
-    // be blocked on a person touching a key — see SIGN_TIMEOUT_MS.
-    agentRoundTrip(this.socketPath, request, {
-      timeoutMs: this.opts.timeoutMs ?? SIGN_TIMEOUT_MS,
-    })
+    // Deliberately NOT `this.opts`: that budget is for listing identities, and
+    // a signature can be blocked on a person touching a key. Inheriting it
+    // would quietly reimpose the 2 s cap the moment anyone makes the listing
+    // timeout configurable — see SIGN_TIMEOUT_MS.
+    agentRoundTrip(this.socketPath, request, { timeoutMs: this.signTimeoutMs })
       .then((body) => callback(null, signatureFor(key.type, parseSignResponse(body))))
       .catch((e) => callback(e instanceof Error ? e : new Error(String(e))));
   }

@@ -120,12 +120,16 @@ describe('AdapterManager.restore()', () => {
     // the wait existed. Reaching into the private field is deliberate: this is
     // teardown ordering, and there is no public seam for it.
     const { mgr } = makeManager();
+    const dispose = vi.fn();
     const setReconnecting = vi.fn();
-    (mgr as unknown as { _dataAdapter: unknown })._dataAdapter = { setReconnecting };
+    (mgr as unknown as { _dataAdapter: unknown })._dataAdapter = { dispose, setReconnecting };
 
     mgr.restore();
 
-    expect(setReconnecting).toHaveBeenCalledWith(false);
+    expect(dispose).toHaveBeenCalledOnce();
+    // NOT setReconnecting(false): that would also tell the read path the
+    // session is healthy, and it would hit a transport being abandoned.
+    expect(setReconnecting).not.toHaveBeenCalled();
   });
 
   it('leaves isPatched() false after restore()', () => {

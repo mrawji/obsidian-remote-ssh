@@ -1,5 +1,6 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { utils } from 'ssh2';
+import { logger } from '../src/util/logger';
 import {
   CertificateAgent,
   canSpeakToAgent,
@@ -226,6 +227,42 @@ describe('CertificateAgent signing', () => {
     const sig = await sign(a, key, Buffer.from('x'));
     expect(sig.equals(signatureBlob('ssh-ed25519'))).toBe(true);
   }, 20_000);
+
+  it('says so when asked to sign with nowhere to answer', async () => {
+    // ssh2 always passes a callback today. If that ever changed, returning
+    // quietly would leave its auth state machine waiting forever for a
+    // signature, with nothing in the log to explain the hang.
+    agent = await startFakeAgent({
+      identities: [{ type: CERT, comment: 'c' }],
+      signature: signatureBlob('ssh-ed25519'),
+    });
+    const a = new CertificateAgent(agent.socketPath);
+    const [key] = await identities(a);
+    const warn = vi.spyOn(logger, 'warn');
+
+    a.sign(key as never, Buffer.from('x'), undefined as never);
+
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/no callback/i));
+    expect(agent.signRequests, 'and nothing is sent to the agent').toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it('asks for SHA-512 on a certificate already renamed to its SHA-2 form', async () => {
+    // `certificateAlgorithm` hands ssh2 `rsa-sha2-512-cert-v01@openssh.com`,
+    // so by the time `sign()` sees the key the base type is no longer
+    // `ssh-rsa`. The flag has to follow the new name, or the agent signs with
+    // SHA-1 while the wire says SHA-512.
+    agent = await startFakeAgent({
+      identities: [{ type: 'ssh-rsa-cert-v01@openssh.com', comment: 'work-cert' }],
+      signature: signatureBlob('rsa-sha2-512'),
+    });
+    const a = new CertificateAgent(agent.socketPath);
+    const [key] = await identities(a);
+    expect(key.type, 'renamed before ssh2 ever sees it').toBe('rsa-sha2-512-cert-v01@openssh.com');
+
+    await sign(a, key, Buffer.from('x'));
+    expect(agent.signRequests[0].flags).toBe(4);  // SSH_AGENT_RSA_SHA2_512
+  });
 
   it('surfaces a refusal instead of returning an empty signature', async () => {
     agent = await startFakeAgent({ identities: [{ type: CERT, comment: 'c' }] });  // refuses

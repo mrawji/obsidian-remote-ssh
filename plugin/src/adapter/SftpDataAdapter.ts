@@ -192,8 +192,21 @@ export class SftpDataAdapter {
   private reconnecting = false;
 
   /**
+   * Set once this adapter has been torn down (`AdapterManager.restore()`).
+   *
+   * Kept SEPARATE from `reconnecting` on purpose. Clearing `reconnecting` to
+   * wake a parked read also tells `readBufferOverWire` the session is healthy,
+   * and it would then put a real `stat`/`readBinary` on a transport that is
+   * being abandoned — the reconnect-failed path calls `restore()` without
+   * closing it. "Stop waiting" and "the connection is fine" are two different
+   * facts and need two different flags.
+   */
+  private disposed = false;
+
+  /**
    * Toggle the "reconnecting" gate. While set:
-   *  - read / readBinary serve cached values only and throw on miss
+   *  - read / readBinary serve a cached value at once; on a miss they wait
+   *    for the session (bounded — see ReconnectWait) and only then throw
    *  - list / stat / exists throw immediately (no cache fallback)
    *  - any write-side method throws with a clear "reconnecting" notice
    *
@@ -204,6 +217,15 @@ export class SftpDataAdapter {
    */
   setReconnecting(on: boolean): void {
     this.reconnecting = on;
+  }
+
+  /**
+   * Retire this adapter: wake anything parked waiting for a reconnect, and
+   * make every later read fail immediately instead of reaching for a
+   * transport nobody owns any more.
+   */
+  dispose(): void {
+    this.disposed = true;
   }
 
   isReconnecting(): boolean {
@@ -825,21 +847,22 @@ export class SftpDataAdapter {
     // no metadata and nothing said about it — 9,756 of them in the 50,000
     // note run (#513). The wait is bounded; if the session is still down
     // afterwards, readBufferOverWire fails as it always did.
-    await this.reconnectWait.wait(() => this.reconnecting);
+    await this.reconnectWait.wait(() => this.reconnecting && !this.disposed);
     return this.readBufferOverWire(remote, normalizedPath);
   }
 
   private async readBufferOverWire(remote: string, normalizedPath: string): Promise<Buffer> {
     const cached = this.readCache.peek(remote);
 
-    // Still reconnecting after the wait: serve the cache if we can, and only
-    // then give up, same as before.
-    if (this.reconnecting) {
+    // Still reconnecting after the wait, or retired while we waited: serve
+    // the cache if we can, and only then give up. Reaching the wire past this
+    // point would mean talking to a transport that is gone.
+    if (this.reconnecting || this.disposed) {
       if (cached) {
         this.readCache.get(remote); // bump LRU on hit
         return cached.data;
       }
-      throw reconnectingError();
+      throw this.disposed ? disconnectedError() : reconnectingError();
     }
 
     if (cached) {
@@ -1115,5 +1138,9 @@ function parentDirRemote(p: string): string {
  */
 function reconnectingError(): Error {
   return new Error('Remote SSH: reconnecting — try again once the connection is restored');
+}
+
+function disconnectedError(): Error {
+  return new Error('Remote SSH: the connection was closed — reconnect to read this file');
 }
 

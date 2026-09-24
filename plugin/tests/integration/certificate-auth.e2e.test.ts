@@ -57,6 +57,9 @@ let plainAgentPid = '';
 /** A third agent holding only an RSA key and its RSA certificate. */
 let rsaAgentSocket = '';
 let rsaAgentPid = '';
+/** And a fourth for ECDSA — the last certificate type nothing exercised. */
+let ecdsaAgentSocket = '';
+let ecdsaAgentPid = '';
 let configured = false;
 
 /** Block the setup thread without a timer; vitest owns the event loop here. */
@@ -98,6 +101,15 @@ beforeAll(() => {
     path.join(dir, 'id-rsa.pub'),
   ]);
 
+  // And ECDSA. RSA broke precisely because it was the type no test covered;
+  // ECDSA was then the only one left in that position.
+  run('ssh-keygen', ['-q', '-t', 'ecdsa', '-b', '256', '-f', path.join(dir, 'ca-ecdsa'), '-N', '', '-C', 'cert-test-ca-ecdsa']);
+  run('ssh-keygen', ['-q', '-t', 'ecdsa', '-b', '256', '-f', path.join(dir, 'id-ecdsa'), '-N', '', '-C', 'cert-test-user-ecdsa']);
+  run('ssh-keygen', [
+    '-q', '-s', path.join(dir, 'ca-ecdsa'), '-I', 'cert-test-ecdsa', '-n', TEST_USER, '-V', '+1h',
+    path.join(dir, 'id-ecdsa.pub'),
+  ]);
+
   // Teach the container to trust the CA. Mark it dirty BEFORE touching it:
   // `sshd -t` runs after the file is already written, so a failure there
   // still leaves state that afterAll has to remove.
@@ -106,7 +118,8 @@ beforeAll(() => {
   fs.writeFileSync(
     path.join(dir, 'cas.pub'),
     fs.readFileSync(path.join(dir, 'ca.pub'), 'utf8') +
-    fs.readFileSync(path.join(dir, 'ca-rsa.pub'), 'utf8'),
+    fs.readFileSync(path.join(dir, 'ca-rsa.pub'), 'utf8') +
+    fs.readFileSync(path.join(dir, 'ca-ecdsa.pub'), 'utf8'),
   );
   run('docker', ['cp', path.join(dir, 'cas.pub'), `${CONTAINER}:${CA_REMOTE}`]);
   run('docker', ['exec', CONTAINER, 'sh', '-c',
@@ -127,6 +140,11 @@ beforeAll(() => {
   rsaAgentPid = /SSH_AGENT_PID=([^;]+);/.exec(rsa)?.[1] ?? '';
   run('ssh-add', [path.join(dir, 'id-rsa')], { SSH_AUTH_SOCK: rsaAgentSocket });
 
+  const ecdsa = run('ssh-agent', ['-s']);
+  ecdsaAgentSocket = /SSH_AUTH_SOCK=([^;]+);/.exec(ecdsa)?.[1] ?? '';
+  ecdsaAgentPid = /SSH_AGENT_PID=([^;]+);/.exec(ecdsa)?.[1] ?? '';
+  run('ssh-add', [path.join(dir, 'id-ecdsa')], { SSH_AUTH_SOCK: ecdsaAgentSocket });
+
   // A separate agent holding ONLY the repo's ordinary test key, which is in
   // the container's authorized_keys. Separate so neither test can pass on
   // the other's credential.
@@ -139,7 +157,7 @@ beforeAll(() => {
 }, 180_000);
 
 afterAll(() => {
-  for (const pid of [agentPid, plainAgentPid, rsaAgentPid]) {
+  for (const pid of [agentPid, plainAgentPid, rsaAgentPid, ecdsaAgentPid]) {
     if (pid) { try { process.kill(Number(pid)); } catch { /* already gone */ } }
   }
   if (configured) {
@@ -202,6 +220,14 @@ describe.skipIf(!TOOLS_PRESENT)('integration: an OpenSSH certificate held by an 
     // the wire does not match the one that actually signed. Ed25519 cannot
     // catch that — there the two names are identical.
     await expect(connect(true, rsaAgentSocket)).resolves.toBe(TEST_USER);
+  }, 60_000);
+
+  it('authenticates with an ECDSA certificate too', async () => {
+    // The third and last certificate type. Its signature is SSH-format r/s,
+    // not the DER an ECDSA key produces locally, and its key type and
+    // signature type share a name like Ed25519's — so neither of the other
+    // two tests stands in for it.
+    await expect(connect(true, ecdsaAgentSocket)).resolves.toBe(TEST_USER);
   }, 60_000);
 
   it('fails without it — the failure users report today', async () => {
