@@ -99,6 +99,9 @@ export async function createJumpTunnel(
     }
   }
 
+  /** The bastion's last complaint, so the tunnel's death can name a cause. */
+  let lastJumpError: Error | null = null;
+
   // Wait for the jump client to handshake. Both 'ready' and 'error'
   // fire at most once; on error we destroy the client so we don't
   // leak the underlying socket while the rejection unwinds.
@@ -108,6 +111,14 @@ export async function createJumpTunnel(
       resolve();
     };
     const onError = (err: Error) => {
+      // Logged, not merely rejected. This handler stays attached for the
+      // life of the jump session, and once the promise has settled `reject`
+      // is a silent no-op — so a bastion dropping mid-session would tear the
+      // tunnel down here and leave no record of why. Downstream, all anyone
+      // saw was the TARGET host's connection closing, which points at the
+      // wrong machine.
+      lastJumpError = err;
+      logger.warn(`Jump host ${jump.host}:${jump.port} error: ${err.message}`);
       try { jumpClient.destroy?.(); } catch { /* ignore */ }
       reject(new Error(`Jump host "${jump.host}" connect failed: ${err.message}`));
     };
@@ -132,7 +143,17 @@ export async function createJumpTunnel(
         // the tunnel closes we tear the jump session down so the OS
         // socket isn't left hanging.
         stream.on('close', () => {
-          logger.info(`Jump tunnel to ${targetHost}:${targetPort} closed; ending jump client`);
+          // At `warn` with the bastion's reason when there is one: this
+          // closing is how a multi-hop session ends, and "the jump host
+          // died" and "the target went away" are the same line without it.
+          if (lastJumpError) {
+            logger.warn(
+              `Jump tunnel to ${targetHost}:${targetPort} closed after a jump-host ` +
+              `failure (${jump.host}: ${lastJumpError.message}); ending jump client`,
+            );
+          } else {
+            logger.info(`Jump tunnel to ${targetHost}:${targetPort} closed; ending jump client`);
+          }
           try { jumpClient.end(); } catch { /* ignore */ }
         });
         resolve(stream);

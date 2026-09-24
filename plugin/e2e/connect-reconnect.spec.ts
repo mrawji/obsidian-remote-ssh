@@ -16,6 +16,7 @@ import {
   assertAtMost,
 } from './helpers/log-oracle';
 import { assertSshdReachable, waitForSshdReachable } from './helpers/sshd';
+import { SSHD_STOP_COMMAND, SSHD_START_COMMAND } from '../test-env/target';
 
 /**
  * Reconnect e2e (Phase 2) — guards "再接続したときに vault が適切に
@@ -45,8 +46,18 @@ const PLUGIN_ROOT = path.resolve(__dirname, '..');
 
 test.setTimeout(360_000);
 
+/**
+ * Drop or restore the server, in whichever environment is selected.
+ *
+ * This used to run `npm run sshd:${action}` outright, which only ever meant
+ * the directly-published container. Over the tailnet that command tears down
+ * a compose project that is not running: sshd stays up, the plugin never
+ * sees a drop, and the spec times out waiting for a reconnect loop that had
+ * no reason to start — blaming the plugin for a harness that did nothing.
+ */
 function sshd(action: 'start' | 'stop'): void {
-  execSync(`npm run sshd:${action}`, { cwd: PLUGIN_ROOT, stdio: 'pipe' });
+  execSync(action === 'stop' ? SSHD_STOP_COMMAND : SSHD_START_COMMAND,
+    { cwd: PLUGIN_ROOT, stdio: 'pipe' });
 }
 
 test.describe('connect reconnect (SFTP, sshd drop → recover)', () => {

@@ -155,6 +155,44 @@ describe('FramedDuplex', () => {
     expect(() => client.writeMessage(Buffer.from('x'))).toThrow(/closed/);
   });
 
+  it('close() still tells its listeners, so callers are not left waiting', async () => {
+    // `close` is the only way `RpcClient` learns the wire is gone: it is what
+    // rejects every in-flight call and fires its own `onClose` handlers.
+    //
+    // This used to be swallowed. `close()` set the `closed` flag before
+    // ending the stream, and the stream's own `end`/`close` then arrived to
+    // find that flag already set and bailed — so the event never reached
+    // anyone. A disconnect with a request in flight left that promise
+    // pending forever: no resolve, no reject, no timeout, nothing.
+    const pair = duplexPair();
+    const client = new FramedDuplex(pair.b);
+
+    const closed = new Promise<void>((resolve) => client.once('close', resolve));
+    client.close();
+
+    await expect(Promise.race([
+      closed.then(() => 'told'),
+      new Promise((r) => setTimeout(() => r('silent'), 500)),
+    ])).resolves.toBe('told');
+  });
+
+  it('says so once, however the wire goes down', async () => {
+    // Belt and braces on the fix: `close()` followed by the stream's own end
+    // must still be one event. A second would have `RpcClient` reject
+    // already-rejected calls and re-fire `onClose`, which upstream turns
+    // into a second reconnect loop.
+    const pair = duplexPair();
+    const client = new FramedDuplex(pair.b);
+
+    let count = 0;
+    client.on('close', () => { count++; });
+    client.close();
+    (pair.b as unknown as { end(): void }).end();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(count).toBe(1);
+  });
+
   it('emits close when stream ends mid-message (partial frame)', async () => {
     const pair = duplexPair();
     const server = new FramedDuplex(pair.a);

@@ -98,6 +98,18 @@ interface TestTarget {
   canShapeLink: boolean;
   /** The npm script that brings this environment up, for "run X first" errors. */
   startCommand: string;
+  /**
+   * How to drop and restore *just sshd*, for the reconnect spec.
+   *
+   * Not the same thing as tearing the environment down: in the tailnet
+   * environment that would take the control plane with it, and a headscale
+   * restart leaves every node without a netmap (see
+   * `docs/en/contributing/testing-strategy.md`). What the spec means by "an
+   * unexpected sshd drop" is the server going away while the path to it
+   * stays up, which is one container in either environment.
+   */
+  sshdStopCommand: string;
+  sshdStartCommand: string;
 }
 
 const TARGETS: Record<TestEnvName, TestTarget> = {
@@ -108,6 +120,10 @@ const TARGETS: Record<TestEnvName, TestTarget> = {
     connectTimeoutMs: 10_000,
     canShapeLink: true,
     startCommand: 'npm run sshd:start',
+    // Unchanged from what the reconnect spec has always run here, so its
+    // behaviour in this environment stays exactly what it was.
+    sshdStopCommand: 'npm run sshd:stop',
+    sshdStartCommand: 'npm run sshd:start',
   },
   tailnet: {
     // A MagicDNS name, not a `100.x` address: headscale allocates addresses
@@ -125,6 +141,13 @@ const TARGETS: Record<TestEnvName, TestTarget> = {
     // no NET_ADMIN to work with.
     canShapeLink: false,
     startCommand: 'npm run tailnet:start',
+    // Just this container. `tailnet:stop` would take headscale with it, and
+    // a node that loses its control connection over plain HTTP retries on
+    // 443 and never comes back — the tailnet would not survive the drop the
+    // spec is trying to simulate. Stopping sshd leaves the node, the mesh
+    // and the network namespace it listens in untouched.
+    sshdStopCommand: 'docker stop orst-tailnet-sshd',
+    sshdStartCommand: 'docker start orst-tailnet-sshd',
   },
 };
 
@@ -136,6 +159,8 @@ export const TEST_PROXY_COMMAND = target.proxyCommand;
 export const SSHD_CONTAINER = target.sshdContainer;
 export const CAN_SHAPE_LINK = target.canShapeLink;
 export const START_COMMAND = target.startCommand;
+export const SSHD_STOP_COMMAND = target.sshdStopCommand;
+export const SSHD_START_COMMAND = target.sshdStartCommand;
 
 /**
  * The connection fields of an `SshProfile` for the current environment.

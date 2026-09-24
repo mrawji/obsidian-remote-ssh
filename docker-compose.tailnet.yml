@@ -126,6 +126,53 @@ services:
     depends_on: [headscale]
     restart: "no"
 
+  # The E2E suite, inside the tailnet rather than looking at it from outside.
+  #
+  # The harness takes over the machine it runs on — `launchObsidian` kills any
+  # running Obsidian and `registerVault` rewrites the real
+  # `~/.config/obsidian/obsidian.json`. That is why it never ran anywhere but
+  # a CI runner, and why "reproduce it locally" was not an option. In here it
+  # can take over all it likes.
+  #
+  # Started on demand (`profiles`), so `tailnet:start` still brings up just
+  # the environment.
+  e2e-runner:
+    profiles: ["e2e"]
+    build:
+      context: ./docker/e2e-runner
+    image: obsidian-remote-ssh-e2e-runner:latest
+    container_name: orst-tailnet-e2e
+    networks: [tailnet]
+    # Reaches the vault the same way any tailnet outsider does, except the
+    # SOCKS5 port is the peer container's rather than a published one — the
+    # `ProxyCommand` reads this, so nothing in the suite needs to know.
+    environment:
+      ORSSH_TEST_ENV: tailnet
+      ORSSH_SOCKS5: ts-client:1055
+    volumes:
+      - .:/work
+      # Over the mount: a macOS `node_modules` is the wrong platform's, and
+      # Playwright's browsers are not interchangeable across them.
+      - e2e-node-modules:/work/plugin/node_modules
+      # The daemon is rebuilt on every run (a cached binary would mean
+      # testing code that is no longer in the tree); Go's cache is what
+      # keeps that cheap.
+      - e2e-go-cache:/root/.cache/go-build
+      # `connect-reconnect` simulates an unexpected drop by stopping the sshd
+      # container, which it cannot do without reaching the daemon that owns
+      # it. This is root-equivalent control of the host's Docker — the reason
+      # this service sits behind a profile instead of being part of the
+      # environment, and the reason nothing else in this file gets it.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Chromium's default 64 MB of /dev/shm is not enough for a real Obsidian
+    # window; it dies with no message that points anywhere near the cause.
+    shm_size: 2gb
+    # Obsidian spawns helpers and the suite kills them; without an init the
+    # container accumulates zombies across specs.
+    init: true
+    depends_on: [ts-client, sshd]
+    restart: "no"
+
 networks:
   tailnet:
 
@@ -133,3 +180,5 @@ volumes:
   tailnet-headscale:
   tailnet-vault-state:
   tailnet-client-state:
+  e2e-node-modules:
+  e2e-go-cache:

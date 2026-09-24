@@ -12,7 +12,21 @@ import { createProxyCommandTunnel } from './ProxyCommandTunnel';
 import { logger } from '../util/logger';
 import { asError, errorMessage } from '../util/errorMessage';
 
-export type CloseListener = (info: { unexpected: boolean }) => void;
+export type CloseListener = (info: {
+  unexpected: boolean;
+  /**
+   * What ssh2 said went wrong, when it said anything.
+   *
+   * ssh2 reports a keepalive timeout, an ECONNRESET or a mid-session
+   * protocol failure by emitting `error` and then `close`. The reason used
+   * to stop there: the only `error` handler existed to reject the connect
+   * promise, and rejecting a promise that has already settled is a silent
+   * no-op. So every post-handshake failure collapsed into one contentless
+   * line — "connection closed" — in the log kept specifically for triaging
+   * support reports.
+   */
+  reason?: Error;
+}) => void;
 
 /**
  * Async callback invoked when the SSH server asks for a
@@ -215,9 +229,16 @@ export class SftpClient {
         resolve();
       });
 
+      // Kept because `reject` below stops mattering the moment the connect
+      // promise settles, and ssh2 keeps using this event for the rest of the
+      // session — keepalive timeouts, ECONNRESET, protocol errors. Whatever
+      // it last said is the only account of why the session ended.
+      let lastError: Error | null = null;
+
       client.on('error', err => {
+        lastError = err instanceof Error ? err : new Error(String(err));
         window.clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
+        reject(lastError);
       });
 
       client.on('close', () => {
@@ -226,10 +247,15 @@ export class SftpClient {
         this.sftp = null;
         this.remoteHome = null;
         if (wasAlive) {
-          logger.warn(`SftpClient: connection closed (${profile.host})`);
+          const reason: Error | undefined = lastError ?? undefined;
+          logger.warn(
+            `SftpClient: connection closed (${profile.host})` +
+            (reason ? `: ${errorMessage(reason)}` : ''),
+          );
           const unexpected = !this.intentionalDisconnect;
           for (const cb of [...this.closeListeners]) {
-            try { cb({ unexpected }); } catch (e) { logger.warn(`onClose listener threw: ${errorMessage(e)}`); }
+            try { cb({ unexpected, reason }); }
+            catch (e) { logger.warn(`onClose listener threw: ${errorMessage(e)}`); }
           }
         }
       });

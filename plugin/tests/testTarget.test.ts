@@ -59,6 +59,22 @@ describe('test-env/target', () => {
     expect(tailnet.SSHD_CONTAINER).not.toBe(local.SSHD_CONTAINER);
   });
 
+  it('drops sshd without taking the tailnet down with it', async () => {
+    // The reconnect spec wants the server to go away while the path to it
+    // stays up. Reaching for `tailnet:stop` would take headscale too, and a
+    // node that loses its control connection over plain HTTP never comes
+    // back — the environment would not survive the drop it is simulating.
+    const t = await loadTarget('tailnet');
+    expect(t.SSHD_STOP_COMMAND).toContain(t.SSHD_CONTAINER);
+    expect(t.SSHD_STOP_COMMAND).not.toContain('tailnet:stop');
+    expect(t.SSHD_START_COMMAND).toContain(t.SSHD_CONTAINER);
+
+    // And the local environment keeps exactly what it always ran.
+    const local = await loadTarget('local');
+    expect(local.SSHD_STOP_COMMAND).toBe('npm run sshd:stop');
+    expect(local.SSHD_START_COMMAND).toBe('npm run sshd:start');
+  });
+
   it('refuses an unknown environment instead of quietly falling back', async () => {
     // Falling back to `local` here would be the worst outcome: a typo in a
     // CI job would run the suite against the wrong environment and pass.
