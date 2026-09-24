@@ -732,6 +732,30 @@ describe('SftpDataAdapter (read-side)', () => {
       await expect(read).resolves.toBe('FROM REMOTE');
     });
 
+    it('a read parked for a reconnect gives up when the adapter is disposed, without touching the wire', async () => {
+      // `restore()` retires the adapter while a read may be parked. Waking it
+      // by clearing `reconnecting` would ALSO tell the read path the session
+      // is healthy, and it would then stat/read a transport the teardown is
+      // abandoning — the reconnect-failed path never closes it. So disposal
+      // is its own flag: wake at once, and still refuse to touch the wire.
+      const fake = makeFakeClient({
+        files: { '/v/note.md': { data: Buffer.from('REMOTE'), mtime: 1 } },
+      });
+      const wait = new ReconnectWait({ timeoutMs: 10_000 });
+      const adapter = new SftpDataAdapter(
+        fake.client, '/v', readCache, dirCache, 'v',
+        null, null, null, null, null, null, undefined, wait,
+      );
+      adapter.setReconnecting(true);
+
+      const read = adapter.read('note.md');
+      setTimeout(() => adapter.dispose(), 10);
+
+      await expect(read).rejects.toThrow(/connection was closed/i);
+      expect(fake.client.stat, 'the discarded transport must not be touched').not.toHaveBeenCalled();
+      expect(fake.client.readBinary).not.toHaveBeenCalled();
+    });
+
     it('throws on every write-side method while reconnecting', async () => {
       const fake = makeFakeClient({});
       const wait = new ReconnectWait({ timeoutMs: 20 });
