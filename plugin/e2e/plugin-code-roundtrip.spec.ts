@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import {
   launchObsidian,
-  driveConnectFlow,
+  connectAndWaitForShadowVault,
   findShadowVaultPath,
   waitForShadowVaultLoaded,
   type ObsidianHandle,
@@ -149,7 +149,7 @@ let obsidian: ObsidianHandle;
 let scaffold: ScaffoldResult;
 let remote: RemoteVerifier;
 /**
- * Captured ONCE. `findShadowVaultPath` picks the most recently registered vault
+ * Captured ONCE. The shadow-vault lookup picks the most recently registered vault
  * out of the user-global `obsidian.json`, so re-resolving it after a later
  * connect could drift onto a different vault — every relaunch in this file
  * reuses this exact path.
@@ -238,8 +238,7 @@ test.beforeAll(async () => {
   // Building blocks rather than `connectAndOpenShadow`, to KEEP the shadow vault
   // path: every relaunch below reuses it, and the on-disk assertions read
   // straight out of it.
-  await driveConnectFlow(obsidian.page);
-  shadowVaultPath = await findShadowVaultPath(scaffold.vaultPath, 15_000);
+  shadowVaultPath = await connectAndWaitForShadowVault(obsidian.page, scaffold.vaultPath);
   await obsidian.cleanup();
   obsidian = await launchObsidian(shadowVaultPath);
 
