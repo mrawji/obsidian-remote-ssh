@@ -330,6 +330,45 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     expect(onRpcClose).toHaveBeenCalledTimes(1);
   });
 
+  it('starts a heartbeat, and stops it when we disconnect', async () => {
+    // The wire closing is the loud case. The quiet one — a daemon that is
+    // still there as far as TCP is concerned but has stopped answering —
+    // only surfaces if something is asking. And a heartbeat still running
+    // after a disconnect would probe a wire nobody owns any more.
+    vi.useFakeTimers();
+    try {
+      const onRpcClose = vi.fn();
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockResolvedValue({ ok: true });
+      const rpc = {
+        ...handle.rpc,
+        call,
+        msSinceLastMessage: () => 10 * 60_000, // long quiet
+        pendingCount: () => 0,                 // and idle
+      };
+      const conn = { ...handle, rpc };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose,
+      });
+      await mgr.startRpcSession(profile, 'work');
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(call, 'nothing would ever ask otherwise').toHaveBeenCalledWith('server.info', {});
+
+      const before = call.mock.calls.length;
+      await mgr.disconnectTransport();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(call.mock.calls.length, 'a disconnected wire must not be probed').toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stays quiet when WE are the ones hanging up', async () => {
     // Otherwise a manual Disconnect, and every pass of the reconnect loop,
     // would each kick off a reconnect of their own.
