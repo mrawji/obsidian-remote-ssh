@@ -59,6 +59,8 @@ export async function startFakeAgent(opts: {
   identities: FakeIdentity[];
   /** What to answer a signature request with; omit to refuse. */
   signature?: Buffer;
+  /** Stall this long before answering a signature — a human touching a key. */
+  signDelayMs?: number;
 }): Promise<FakeAgent> {
   const socketPath = agentSocketPath();
   if (process.platform !== 'win32' && fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
@@ -98,7 +100,9 @@ export async function startFakeAgent(opts: {
         const reply = opts.signature
           ? Buffer.concat([Buffer.from([SSH_AGENT_SIGN_RESPONSE]), sshStr(opts.signature)])
           : Buffer.from([SSH_AGENT_FAILURE]);
-        conn.end(Buffer.concat([u32(reply.length), reply]));
+        const framed = Buffer.concat([u32(reply.length), reply]);
+        if (opts.signDelayMs) setTimeout(() => conn.end(framed), opts.signDelayMs);
+        else conn.end(framed);
         return;
       }
       const failure = Buffer.from([SSH_AGENT_FAILURE]);

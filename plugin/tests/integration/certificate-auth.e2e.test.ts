@@ -54,6 +54,9 @@ let agentPid = '';
 /** A second agent holding only the ordinary key the server already trusts. */
 let plainAgentSocket = '';
 let plainAgentPid = '';
+/** A third agent holding only an RSA key and its RSA certificate. */
+let rsaAgentSocket = '';
+let rsaAgentPid = '';
 let configured = false;
 
 /** Block the setup thread without a timer; vitest owns the event loop here. */
@@ -83,11 +86,29 @@ beforeAll(() => {
     path.join(dir, 'id.pub'),
   ]);
 
+  // The same, with RSA. Ed25519 hides a whole class of bug here: its key
+  // type and its signature type are the same string, so a client that
+  // conflates the two still works. RSA separates them — the certificate is
+  // `ssh-rsa-cert-v01@openssh.com` while the signature must be `ssh-rsa`,
+  // `rsa-sha2-256` or `rsa-sha2-512`, and OpenSSH checks that the pair agrees.
+  run('ssh-keygen', ['-q', '-t', 'rsa', '-b', '2048', '-f', path.join(dir, 'ca-rsa'), '-N', '', '-C', 'cert-test-ca-rsa']);
+  run('ssh-keygen', ['-q', '-t', 'rsa', '-b', '2048', '-f', path.join(dir, 'id-rsa'), '-N', '', '-C', 'cert-test-user-rsa']);
+  run('ssh-keygen', [
+    '-q', '-s', path.join(dir, 'ca-rsa'), '-I', 'cert-test-rsa', '-n', TEST_USER, '-V', '+1h',
+    path.join(dir, 'id-rsa.pub'),
+  ]);
+
   // Teach the container to trust the CA. Mark it dirty BEFORE touching it:
   // `sshd -t` runs after the file is already written, so a failure there
   // still leaves state that afterAll has to remove.
   configured = true;
-  run('docker', ['cp', path.join(dir, 'ca.pub'), `${CONTAINER}:${CA_REMOTE}`]);
+  // Both CAs go in one file — TrustedUserCAKeys takes a list.
+  fs.writeFileSync(
+    path.join(dir, 'cas.pub'),
+    fs.readFileSync(path.join(dir, 'ca.pub'), 'utf8') +
+    fs.readFileSync(path.join(dir, 'ca-rsa.pub'), 'utf8'),
+  );
+  run('docker', ['cp', path.join(dir, 'cas.pub'), `${CONTAINER}:${CA_REMOTE}`]);
   run('docker', ['exec', CONTAINER, 'sh', '-c',
     `printf 'TrustedUserCAKeys ${CA_REMOTE}\\n' > ${CONF_REMOTE} && sshd -t`]);
   run('docker', ['restart', CONTAINER]);
@@ -98,6 +119,13 @@ beforeAll(() => {
   agentSocket = /SSH_AUTH_SOCK=([^;]+);/.exec(started)?.[1] ?? '';
   agentPid = /SSH_AGENT_PID=([^;]+);/.exec(started)?.[1] ?? '';
   run('ssh-add', [path.join(dir, 'id')], { SSH_AUTH_SOCK: agentSocket });
+
+  // An agent holding ONLY the RSA key and its certificate — separate, so an
+  // Ed25519 success cannot stand in for an RSA one.
+  const rsa = run('ssh-agent', ['-s']);
+  rsaAgentSocket = /SSH_AUTH_SOCK=([^;]+);/.exec(rsa)?.[1] ?? '';
+  rsaAgentPid = /SSH_AGENT_PID=([^;]+);/.exec(rsa)?.[1] ?? '';
+  run('ssh-add', [path.join(dir, 'id-rsa')], { SSH_AUTH_SOCK: rsaAgentSocket });
 
   // A separate agent holding ONLY the repo's ordinary test key, which is in
   // the container's authorized_keys. Separate so neither test can pass on
@@ -111,7 +139,7 @@ beforeAll(() => {
 }, 180_000);
 
 afterAll(() => {
-  for (const pid of [agentPid, plainAgentPid]) {
+  for (const pid of [agentPid, plainAgentPid, rsaAgentPid]) {
     if (pid) { try { process.kill(Number(pid)); } catch { /* already gone */ } }
   }
   if (configured) {
@@ -165,6 +193,15 @@ describe.skipIf(!TOOLS_PRESENT)('integration: an OpenSSH certificate held by an 
     // which corrupted every plain-key signature. Nothing short of a real
     // handshake with a real agent notices.
     await expect(connect(true, plainAgentSocket)).resolves.toBe(TEST_USER);
+  }, 60_000);
+
+  it('authenticates with an RSA certificate too', async () => {
+    // The certificate is `ssh-rsa-cert-v01@openssh.com`; the signature has to
+    // be one of ssh-rsa / rsa-sha2-256 / rsa-sha2-512, and OpenSSH's
+    // `sshkey_check_sigtype()` rejects the login when the algorithm named on
+    // the wire does not match the one that actually signed. Ed25519 cannot
+    // catch that — there the two names are identical.
+    await expect(connect(true, rsaAgentSocket)).resolves.toBe(TEST_USER);
   }, 60_000);
 
   it('fails without it — the failure users report today', async () => {

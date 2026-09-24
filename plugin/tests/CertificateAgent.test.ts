@@ -4,6 +4,7 @@ import {
   CertificateAgent,
   canSpeakToAgent,
   baseKeyType,
+  certificateAlgorithm,
   isCertificateType,
   parsedKeySymbol,
   type AgentPublicKey,
@@ -89,6 +90,27 @@ describe('CertificateAgent identities', () => {
     });
     const keys = await identities(new CertificateAgent(agent.socketPath));
     expect(keys.map((k) => k.type)).toEqual(['ssh-ed25519', CERT]);
+  });
+
+  it('offers an RSA certificate under its SHA-2 name, not the agent\'s SHA-1 one', async () => {
+    // An agent lists the identity as `ssh-rsa-cert-v01@openssh.com`, but that
+    // name means SHA-1 and servers have refused SHA-1 since OpenSSH 8.8 — the
+    // probe is rejected with "signature algorithm ssh-rsa-cert-v01@openssh.com
+    // not in PubkeyAcceptedAlgorithms" before a signature is ever sent.
+    // Measured against a real sshd; Ed25519 cannot catch this.
+    agent = await startFakeAgent({
+      identities: [{ type: 'ssh-rsa-cert-v01@openssh.com', comment: 'work-cert' }],
+    });
+    const [key] = await identities(new CertificateAgent(agent.socketPath));
+    expect(key.type).toBe('rsa-sha2-512-cert-v01@openssh.com');
+  });
+
+  it('leaves every other certificate type named as the agent named it', () => {
+    expect(certificateAlgorithm(CERT)).toBe(CERT);
+    expect(certificateAlgorithm('ecdsa-sha2-nistp256-cert-v01@openssh.com'))
+      .toBe('ecdsa-sha2-nistp256-cert-v01@openssh.com');
+    expect(certificateAlgorithm('ssh-rsa-cert-v01@openssh.com'))
+      .toBe('rsa-sha2-512-cert-v01@openssh.com');
   });
 
   it('reports an agent it cannot reach rather than offering nothing', async () => {
@@ -186,6 +208,24 @@ describe('CertificateAgent signing', () => {
     await sign(a, key, Buffer.from('x'), {});
     expect(agent.signRequests[2].flags, 'no hash asked for means legacy ssh-rsa').toBe(0);
   });
+
+  it('waits for a signature that needs a human — a touch, a PIN, a biometric', async () => {
+    // Listing identities has a 2 s budget; signing must not inherit it. A
+    // YubiKey touch, Touch ID, 1Password or pinentry all take longer than that
+    // on a cold connect, and OpenSSH itself waits indefinitely. Capping it
+    // would break hardware-backed agents for people who never use a
+    // certificate — which is most users.
+    agent = await startFakeAgent({
+      identities: [{ type: CERT, comment: 'yubikey' }],
+      signature: signatureBlob('ssh-ed25519'),
+      signDelayMs: 2_600,
+    });
+    const a = new CertificateAgent(agent.socketPath);
+    const [key] = await identities(a);
+
+    const sig = await sign(a, key, Buffer.from('x'));
+    expect(sig.equals(signatureBlob('ssh-ed25519'))).toBe(true);
+  }, 20_000);
 
   it('surfaces a refusal instead of returning an empty signature', async () => {
     agent = await startFakeAgent({ identities: [{ type: CERT, comment: 'c' }] });  // refuses
