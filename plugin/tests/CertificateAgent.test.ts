@@ -308,6 +308,73 @@ describe('key type helpers', () => {
     expect(canSpeakToAgent('', 'linux')).toBe(false);
   });
 
+  it('falls through to another algorithm when ssh2 refuses the first', async () => {
+    // ssh2 decides ed25519 support AT RUNTIME — `eddsaSupported`
+    // (`ssh2/lib/protocol/constants.js`) signs and verifies a sample key when
+    // the module loads and can come out false. The first version of this
+    // looked the marker up by parsing an ed25519 key, so on such a machine it
+    // returned null and EVERY agent user lost authentication, certificates or
+    // not. CI reproduced exactly that. Refusing the FIRST sample here is what
+    // exercises the fallthrough; refusing a later one would pass trivially.
+    vi.resetModules();
+    const ssh2 = await import('ssh2');
+    const real = ssh2.utils.parseKey;
+    const spy = vi.spyOn(ssh2.utils, 'parseKey').mockImplementation(((d: unknown, p?: unknown) => {
+      const text = typeof d === 'string' ? d : '';
+      if (text.startsWith('ssh-rsa')) return new Error('Unsupported key format');
+      return (real as (a: unknown, b?: unknown) => unknown)(d, p);
+    }) as typeof ssh2.utils.parseKey);
+
+    const fresh = await import('../src/ssh/CertificateAgent');
+    expect(fresh.parsedKeySymbol()).toBeTypeOf('symbol');
+
+    spy.mockRestore();
+    vi.resetModules();
+  });
+
+  it('keeps going past a sample that throws, and past one with no marker', async () => {
+    // Three ways a sample can be useless, and only the last one used to be
+    // handled: ssh2 can throw, it can return an Error, or it can hand back
+    // something that simply does not carry the marker. All three must lead to
+    // the next sample rather than to a null.
+    vi.resetModules();
+    const ssh2 = await import('ssh2');
+    const real = ssh2.utils.parseKey;
+    const spy = vi.spyOn(ssh2.utils, 'parseKey').mockImplementation(((d: unknown, p?: unknown) => {
+      const text = typeof d === 'string' ? d : '';
+      if (text.startsWith('ssh-rsa')) throw new Error('boom');
+      if (text.startsWith('ecdsa-')) return {} as never;   // parsed, no marker
+      return (real as (a: unknown, b?: unknown) => unknown)(d, p);
+    }) as typeof ssh2.utils.parseKey);
+
+    const fresh = await import('../src/ssh/CertificateAgent');
+    expect(fresh.parsedKeySymbol(), 'the third sample still yields one').toBeTypeOf('symbol');
+
+    spy.mockRestore();
+    vi.resetModules();
+  });
+
+  it('says which algorithms were refused when none of them parse', async () => {
+    // The failure that hid: `parseKey` RETURNS an Error rather than throwing,
+    // and only the throw path used to be logged — so a CI run reported
+    // "internals changed" with no clue which algorithm ssh2 had refused.
+    vi.resetModules();
+    const ssh2 = await import('ssh2');
+    const spy = vi.spyOn(ssh2.utils, 'parseKey')
+      .mockImplementation((() => new Error('Unsupported key format')) as typeof ssh2.utils.parseKey);
+    const { logger: freshLogger } = await import('../src/util/logger');
+    const warn = vi.spyOn(freshLogger, 'warn');
+
+    const fresh = await import('../src/ssh/CertificateAgent');
+    expect(fresh.parsedKeySymbol()).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ssh-rsa: Unsupported key format/));
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ssh-ed25519:/));
+
+    warn.mockRestore();
+    spy.mockRestore();
+    vi.resetModules();
+  });
+
   it('finds the marker ssh2 stamps on a parsed key', () => {
     // If a future ssh2 stops using it, this fails here rather than at a
     // user's connect, and the agent falls back to stock behaviour.

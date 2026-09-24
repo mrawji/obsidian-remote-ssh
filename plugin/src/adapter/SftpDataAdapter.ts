@@ -496,10 +496,11 @@ export class SftpDataAdapter {
     const __t1 = perfTracer.begin('S.adp');
     try {
       if (this.reconnecting) {
-        // Read locally (cache-only via readBuffer's reconnecting branch),
-        // splice, then queue as a full write. Reading + writing as
-        // separate ops would explode the queue size when the editor
-        // appends in a tight loop.
+        // Read through readBuffer, which serves a cached hit at once and
+        // otherwise waits for the session (bounded — see ReconnectWait)
+        // before giving up. Then splice and queue as a full write: reading
+        // and writing as separate ops would explode the queue size when the
+        // editor appends in a tight loop.
         let existing = '';
         try { existing = await this.read(normalizedPath); }
         catch { /* file did not exist; start empty so append acts like create */ }

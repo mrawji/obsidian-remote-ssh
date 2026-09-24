@@ -19,12 +19,15 @@
  *
  * An earlier version also capped how many reads could be in flight, on the
  * theory that indexing a large vault burst hard enough to take the session
- * down. Measurement says otherwise
- * (`tests/integration/cache-overflow.test.ts`, 40 ms link, 720 reads):
+ * down. Measurement said otherwise. Both surviving figures are reproducible
+ * from `tests/integration/cache-overflow.test.ts` (40 ms link, 720 reads):
  *
  *     sequential           226.5 ms/read
  *     all at once            2.2 ms/read    <- no failures, session alive
- *     all at once, cap 8    28.1 ms/read
+ *
+ * The cap itself was measured at 28.1 ms/read before being removed; that
+ * scenario no longer exists in the test, so take the number as history
+ * rather than something you can re-run.
  *
  * Nothing failed in any of the three, so the cap protected against nothing
  * measurable — and it cost an order of magnitude if the read path ever does

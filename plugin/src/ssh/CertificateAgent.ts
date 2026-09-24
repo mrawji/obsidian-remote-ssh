@@ -63,23 +63,62 @@ export function canSpeakToAgent(
  * and every caller then falls back to stock behaviour.
  */
 let cachedSymbol: symbol | null | undefined;
+
+/**
+ * Public halves of three throwaway keys, one per algorithm family. Public
+ * keys are not secrets; these exist only to be parsed.
+ *
+ * Why three, and why not generate one: `parseKey` rejects any type ssh2
+ * considers unsupported, and ed25519 support is decided AT RUNTIME —
+ * `eddsaSupported` in `ssh2/lib/protocol/constants.js` actually signs and
+ * verifies a sample key on load and can come out false. An earlier version
+ * of this function generated an ed25519 key and parsed that, so on any
+ * machine where ed25519 was unavailable the symbol lookup failed and EVERY
+ * agent user lost authentication, certificates or not. CI reproduced it.
+ *
+ * `ssh-rsa` is the one type ssh2 supports unconditionally, so it is tried
+ * first; the others are there so a future ssh2 that drops RSA does not put
+ * us back in the same position.
+ */
+const SAMPLE_PUBLIC_KEYS = [
+  'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCyNryM6KQyTgwlaqrs36KJ32coN9RBtSIc4eAdigNygNtZSO6rasxhXhDswernr6nXVhc9lB+iJxzHWATGWXRdsmeuwgXvUF1+RrjbRwlxy0Lx2gjq1krI4eZQGRjK/Lr5KV3JKSZP+PCbOrr5nD7iBuMjOIZxQxY2DTSlKPwz0k6kdqESPt4P4ufvZn9CiBKFsxuGcR/wcyFZzRFN8UNusgI12AV+DvNFEJDmaD/7B6kyeHcoMJkYmkVkJpPkH0NVjv1RGDSwAUoTrIEKOycGHdNcxzHTYs/t5JNCBB8giXHCjo84O4oycE/54dQkxF2TY2p6bAiPj+jXgD+kpEdh sample',
+  'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNWKSjk7yTKjo7iOH2JvyOJRiqclHiP+GzTrLvGIK+V3tPD9KAAP0ODaUCeeY2e/kF/7swf6vOvAC2qDlVZ3ps8= sample',
+  'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKsi+DBwARVUK0nEuctcLLFawv/t0rnuO8cOvOiqxgSA sample',
+] as const;
+
 export function parsedKeySymbol(): symbol | null {
   if (cachedSymbol !== undefined) return cachedSymbol;
   cachedSymbol = null;
-  try {
-    const pair = utils.generateKeyPairSync('ed25519');
-    const parsed = utils.parseKey(pair.public);
-    if (!(parsed instanceof Error)) {
-      const fields = parsed as unknown as Record<symbol, unknown>;
-      cachedSymbol = Object.getOwnPropertySymbols(parsed)
-        .find((s) => typeof fields[s] === 'boolean') ?? null;
+  const refusals: string[] = [];
+
+  for (const sample of SAMPLE_PUBLIC_KEYS) {
+    let parsed: ReturnType<typeof utils.parseKey>;
+    try {
+      parsed = utils.parseKey(sample);
+    } catch (e) {
+      refusals.push(`${sample.split(' ')[0]}: threw ${errorMessage(e)}`);
+      continue;
     }
-  } catch (e) {
-    logger.warn(`CertificateAgent: cannot read ssh2's parsed-key marker: ${errorMessage(e)}`);
+    if (parsed instanceof Error) {
+      // Not an exception, so it used to disappear without a word — which is
+      // exactly how this failure hid the first time.
+      refusals.push(`${sample.split(' ')[0]}: ${parsed.message}`);
+      continue;
+    }
+    const fields = parsed as unknown as Record<symbol, unknown>;
+    const found = Object.getOwnPropertySymbols(parsed)
+      .find((sym) => typeof fields[sym] === 'boolean');
+    if (found) {
+      cachedSymbol = found;
+      return cachedSymbol;
+    }
+    refusals.push(`${sample.split(' ')[0]}: parsed, but carries no marker`);
   }
-  if (cachedSymbol === null) {
-    logger.warn('CertificateAgent: ssh2 internals changed; certificate identities stay unavailable');
-  }
+
+  logger.warn(
+    'CertificateAgent: ssh2 would not parse any sample key, so agent identities ' +
+    `stay unavailable — ${refusals.join('; ')}`,
+  );
   return cachedSymbol;
 }
 
