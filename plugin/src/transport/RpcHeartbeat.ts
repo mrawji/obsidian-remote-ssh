@@ -94,8 +94,10 @@ export class RpcHeartbeat {
     this.probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
     this.maxMisses = opts.maxMisses ?? DEFAULT_MAX_MISSES;
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
-    this.setTimer = opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
-    this.clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+    // `window.` deliberately: Obsidian tears down a popout window's timers
+    // with the window, and a bare `setTimeout` would outlive it.
+    this.setTimer = opts.setTimer ?? ((fn, ms) => window.setTimeout(fn, ms));
+    this.clearTimer = opts.clearTimer ?? ((h) => { window.clearTimeout(h as number); });
   }
 
   start(): void {
