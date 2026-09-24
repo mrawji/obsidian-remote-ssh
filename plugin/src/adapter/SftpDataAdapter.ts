@@ -27,7 +27,7 @@ import type { RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
 import type { ReadCache } from '../cache/ReadCache';
-import { ReadGate } from '../util/ReadGate';
+import { ReconnectWait } from '../util/ReconnectWait';
 import type { DirCache } from '../cache/DirCache';
 import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
@@ -145,11 +145,11 @@ export class SftpDataAdapter {
      */
     private transferTracker: TransferTracker | null = null,
     /**
-     * Bounds concurrent remote reads and parks them across a reconnect.
-     * Injectable so a test can shorten the reconnect wait; production uses
-     * the defaults (see ReadGate).
+     * Parks a read across a reconnect instead of failing it. Injectable so a
+     * test can shorten the wait; production uses the defaults (see
+     * ReconnectWait).
      */
-    private readGate: ReadGate = new ReadGate(),
+    private reconnectWait: ReconnectWait = new ReconnectWait(),
   ) {}
 
   /**
@@ -819,15 +819,14 @@ export class SftpDataAdapter {
       }
     }
 
-    // Everything past here talks to the remote, so it goes through the gate:
-    // at most a few reads in flight, and a read that lands mid-reconnect
-    // waits for the session instead of failing. Indexing a large vault used
-    // to burst hard enough to take the session down, and then lose thousands
-    // of notes to "reconnecting" errors (#513).
-    return this.readGate.run(
-      () => this.readBufferOverWire(remote, normalizedPath),
-      () => this.reconnecting,
-    );
+    // Everything past here talks to the remote. A read that lands while the
+    // session is reconnecting waits for it rather than failing: Obsidian's
+    // indexer never retries, so a "reconnecting" error is a note left with
+    // no metadata and nothing said about it — 9,756 of them in the 50,000
+    // note run (#513). The wait is bounded; if the session is still down
+    // afterwards, readBufferOverWire fails as it always did.
+    await this.reconnectWait.wait(() => this.reconnecting);
+    return this.readBufferOverWire(remote, normalizedPath);
   }
 
   private async readBufferOverWire(remote: string, normalizedPath: string): Promise<Buffer> {

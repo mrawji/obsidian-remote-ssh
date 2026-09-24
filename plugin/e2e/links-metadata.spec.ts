@@ -1,8 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import {
   launchObsidian,
-  driveConnectFlow,
-  findShadowVaultPath,
+  connectAndWaitForShadowVault,
   waitForShadowVaultLoaded,
   runCommandViaPalette,
   dismissBlockingModals,
@@ -198,8 +197,7 @@ test.beforeAll(async () => {
 
   // Building blocks rather than `connectAndOpenShadow`, so we keep hold of the
   // shadow vault PATH — `waitForShadowVaultLoaded` needs its log path.
-  await driveConnectFlow(obsidian.page);
-  shadowVaultPath = await findShadowVaultPath(scaffold.vaultPath, 15_000);
+  shadowVaultPath = await connectAndWaitForShadowVault(obsidian.page, scaffold.vaultPath);
   await obsidian.cleanup();
   obsidian = await launchObsidian(shadowVaultPath);
 

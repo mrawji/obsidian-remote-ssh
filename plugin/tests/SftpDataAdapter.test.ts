@@ -3,7 +3,7 @@ import { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
 import { ReadCache } from '../src/cache/ReadCache';
 import { DirCache } from '../src/cache/DirCache';
 import { PathMapper } from '../src/path/PathMapper';
-import { ReadGate } from '../src/util/ReadGate';
+import { ReconnectWait } from '../src/util/ReconnectWait';
 import { AncestorTracker } from '../src/conflict/AncestorTracker';
 import { ConflictResolver } from '../src/conflict/ConflictResolver';
 import { OfflineQueue } from '../src/offline/OfflineQueue';
@@ -703,14 +703,14 @@ describe('SftpDataAdapter (read-side)', () => {
 
     it('waits for the session, then throws on a cache miss that outlives it', async () => {
       // A read that lands mid-reconnect waits rather than failing: Obsidian's
-      // indexer is sequential, so a wait costs it time while an error costs
+      // indexer never retries, so a wait costs it time while an error costs
       // it the note. Indexing a 50k vault used to lose ~9,000 notes that way
       // (#513). A session that never comes back still fails.
       const fake = makeFakeClient({});
-      const gate = new ReadGate({ reconnectWaitMs: 20 });
+      const wait = new ReconnectWait({ timeoutMs: 20 });
       const adapter = new SftpDataAdapter(
         fake.client, '/v', readCache, dirCache, 'v',
-        null, null, null, null, null, null, undefined, gate,
+        null, null, null, null, null, null, undefined, wait,
       );
       adapter.setReconnecting(true);
       await expect(adapter.read('absent.md')).rejects.toThrow(/reconnecting/i);
@@ -720,10 +720,10 @@ describe('SftpDataAdapter (read-side)', () => {
       const fake = makeFakeClient({
         files: { '/v/note.md': { data: Buffer.from('FROM REMOTE'), mtime: 1 } },
       });
-      const gate = new ReadGate({ reconnectWaitMs: 5_000 });
+      const wait = new ReconnectWait({ timeoutMs: 5_000 });
       const adapter = new SftpDataAdapter(
         fake.client, '/v', readCache, dirCache, 'v',
-        null, null, null, null, null, null, undefined, gate,
+        null, null, null, null, null, null, undefined, wait,
       );
       adapter.setReconnecting(true);
       const read = adapter.read('note.md');
@@ -734,10 +734,10 @@ describe('SftpDataAdapter (read-side)', () => {
 
     it('throws on every write-side method while reconnecting', async () => {
       const fake = makeFakeClient({});
-      const gate = new ReadGate({ reconnectWaitMs: 20 });
+      const wait = new ReconnectWait({ timeoutMs: 20 });
       const adapter = new SftpDataAdapter(
         fake.client, '/v', readCache, dirCache, 'v',
-        null, null, null, null, null, null, undefined, gate,
+        null, null, null, null, null, null, undefined, wait,
       );
       adapter.setReconnecting(true);
       const ab = new ArrayBuffer(0);
