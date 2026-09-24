@@ -94,6 +94,10 @@ export function patchAuthPK(proto: Ssh2Protocol): void {
     }
 
     const blob = key.getPublicSSH();
+    // `certType` is already the wire name — `CertificateAgent` renames an RSA
+    // certificate to its SHA-2 form when it hands the identity to ssh2, so the
+    // probe and this signed request agree. See `certificateAlgorithm`.
+    const advertised = certType;
     const sessionID = proto._kex!.sessionID!;
     const request = Buffer.concat([
       Buffer.from([USERAUTH_REQUEST]),
@@ -101,7 +105,7 @@ export function patchAuthPK(proto: Ssh2Protocol): void {
       sshString('ssh-connection'),
       sshString('publickey'),
       Buffer.from([1]),        // "this request is signed"
-      sshString(certType),     // public key algorithm: the certificate type
+      sshString(advertised),   // public key algorithm name
       sshString(blob),
     ]);
 
@@ -110,8 +114,8 @@ export function patchAuthPK(proto: Ssh2Protocol): void {
       // string(signature) — and its algorithm is the base type, which is
       // exactly what the certificate requires and what ssh2 overwrites.
       proto._debug?.(
-        `Outbound: Sending USERAUTH_REQUEST (publickey, ${certType}, ` +
-        `signature ${baseKeyType(certType)})`,
+        `Outbound: Sending USERAUTH_REQUEST (publickey, ${advertised}, ` +
+        `signature ${baseKeyType(advertised)})`,
       );
       sendPacket(proto, Buffer.concat([request, sshString(signature)]));
     });

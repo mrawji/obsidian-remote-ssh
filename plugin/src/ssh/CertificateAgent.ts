@@ -2,6 +2,7 @@ import { BaseAgent, utils, type ParsedKey } from 'ssh2';
 import {
   agentRoundTrip,
   baseKeyType,
+  SIGN_TIMEOUT_MS,
   isCertificateType,
   isUsableIdentity,
   listAgentIdentityBlobs,
@@ -94,6 +95,32 @@ export interface AgentPublicKey {
 // Re-exported so callers that think in terms of the agent keep one import.
 export { baseKeyType, isCertificateType };
 
+/**
+ * The public key algorithm name to put on the wire for a certificate.
+ *
+ * For most types this is the certificate type itself, because the algorithm
+ * that signs and the algorithm that names the key are the same string. RSA is
+ * the exception: an agent lists the identity as
+ * `ssh-rsa-cert-v01@openssh.com`, but that name means SHA-1, and servers have
+ * been refusing SHA-1 signatures since OpenSSH 8.8. We ask the agent for
+ * SHA-512 (see `rsaFlags`), so the name on the wire has to say so too —
+ * OpenSSH's `sshkey_check_sigtype()` rejects the login when the two disagree,
+ * which is exactly what an RSA certificate did before this existed.
+ *
+ * `rsa-sha2-512-cert-v01@openssh.com` is a public key algorithm name only; the
+ * blob it accompanies is still the `ssh-rsa-cert-v01@openssh.com` certificate
+ * (RFC 8332 §3, OpenSSH PROTOCOL.certkeys).
+ */
+export function certificateAlgorithm(certType: string): string {
+  // Only certificates are renamed. A PLAIN `ssh-rsa` key keeps its name:
+  // ssh2 negotiates rsa-sha2-* for those itself (`getKeyAlgos`), and calling
+  // a plain key by a certificate's name would be a lie the server sees.
+  if (!isCertificateType(certType)) return certType;
+  return baseKeyType(certType) === 'ssh-rsa'
+    ? 'rsa-sha2-512-cert-v01@openssh.com'
+    : certType;
+}
+
 function makeAgentKey(
   type: string, comment: string, blob: Buffer, marker: symbol,
 ): AgentPublicKey {
@@ -138,7 +165,14 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
         (skipped.length ? `; skipped ${skipped.map((i) => i.type).join(', ')}` : ''),
       );
       cb(undefined, offered.map(
-        (i) => makeAgentKey(i.type, i.comment, i.blob, marker) as unknown as ParsedKey,
+        // Named for the wire, not for the agent's listing: ssh2 writes this
+        // `type` into BOTH the "would you accept this key" probe and the
+        // signed request, and for an RSA certificate those must say SHA-2 or
+        // the server refuses the probe outright ("signature algorithm
+        // ssh-rsa-cert-v01@openssh.com not in PubkeyAcceptedAlgorithms").
+        (i) => makeAgentKey(
+          certificateAlgorithm(i.type), i.comment, i.blob, marker,
+        ) as unknown as ParsedKey,
       ));
     }).catch((e) => cb(e instanceof Error ? e : new Error(String(e))));
   }
@@ -158,7 +192,11 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
       rsaFlags(key.type, hash),
     ]);
 
-    agentRoundTrip(this.socketPath, request, this.opts)
+    // Not `this.opts`: that budget is for listing identities. A signature can
+    // be blocked on a person touching a key — see SIGN_TIMEOUT_MS.
+    agentRoundTrip(this.socketPath, request, {
+      timeoutMs: this.opts.timeoutMs ?? SIGN_TIMEOUT_MS,
+    })
       .then((body) => callback(null, signatureFor(key.type, parseSignResponse(body))))
       .catch((e) => callback(e instanceof Error ? e : new Error(String(e))));
   }
@@ -173,10 +211,18 @@ export class CertificateAgent extends BaseAgent<ParsedKey> {
  */
 function rsaFlags(type: string, hash: string | undefined): Buffer {
   const flags = Buffer.alloc(4);
-  if (baseKeyType(type) !== 'ssh-rsa') return flags;
-  if (hash === 'sha256') flags.writeUInt32BE(SSH_AGENT_RSA_SHA2_256, 0);
-  else if (hash === 'sha512') flags.writeUInt32BE(SSH_AGENT_RSA_SHA2_512, 0);
-  else if (isCertificateType(type)) flags.writeUInt32BE(SSH_AGENT_RSA_SHA2_512, 0);
+  const base = baseKeyType(type);
+  // `rsa-sha2-512` is what an RSA certificate is called once renamed for the
+  // wire (see `certificateAlgorithm`); `ssh-rsa` is a plain key or a
+  // certificate that has not been renamed.
+  if (base !== 'ssh-rsa' && base !== 'rsa-sha2-256' && base !== 'rsa-sha2-512') return flags;
+  if (hash === 'sha256' || base === 'rsa-sha2-256') {
+    flags.writeUInt32BE(SSH_AGENT_RSA_SHA2_256, 0);
+  } else if (hash === 'sha512' || base === 'rsa-sha2-512') {
+    flags.writeUInt32BE(SSH_AGENT_RSA_SHA2_512, 0);
+  } else if (isCertificateType(type)) {
+    flags.writeUInt32BE(SSH_AGENT_RSA_SHA2_512, 0);
+  }
   return flags;
 }
 

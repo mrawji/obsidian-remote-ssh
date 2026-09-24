@@ -87,7 +87,25 @@ export function sshString(value: Buffer | string): Buffer {
   return Buffer.concat([len, buf]);
 }
 
+/**
+ * Listing identities is a local, non-interactive round trip: an agent that
+ * cannot answer in two seconds is wedged, and saying so beats hanging.
+ */
 const DEFAULT_TIMEOUT_MS = 2_000;
+
+/**
+ * Signing is a different animal: it may be waiting for a HUMAN. A YubiKey
+ * wants a touch, the macOS agent wants Touch ID, 1Password and Secretive want
+ * biometrics, gpg-agent wants a PIN typed into pinentry. OpenSSH's own client
+ * waits indefinitely for all of these, and so does ssh2's agent client — it
+ * has no timeout at all. A short cap here would break every hardware-backed
+ * setup this project's own cookbook recommends, for people who have never
+ * touched a certificate.
+ *
+ * So: long enough that a person can find their key and touch it, short enough
+ * that a wedged agent does not hang Obsidian forever.
+ */
+export const SIGN_TIMEOUT_MS = 120_000;
 /**
  * Largest reply we will buffer. A real agent's identity list is a few KB;
  * anything claiming more is a process on the socket path trying to make us
