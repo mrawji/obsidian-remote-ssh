@@ -36,6 +36,8 @@ export class RpcClient {
   private readonly notificationHandlers = new Map<string, Array<(params: unknown) => void>>();
   private readonly closeHandlers: Array<(err?: Error) => void> = [];
   private closed = false;
+  /** When the daemon last said anything at all. See `msSinceLastMessage`. */
+  private lastMessageAt = Date.now();
 
   constructor(private readonly framed: FramedDuplex) {
     framed.on('message', (body: Buffer) => this.handleMessage(body));
@@ -109,7 +111,33 @@ export class RpcClient {
 
   // ─── internals ───────────────────────────────────────────────────────────
 
+  /**
+   * How many calls are waiting for a reply.
+   *
+   * The daemon serves one request at a time per connection
+   * (`server/internal/server/server.go`, a plain read-dispatch-write loop),
+   * so anything sent while a call is outstanding queues behind it. A
+   * liveness probe therefore has to know whether the line is actually free
+   * before reading silence as trouble.
+   */
+  pendingCount(): number {
+    return this.pending.size;
+  }
+
+  /**
+   * Milliseconds since the daemon last sent anything.
+   *
+   * This is the honest liveness signal for a large *read*: the response
+   * arrives as a stream of frames, so a working transfer keeps this small.
+   * It says nothing during a large *write*, where the daemon is busy and
+   * quiet by design — which is why `pendingCount()` exists alongside it.
+   */
+  msSinceLastMessage(): number {
+    return Date.now() - this.lastMessageAt;
+  }
+
   private handleMessage(body: Buffer): void {
+    this.lastMessageAt = Date.now();
     let msg: unknown;
     try {
       msg = JSON.parse(body.toString('utf8'));

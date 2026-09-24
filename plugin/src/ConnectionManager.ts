@@ -8,6 +8,7 @@ import type { ReconnectState } from './transport/ReconnectManager';
 import { DEFAULT_BACKOFF } from './transport/Backoff';
 import { ServerDeployer, resolveRemotePath } from './transport/ServerDeployer';
 import { tryReuseExistingDaemon } from './transport/DaemonProbe';
+import { RpcHeartbeat } from './transport/RpcHeartbeat';
 import { establishRpcConnection } from './transport/RpcConnection';
 import { normalizeRemotePath, sameRemotePath } from './util/pathUtils';
 import { logger } from './util/logger';
@@ -77,6 +78,9 @@ export class ConnectionManager {
    * reconnect pass would kick off a reconnect of its own.
    */
   private closingRpcIntentionally = false;
+
+  /** Watches for a daemon that stops answering without the wire dropping. */
+  private heartbeat: RpcHeartbeat | null = null;
   daemonDeployer: ServerDeployer | null = null;
   reconnectManager: ReconnectManager | null = null;
 
@@ -205,16 +209,44 @@ export class ConnectionManager {
    * a daemon that is already up, as silent as before.
    */
   private watchRpcWire(): void {
-    this.rpcConnection?.rpc.onClose((err) => {
+    const conn = this.rpcConnection;
+    if (!conn) return;
+
+    conn.rpc.onClose((err) => {
       if (this.closingRpcIntentionally) return;
       logger.warn(`RPC wire closed unexpectedly${err ? `: ${errorMessage(err)}` : ''}`);
+      this.stopHeartbeat();
       this.deps.onRpcClose();
     });
+
+    // A closed wire is the loud case. The quiet one is a daemon that is
+    // still there as far as TCP and SSH are concerned but has stopped
+    // answering — the machine that slept, the process the OOM killer took
+    // by surprise. Nothing below the RPC layer notices that, and a call
+    // made into it simply never returns.
+    this.stopHeartbeat();
+    this.heartbeat = new RpcHeartbeat({
+      probe: () => conn.rpc.call('server.info', {}),
+      msSinceLastMessage: () => conn.rpc.msSinceLastMessage(),
+      pendingCount: () => conn.rpc.pendingCount(),
+      onDead: (reason) => {
+        if (this.closingRpcIntentionally) return;
+        logger.warn(`RPC heartbeat: ${reason.message}`);
+        this.deps.onRpcClose();
+      },
+    });
+    this.heartbeat.start();
+  }
+
+  private stopHeartbeat(): void {
+    this.heartbeat?.stop();
+    this.heartbeat = null;
   }
 
   /** Close RPC tunnel, stop daemon, disconnect SSH. */
   async disconnectTransport(): Promise<void> {
     if (this.rpcConnection) {
+      this.stopHeartbeat();
       this.closingRpcIntentionally = true;
       try { this.rpcConnection.close(); }
       catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
@@ -280,6 +312,7 @@ export class ConnectionManager {
 
     const transport = profile.transport ?? 'sftp';
     if (this.rpcConnection) {
+      this.stopHeartbeat();
       this.closingRpcIntentionally = true;
       try { this.rpcConnection.close(); } catch { /* already dead */ }
       finally { this.closingRpcIntentionally = false; }
