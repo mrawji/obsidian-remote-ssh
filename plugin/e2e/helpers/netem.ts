@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { SSHD_CONTAINER as CONTAINER, TEST_ENV } from '../../test-env/target';
+import { SSHD_CONTAINER as CONTAINER, CAN_SHAPE_LINK, describeTarget } from '../../test-env/target';
 
 /**
  * Network shaping and byte counting for the test sshd container (#513 scale
@@ -49,14 +49,13 @@ export function applyNetProfile(p: NetProfile): void {
   // `del` fails when no qdisc is set; that's the state we want anyway.
   try { dockerExec(['tc', 'qdisc', 'del', 'dev', IFACE, 'root']); } catch { /* none set */ }
   if (p.delayMs === null && p.rateMbit === null) return;
-  if (TEST_ENV === 'tailnet') {
-    // The tailnet node runs without NET_ADMIN, so `tc` cannot shape here.
+  if (!CAN_SHAPE_LINK) {
     // Refusing beats continuing: a run that reported "wan" while measuring
     // an unshaped link would be worse than no measurement at all.
     throw new Error(
-      `Cannot apply the "${p.name}" net profile in the tailnet environment: ` +
-      'its sshd shares a network namespace with an unprivileged tailscale ' +
-      'node. Run link-shaping measurements with ORSSH_TEST_ENV=local.',
+      `Cannot apply the "${p.name}" net profile against ${describeTarget()}: ` +
+      'this environment\'s sshd has no NET_ADMIN, so `tc` cannot shape its ' +
+      'link. Run link-shaping measurements with ORSSH_TEST_ENV=local.',
     );
   }
   const args = ['tc', 'qdisc', 'add', 'dev', IFACE, 'root', 'netem'];

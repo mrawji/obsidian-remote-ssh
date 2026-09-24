@@ -1,5 +1,5 @@
 import {
-  TEST_ENV, TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, targetConnection,
+  TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, targetConnection,
 } from '../../../test-env/target';
 import { SftpClient } from '../../../src/ssh/SftpClient';
 import { AuthResolver } from '../../../src/ssh/AuthResolver';
@@ -40,10 +40,6 @@ export function buildTestProfile(label: string): SshProfile {
     authMethod:          'privateKey',
     privateKeyPath:      TEST_PRIVATE_KEY,
     remotePath:          TEST_VAULT,
-    // A tailnet connection sets up WireGuard and spawns a proxy process
-    // before the SSH handshake starts, which the old 10s budget did not
-    // allow for on a cold container.
-    connectTimeoutMs:    TEST_ENV === 'tailnet' ? 30_000 : 10_000,
     keepaliveIntervalMs: 0,
     keepaliveCountMax:   0,
   };

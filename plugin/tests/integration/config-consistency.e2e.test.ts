@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { ShadowVaultBootstrap } from '../../src/shadow/ShadowVaultBootstrap';
 import { ObsidianRegistry } from '../../src/shadow/ObsidianRegistry';
 import { setupClientPair, TEST_PRIVATE_KEY, type TestClient } from './helpers/makeAdapter';
+import { TEST_USER, targetConnection } from '../../test-env/target';
 import type { SshProfile } from '../../src/types';
 
 /**
@@ -71,7 +72,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     return {
       id: `cfg-${caseId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       name: `Config consistency (${caseId})`,
-      host: '127.0.0.1', port: 2222, username: 'tester',
+      ...targetConnection(), username: TEST_USER,
       authMethod: 'privateKey', privateKeyPath: TEST_PRIVATE_KEY,
       remotePath: remoteClient.vaultRoot,
       connectTimeoutMs: 10_000, keepaliveIntervalMs: 0, keepaliveCountMax: 0,

@@ -37,11 +37,27 @@ if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
 const [proxyHost, proxyPortArg] = (proxyArg ?? process.env.ORSSH_SOCKS5 ?? '127.0.0.1:1055').split(':');
 const proxyPort = Number(proxyPortArg);
 
-/** Fail loudly on stderr: ssh2 surfaces it, and a silent proxy is unreadable. */
+/**
+ * Fail loudly on stderr and with a non-zero status.
+ *
+ * `ProxyCommandTunnel` logs this process's stderr (`logger.warn`) and warns
+ * on a non-zero exit, so both halves matter: exiting 0 after a failed
+ * handshake is indistinguishable from a tunnel that closed normally, and
+ * nothing downstream would say a word.
+ */
 function die(msg) {
   console.error(`socks5-connect: ${msg}`);
   process.exit(1);
 }
+
+/**
+ * True once the tunnel is carrying traffic. Until then a closed socket is a
+ * failure, not an end-of-tunnel — see the `close` handler at the bottom.
+ */
+let piping = false;
+
+/** How far the handshake got, for the diagnostics in `read()`. */
+let bytesRead = 0;
 
 const sock = net.connect(proxyPort, proxyHost);
 sock.on('error', (e) => die(`cannot reach SOCKS5 proxy at ${proxyHost}:${proxyPort}: ${e.message}`));
@@ -60,11 +76,18 @@ function read(n) {
   return new Promise((resolve) => {
     const attempt = () => {
       const chunk = sock.read(n);
-      if (chunk) resolve(chunk);
+      // Once the stream has ended, `read(n)` stops returning null and hands
+      // back whatever short remainder is buffered. Accepting it would index
+      // past the end of the reply and report something invented — a
+      // truncated CONNECT reply used to surface as "unknown address type
+      // undefined" rather than "the proxy hung up".
+      if (chunk && chunk.length === n) resolve(chunk);
+      else if (chunk) die(`proxy sent ${chunk.length} of ${n} expected bytes, then closed`);
+      else if (sock.readableEnded) die(`proxy closed the connection after ${bytesRead} bytes, mid-handshake`);
       else sock.once('readable', attempt);
     };
     attempt();
-  });
+  }).then((chunk) => { bytesRead += chunk.length; return chunk; });
 }
 
 const SOCKS5_REPLY = {
@@ -107,10 +130,18 @@ sock.on('connect', async () => {
   else if (atyp === 0x03) { const len = await read(1); await read(len[0] + 2); }
   else die(`proxy replied with unknown address type ${atyp}`);
 
+  piping = true;
   process.stdin.pipe(sock);
   sock.pipe(process.stdout);
 });
 
-// When either side goes away the tunnel is over; exiting lets ssh2 see EOF.
-sock.on('close', () => process.exit(0));
+// Once the tunnel is carrying traffic, a close is the tunnel ending and
+// exiting 0 lets ssh2 see a clean EOF. Before that it is a failure: a peer
+// that accepts the connection and then hangs up sends no `error` event at
+// all, so without this the script exits 0 with an empty stdout and says
+// nothing — the exact silent-success this file's `die()` exists to avoid.
+sock.on('close', () => {
+  if (piping) process.exit(0);
+  die('proxy closed the connection before the SOCKS5 handshake completed');
+});
 process.stdin.on('end', () => sock.end());

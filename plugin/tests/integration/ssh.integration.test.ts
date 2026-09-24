@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import {
-  TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, TEST_ENV, targetConnection,
+  TEST_USER, TEST_VAULT, TEST_PRIVATE_KEY, targetConnection,
 } from '../../test-env/target';
 import { SftpClient } from '../../src/ssh/SftpClient';
 import { AuthResolver } from '../../src/ssh/AuthResolver';
@@ -48,7 +48,6 @@ function buildProfile(): SshProfile {
     authMethod:          'privateKey',
     privateKeyPath:      PRIVATE_KEY,
     remotePath:          REMOTE_VAULT,
-    connectTimeoutMs:    TEST_ENV === 'tailnet' ? 30_000 : 10_000,
     keepaliveIntervalMs: 0,
     keepaliveCountMax:   0,
   };

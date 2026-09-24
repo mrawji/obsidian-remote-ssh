@@ -6,9 +6,7 @@ import * as crypto from 'node:crypto';
  * Connection coordinates for the test sshd — the same source the integration
  * helpers use, so both suites aim at whichever environment is selected.
  */
-import {
-  TEST_HOST, TEST_PORT, TEST_USER, TEST_VAULT, TEST_PROXY_COMMAND,
-} from '../../test-env/target';
+import { TEST_USER, TEST_VAULT, targetConnection } from '../../test-env/target';
 
 const TEST_VAULT_REMOTE = TEST_VAULT;
 
@@ -152,18 +150,16 @@ export function scaffoldTestVault(opts: ScaffoldOptions = {}): ScaffoldResult {
       {
         id: profileId,
         name: 'E2E Test',
-        host: TEST_HOST,
-        port: TEST_PORT,
+        ...targetConnection(),
         username: TEST_USER,
         authMethod: 'privateKey',
         privateKeyPath,
         remotePath,
         transport,
-        // Present only in the tailnet environment, where the host is not
-        // reachable from this machine by any other route. Omitted entirely
-        // otherwise, so the local environment's profile is byte-identical
-        // to what it has always been.
-        ...(TEST_PROXY_COMMAND ? { proxyCommand: TEST_PROXY_COMMAND } : {}),
+        // After the spread, deliberately: E2E keeps its own, larger budget.
+        // A spec's connect races an Obsidian window booting on a CI runner,
+        // which is a different thing to wait for than the integration
+        // suite's bare `SftpClient.connect()`.
         connectTimeoutMs: 30_000,
         keepaliveIntervalMs: 10_000,
         keepaliveCountMax: 3,

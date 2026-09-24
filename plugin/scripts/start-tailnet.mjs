@@ -74,6 +74,11 @@ spawnSync('docker', ['exec', HEADSCALE, 'headscale', 'users', 'create', 'tester'
   { stdio: 'ignore' });
 
 for (const node of ['vault', 'client']) {
+  // `--user 1`: the tailnet has exactly one user, the `tester` created just
+  // above, and headscale numbers users from 1 in a database this script owns
+  // — `tailnet:stop` removes the volume, so there is never a second one to
+  // collide with. The key check below is what catches it if that ever stops
+  // being true, rather than a confusing tailscaled registration failure.
   const key = capture('docker', [
     'exec', HEADSCALE, 'headscale', 'preauthkeys', 'create',
     '--user', '1', '--reusable', '--expiration', '24h',
@@ -120,9 +125,15 @@ function sshBannerReachable() {
     // child's stdin is /dev/null, which reports EOF immediately; the proxy
     // then half-closes the socket and sshd drops the connection before it
     // has said anything ("Connection closed by 127.0.0.1 port …").
+    //
+    // stderr is captured rather than ignored: it carries the only statement
+    // of WHY the tailnet is not answering ("proxy refused CONNECT to
+    // vault.tailnet.test:22 — host unreachable"). Dropping it left a
+    // three-minute timeout whose report was four containers' logs and no
+    // mention of the thing the probe itself had just been told.
     const proxy = spawn(process.execPath, [
       path.join(here, 'socks5-connect.mjs'), VAULT_HOST, '22', `127.0.0.1:${SOCKS5_PORT}`,
-    ], { stdio: ['pipe', 'pipe', 'ignore'] });
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
     let seen = '';
     let settled = false;
@@ -138,10 +149,14 @@ function sshBannerReachable() {
       seen += chunk.toString('utf8');
       if (seen.includes('SSH-')) { clearTimeout(timer); finish(true); }
     });
-    proxy.on('error', () => { clearTimeout(timer); finish(false); });
+    proxy.stderr.on('data', (chunk) => { lastProxyError = chunk.toString('utf8').trim(); });
+    proxy.on('error', (e) => { lastProxyError = e.message; clearTimeout(timer); finish(false); });
     proxy.on('exit', () => { clearTimeout(timer); finish(seen.includes('SSH-')); });
   });
 }
+
+/** The last thing the proxy said, so a timeout can report a cause. */
+let lastProxyError = '';
 
 async function waitFor(what, timeoutMs, check) {
   const deadline = Date.now() + timeoutMs;
@@ -150,7 +165,10 @@ async function waitFor(what, timeoutMs, check) {
     await new Promise((r) => setTimeout(r, 2000));
   }
   dumpLogs();
-  fail(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${what}.`);
+  fail(
+    `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${what}.` +
+    (lastProxyError ? `\nLast proxy error: ${lastProxyError}` : ''),
+  );
 }
 
 function run(cmd, args) {

@@ -109,9 +109,12 @@ tailnet.
 
 The plugin still works. Point a profile at the host as usual and leave
 `Authentication` on `Private key`: Tailscale SSH accepts the connection
-without looking at the key, and serves SFTP. (Verified against
-`tailscale up --ssh` with a key the server had never seen — it
-authenticated and SFTP round-tripped.)
+without looking at the key, and serves SFTP.
+
+That was measured, not assumed — against `tailscale up --ssh` on Tailscale
+**1.102.4**, with a key the server had never seen: it authenticated and SFTP
+round-tripped. It is one observation on one version, and this path is not in
+CI, so treat it as "known to have worked" rather than a guarantee.
 
 Two caveats, both upstream and both worth knowing before you switch:
 

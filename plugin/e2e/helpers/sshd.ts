@@ -1,7 +1,9 @@
 import * as net from 'node:net';
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
-import { TEST_ENV, TEST_HOST, TEST_PORT, describeTarget } from '../../test-env/target';
+import {
+  TEST_HOST, TEST_PORT, TEST_PROXY_COMMAND, START_COMMAND, describeTarget,
+} from '../../test-env/target';
 
 /**
  * Test-sshd reachability gate, shared by the connect-lifecycle /
@@ -17,9 +19,6 @@ import { TEST_ENV, TEST_HOST, TEST_PORT, describeTarget } from '../../test-env/t
 
 export const SSHD_HOST = TEST_HOST;
 export const SSHD_PORT = TEST_PORT;
-
-/** The command that brings up whichever environment is selected. */
-const START_COMMAND = TEST_ENV === 'tailnet' ? 'npm run tailnet:start' : 'npm run sshd:start';
 
 /** One-shot TCP probe — resolves if the port accepts a connection. */
 function probeTcp(): Promise<void> {
@@ -76,7 +75,9 @@ function probeTailnet(): Promise<void> {
   });
 }
 
-const probeSshd = TEST_ENV === 'tailnet' ? probeTailnet : probeTcp;
+// A proxy in the profile is exactly what "not directly reachable from here"
+// means, so it is also what decides how to probe — no environment name needed.
+const probeSshd = TEST_PROXY_COMMAND ? probeTailnet : probeTcp;
 
 export async function assertSshdReachable(): Promise<void> {
   await probeSshd().catch((e) => {

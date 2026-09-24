@@ -7,7 +7,7 @@ import { Client } from 'ssh2';
 import { CertificateAgent } from '../../src/ssh/CertificateAgent';
 import { enableCertificateAuth } from '../../src/ssh/certificateAuth';
 import { TEST_HOST, TEST_PORT, TEST_USER, TEST_PRIVATE_KEY } from './helpers/makeAdapter';
-import { SSHD_CONTAINER, TEST_ENV } from '../../test-env/target';
+import { SSHD_CONTAINER, TEST_PROXY_COMMAND } from '../../test-env/target';
 
 /**
  * #536, end to end: an OpenSSH certificate held by an `ssh-agent`.
@@ -201,13 +201,13 @@ function connect(withCertificateSupport: boolean, socket = agentSocket): Promise
 }
 
 /**
- * Not run in the tailnet environment. This file drives a bare ssh2 `Client`
- * rather than `SftpClient`, so it has no `ProxyCommand` to get into the
- * tailnet — and what it tests is which bytes the certificate handshake puts
- * on the wire, which the route to the server cannot change. Running it twice
- * would cost time and prove nothing.
+ * Only where the server is directly reachable. This file drives a bare ssh2
+ * `Client` rather than `SftpClient`, so it cannot follow a `ProxyCommand` —
+ * and what it tests is which bytes the certificate handshake puts on the
+ * wire, which the route to the server cannot change. Running it a second
+ * time over a proxy would cost time and prove nothing.
  */
-const RUN_HERE = TOOLS_PRESENT && TEST_ENV !== 'tailnet';
+const RUN_HERE = TOOLS_PRESENT && !TEST_PROXY_COMMAND;
 
 describe.skipIf(!RUN_HERE)('integration: an OpenSSH certificate held by an agent (#536)', () => {
   it('authenticates, and the server agrees who we are', async () => {

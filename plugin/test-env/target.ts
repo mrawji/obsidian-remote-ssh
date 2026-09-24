@@ -3,10 +3,19 @@ import * as path from 'node:path';
 /**
  * Where the test suites point.
  *
- * The suites used to carry a copy of `127.0.0.1` / `2222` each — six of them,
- * across `tests/integration/` and `e2e/`. This module is the single place
- * that answers "which sshd am I talking to", so the same tests can be aimed
- * at a different environment without editing a test.
+ * `tests/integration/` and `e2e/` used to carry their own copies of
+ * `127.0.0.1` / `2222`. This module is the single place that answers "which
+ * sshd am I talking to", so the same tests can be aimed at a different
+ * environment without editing a test.
+ *
+ * Two of those copies (`config-consistency`, `restart-roundtrip`) were found
+ * during review, having survived the first pass — they sat in profiles that
+ * `ShadowVaultBootstrap` never dials, so pointing them at a port with
+ * nothing behind it changed nothing and nothing failed. A constant that is
+ * never used is not harmless: it reads as the address the test connects to,
+ * and it is the first thing someone will trust when this file stops
+ * matching reality. If you add a profile here, spread `targetConnection()`
+ * into it even when you believe nothing will dial it.
  *
  * ## The environments
  *
@@ -59,6 +68,15 @@ export const TEST_VAULT = `/home/${TEST_USER}/vault`;
 const TAILNET_PROXY_COMMAND =
   `node "${path.join(repoRoot, 'plugin', 'scripts', 'socks5-connect.mjs')}" %h %p`;
 
+/**
+ * What a caller actually needs to know about an environment.
+ *
+ * These are capabilities and budgets, not a name. Callers that ask
+ * "is this the tailnet?" instead of "can this link be shaped?" have to be
+ * found and updated by hand when a third environment appears; callers that
+ * read a field get the answer from here, and `Record<TestEnvName, …>` below
+ * makes the compiler insist the new environment fills every one in.
+ */
 interface TestTarget {
   host: string;
   port: number;
@@ -70,6 +88,16 @@ interface TestTarget {
    * to name it, and the two environments name it differently.
    */
   sshdContainer: string;
+  /**
+   * How long a connect may take. Not a preference: bringing up a proxy
+   * process and a WireGuard path before the SSH handshake starts does not
+   * fit in the budget a published local port needs.
+   */
+  connectTimeoutMs: number;
+  /** Whether `tc` can shape this link — i.e. whether its sshd has NET_ADMIN. */
+  canShapeLink: boolean;
+  /** The npm script that brings this environment up, for "run X first" errors. */
+  startCommand: string;
 }
 
 const TARGETS: Record<TestEnvName, TestTarget> = {
@@ -77,6 +105,9 @@ const TARGETS: Record<TestEnvName, TestTarget> = {
     host: '127.0.0.1',
     port: 2222,
     sshdContainer: 'obsidian-remote-ssh-test-sshd',
+    connectTimeoutMs: 10_000,
+    canShapeLink: true,
+    startCommand: 'npm run sshd:start',
   },
   tailnet: {
     // A MagicDNS name, not a `100.x` address: headscale allocates addresses
@@ -86,9 +117,14 @@ const TARGETS: Record<TestEnvName, TestTarget> = {
     host: 'vault.tailnet.test',
     port: 22,
     proxyCommand: TAILNET_PROXY_COMMAND,
-    // sshd shares the tailnet node's network namespace, so `tc` and
-    // `sshd_config` edits both land in the right place through this name.
+    // sshd shares the tailnet node's network namespace, so `sshd_config`
+    // edits land in the right place through this name.
     sshdContainer: 'orst-tailnet-sshd',
+    connectTimeoutMs: 30_000,
+    // That namespace belongs to an unprivileged tailscale node, so `tc` has
+    // no NET_ADMIN to work with.
+    canShapeLink: false,
+    startCommand: 'npm run tailnet:start',
   },
 };
 
@@ -98,16 +134,28 @@ export const TEST_HOST = target.host;
 export const TEST_PORT = target.port;
 export const TEST_PROXY_COMMAND = target.proxyCommand;
 export const SSHD_CONTAINER = target.sshdContainer;
+export const CAN_SHAPE_LINK = target.canShapeLink;
+export const START_COMMAND = target.startCommand;
 
 /**
  * The connection fields of an `SshProfile` for the current environment.
  * Spread into a profile so a caller never has to know whether this
- * environment needs a proxy.
+ * environment needs a proxy, or what it costs to reach.
+ *
+ * Build profiles with this rather than by hand: a profile assembled from the
+ * individual constants is a copy of this function that will not be updated
+ * when this one is.
  */
-export function targetConnection(): { host: string; port: number; proxyCommand?: string } {
+export function targetConnection(): {
+  host: string;
+  port: number;
+  proxyCommand?: string;
+  connectTimeoutMs: number;
+} {
   return {
     host: TEST_HOST,
     port: TEST_PORT,
+    connectTimeoutMs: target.connectTimeoutMs,
     ...(TEST_PROXY_COMMAND ? { proxyCommand: TEST_PROXY_COMMAND } : {}),
   };
 }
