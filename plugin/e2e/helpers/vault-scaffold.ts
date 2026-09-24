@@ -117,6 +117,22 @@ export function scaffoldTestVault(opts: ScaffoldOptions = {}): ScaffoldResult {
       'Generate the docker fixture keys (docker/keys/id_test) before running the suite.',
     );
   }
+  // The plugin itself. `main.js` is a build artefact and is gitignored, and
+  // the copy above skips whatever is not there — so a checkout that has not
+  // been built yields a vault with NO plugin, and every spec then reports the
+  // product as broken. CI builds it (`node esbuild.config.mjs production` in
+  // e2e.yml); a local run has to be told.
+  for (const required of ['main.js', 'manifest.json'] as const) {
+    if (!fs.existsSync(path.join(pluginDir, required))) {
+      throw new Error(
+        `fixture missing: ${required} was not installed into ${pluginDir} ` +
+        `(source: ${path.join(pluginRoot, required)}). The vault would open with ` +
+        'no plugin at all and every spec would blame the product — run ' +
+        '`npm run build` in plugin/ first.',
+      );
+    }
+  }
+
   if (transport === 'rpc') {
     const stagedBinDir = path.join(pluginDir, 'server-bin');
     const staged = fs.existsSync(stagedBinDir) ? fs.readdirSync(stagedBinDir) : [];
