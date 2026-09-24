@@ -288,6 +288,13 @@ export class AdapterManager {
       }
     }
     this.patcher = null;
+    // Wake anything parked in ReconnectWait before dropping the adapter.
+    // Those reads poll THIS object's `reconnecting` flag; once `_dataAdapter`
+    // is null nothing can ever clear it (main.ts resets it via
+    // `dataAdapter?.setReconnecting(false)`), so they would sit out the full
+    // 30 s budget instead of failing promptly as they did before the wait
+    // existed.
+    this._dataAdapter?.setReconnecting(false);
     this._dataAdapter = null;
     this.readCache = null;
     this.dirCache = null;

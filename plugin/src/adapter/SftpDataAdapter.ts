@@ -809,8 +809,8 @@ export class SftpDataAdapter {
   private async readBuffer(normalizedPath: string): Promise<Buffer> {
     const remote = this.toRemote(normalizedPath);
 
-    // Serve a cached hit without taking a slot: it costs no remote work, and
-    // making it queue behind other reads would only add latency.
+    // A cached hit needs no session at all, so serve it without waiting on
+    // the reconnect below.
     if (this.reconnecting) {
       const cachedNow = this.readCache.peek(remote);
       if (cachedNow) {
@@ -832,8 +832,8 @@ export class SftpDataAdapter {
   private async readBufferOverWire(remote: string, normalizedPath: string): Promise<Buffer> {
     const cached = this.readCache.peek(remote);
 
-    // Still reconnecting after the gate's wait: serve the cache if we can,
-    // and only then give up, same as before.
+    // Still reconnecting after the wait: serve the cache if we can, and only
+    // then give up, same as before.
     if (this.reconnecting) {
       if (cached) {
         this.readCache.get(remote); // bump LRU on hit
