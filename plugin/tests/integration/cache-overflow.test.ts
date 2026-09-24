@@ -198,3 +198,4 @@ describe('integration: reading more than the read cache holds (#513)', () => {
       await burst.disconnect();
     }
   }, 600_000);
+});
