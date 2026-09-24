@@ -23,6 +23,13 @@ const runDir   = path.join(repoRoot, 'docker', 'tailnet', 'run');
 
 const r = spawnSync('docker', [
   'compose', '-f', path.join(repoRoot, 'docker-compose.tailnet.yml'),
+  // `--profile e2e` so this reaches the runner's volumes too. Compose only
+  // acts on services in the selected profiles, and the E2E runner sits
+  // behind one — so `down -v` was quietly leaving its `node_modules` and Go
+  // caches behind (~300 MB) while reporting that everything was gone. A
+  // teardown that looks complete and is not is worse than one that admits
+  // what it skipped.
+  '--profile', 'e2e',
   'down', '-v', '--remove-orphans',
 ], { stdio: 'inherit', cwd: repoRoot });
 
