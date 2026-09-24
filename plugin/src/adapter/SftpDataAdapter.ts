@@ -27,6 +27,7 @@ import type { RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
 import type { ReadCache } from '../cache/ReadCache';
+import { ReconnectWait } from '../util/ReconnectWait';
 import type { DirCache } from '../cache/DirCache';
 import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
@@ -143,6 +144,12 @@ export class SftpDataAdapter {
      * (#127). When omitted (e.g. unit tests), no UI signaling occurs.
      */
     private transferTracker: TransferTracker | null = null,
+    /**
+     * Parks a read across a reconnect instead of failing it. Injectable so a
+     * test can shorten the wait; production uses the defaults (see
+     * ReconnectWait).
+     */
+    private reconnectWait: ReconnectWait = new ReconnectWait(),
   ) {}
 
   /**
@@ -801,11 +808,32 @@ export class SftpDataAdapter {
    */
   private async readBuffer(normalizedPath: string): Promise<Buffer> {
     const remote = this.toRemote(normalizedPath);
+
+    // Serve a cached hit without taking a slot: it costs no remote work, and
+    // making it queue behind other reads would only add latency.
+    if (this.reconnecting) {
+      const cachedNow = this.readCache.peek(remote);
+      if (cachedNow) {
+        this.readCache.get(remote); // bump LRU on hit
+        return cachedNow.data;
+      }
+    }
+
+    // Everything past here talks to the remote. A read that lands while the
+    // session is reconnecting waits for it rather than failing: Obsidian's
+    // indexer never retries, so a "reconnecting" error is a note left with
+    // no metadata and nothing said about it — 9,756 of them in the 50,000
+    // note run (#513). The wait is bounded; if the session is still down
+    // afterwards, readBufferOverWire fails as it always did.
+    await this.reconnectWait.wait(() => this.reconnecting);
+    return this.readBufferOverWire(remote, normalizedPath);
+  }
+
+  private async readBufferOverWire(remote: string, normalizedPath: string): Promise<Buffer> {
     const cached = this.readCache.peek(remote);
 
-    // While reconnecting we can't talk to the remote at all. Serve
-    // whatever is already in the cache so already-open editors keep
-    // working; throw on a miss rather than block forever.
+    // Still reconnecting after the gate's wait: serve the cache if we can,
+    // and only then give up, same as before.
     if (this.reconnecting) {
       if (cached) {
         this.readCache.get(remote); // bump LRU on hit
