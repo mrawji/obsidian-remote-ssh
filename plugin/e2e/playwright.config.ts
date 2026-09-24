@@ -31,14 +31,6 @@ export default defineConfig({
     ...(process.env.E2E_SCALE ? [] : ['**/scale.spec.ts']),
   ],
   timeout: 120_000,
-  // Playwright's DEFAULT actionTimeout is 0 — wait FOREVER. With Obsidian's
-  // virtualised File Explorer under Xvfb a node can be *attached but never
-  // actionable* (hover popovers swallow pointer events, rows paint lazily), so
-  // a bare `.click()` blocked until the whole test timed out: three minutes
-  // burned with NO message, which reads as "the product hung" when in fact the
-  // harness was waiting. Bound it — an unactionable element now fails with
-  // Playwright's own locator diagnostic, well inside the 120 s test budget.
-  actionTimeout: 30_000,
   retries: 1,
   // Obsidian is a single-instance app, so a machine can only ever drive ONE
   // window: `workers: 1` is not tunable. But that constraint is PER MACHINE —
@@ -111,6 +103,19 @@ export default defineConfig({
   use: {
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
+    // Playwright's DEFAULT actionTimeout is 0 — wait FOREVER. With Obsidian's
+    // virtualised File Explorer under Xvfb a node can be *attached but never
+    // actionable* (hover popovers swallow pointer events, rows paint lazily),
+    // so a bare `.click()` blocked until the whole test timed out: three
+    // minutes burned with NO message, which reads as "the product hung" when
+    // in fact the harness was waiting. Bound it — an unactionable element now
+    // fails with Playwright's own locator diagnostic, well inside the 120 s
+    // budget.
+    //
+    // This lived at the top level until #503's review: `actionTimeout` is a
+    // `use` option (Playwright's own `PlaywrightTestOptions`), so up there it
+    // was silently ignored and the bound above never applied to a single run.
+    actionTimeout: 30_000,
   },
   reporter: [
     ['list'],

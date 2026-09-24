@@ -1,8 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import {
   launchObsidian,
-  driveConnectFlow,
-  findShadowVaultPath,
+  connectAndWaitForShadowVault,
   waitForShadowVaultLoaded,
   type ObsidianHandle,
 } from './helpers/obsidian';
@@ -368,8 +367,7 @@ async function adapterListFiles(page: Page, dir: string): Promise<string[]> {
  */
 async function connectShadow(scaffold: ScaffoldResult): Promise<ObsidianHandle> {
   let handle = await launchObsidian(scaffold.vaultPath);
-  await driveConnectFlow(handle.page);
-  const shadowVaultPath = await findShadowVaultPath(scaffold.vaultPath, 15_000);
+  const shadowVaultPath = await connectAndWaitForShadowVault(handle.page, scaffold.vaultPath);
   await handle.cleanup();
   handle = await launchObsidian(shadowVaultPath);
   // launchObsidian only waits for the plugin to LOAD; the SSH connect + adapter

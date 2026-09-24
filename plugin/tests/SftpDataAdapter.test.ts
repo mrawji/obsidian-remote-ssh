@@ -3,6 +3,7 @@ import { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
 import { ReadCache } from '../src/cache/ReadCache';
 import { DirCache } from '../src/cache/DirCache';
 import { PathMapper } from '../src/path/PathMapper';
+import { ReconnectWait } from '../src/util/ReconnectWait';
 import { AncestorTracker } from '../src/conflict/AncestorTracker';
 import { ConflictResolver } from '../src/conflict/ConflictResolver';
 import { OfflineQueue } from '../src/offline/OfflineQueue';
@@ -700,16 +701,68 @@ describe('SftpDataAdapter (read-side)', () => {
       expect(fake.client.readBinary).not.toHaveBeenCalled();
     });
 
-    it('throws on a cache miss while reconnecting', async () => {
+    it('waits for the session, then throws on a cache miss that outlives it', async () => {
+      // A read that lands mid-reconnect waits rather than failing: Obsidian's
+      // indexer never retries, so a wait costs it time while an error costs
+      // it the note. Indexing a 50k vault used to lose ~9,000 notes that way
+      // (#513). A session that never comes back still fails.
       const fake = makeFakeClient({});
-      const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+      const wait = new ReconnectWait({ timeoutMs: 20 });
+      const adapter = new SftpDataAdapter(
+        fake.client, '/v', readCache, dirCache, 'v',
+        null, null, null, null, null, null, undefined, wait,
+      );
       adapter.setReconnecting(true);
       await expect(adapter.read('absent.md')).rejects.toThrow(/reconnecting/i);
     });
 
+    it('serves a read that arrives mid-reconnect once the session is back', async () => {
+      const fake = makeFakeClient({
+        files: { '/v/note.md': { data: Buffer.from('FROM REMOTE'), mtime: 1 } },
+      });
+      const wait = new ReconnectWait({ timeoutMs: 5_000 });
+      const adapter = new SftpDataAdapter(
+        fake.client, '/v', readCache, dirCache, 'v',
+        null, null, null, null, null, null, undefined, wait,
+      );
+      adapter.setReconnecting(true);
+      const read = adapter.read('note.md');
+      setTimeout(() => adapter.setReconnecting(false), 10);
+
+      await expect(read).resolves.toBe('FROM REMOTE');
+    });
+
+    it('a read parked for a reconnect gives up when the adapter is disposed, without touching the wire', async () => {
+      // `restore()` retires the adapter while a read may be parked. Waking it
+      // by clearing `reconnecting` would ALSO tell the read path the session
+      // is healthy, and it would then stat/read a transport the teardown is
+      // abandoning — the reconnect-failed path never closes it. So disposal
+      // is its own flag: wake at once, and still refuse to touch the wire.
+      const fake = makeFakeClient({
+        files: { '/v/note.md': { data: Buffer.from('REMOTE'), mtime: 1 } },
+      });
+      const wait = new ReconnectWait({ timeoutMs: 10_000 });
+      const adapter = new SftpDataAdapter(
+        fake.client, '/v', readCache, dirCache, 'v',
+        null, null, null, null, null, null, undefined, wait,
+      );
+      adapter.setReconnecting(true);
+
+      const read = adapter.read('note.md');
+      setTimeout(() => adapter.dispose(), 10);
+
+      await expect(read).rejects.toThrow(/connection was closed/i);
+      expect(fake.client.stat, 'the discarded transport must not be touched').not.toHaveBeenCalled();
+      expect(fake.client.readBinary).not.toHaveBeenCalled();
+    });
+
     it('throws on every write-side method while reconnecting', async () => {
       const fake = makeFakeClient({});
-      const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+      const wait = new ReconnectWait({ timeoutMs: 20 });
+      const adapter = new SftpDataAdapter(
+        fake.client, '/v', readCache, dirCache, 'v',
+        null, null, null, null, null, null, undefined, wait,
+      );
       adapter.setReconnecting(true);
       const ab = new ArrayBuffer(0);
       await expect(adapter.write('a', 'x')).rejects.toThrow(/reconnecting/i);

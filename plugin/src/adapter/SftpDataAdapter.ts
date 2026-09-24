@@ -27,6 +27,7 @@ import type { RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
 import type { ReadCache } from '../cache/ReadCache';
+import { ReconnectWait } from '../util/ReconnectWait';
 import type { DirCache } from '../cache/DirCache';
 import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
@@ -143,6 +144,12 @@ export class SftpDataAdapter {
      * (#127). When omitted (e.g. unit tests), no UI signaling occurs.
      */
     private transferTracker: TransferTracker | null = null,
+    /**
+     * Parks a read across a reconnect instead of failing it. Injectable so a
+     * test can shorten the wait; production uses the defaults (see
+     * ReconnectWait).
+     */
+    private reconnectWait: ReconnectWait = new ReconnectWait(),
   ) {}
 
   /**
@@ -185,8 +192,21 @@ export class SftpDataAdapter {
   private reconnecting = false;
 
   /**
+   * Set once this adapter has been torn down (`AdapterManager.restore()`).
+   *
+   * Kept SEPARATE from `reconnecting` on purpose. Clearing `reconnecting` to
+   * wake a parked read also tells `readBufferOverWire` the session is healthy,
+   * and it would then put a real `stat`/`readBinary` on a transport that is
+   * being abandoned — the reconnect-failed path calls `restore()` without
+   * closing it. "Stop waiting" and "the connection is fine" are two different
+   * facts and need two different flags.
+   */
+  private disposed = false;
+
+  /**
    * Toggle the "reconnecting" gate. While set:
-   *  - read / readBinary serve cached values only and throw on miss
+   *  - read / readBinary serve a cached value at once; on a miss they wait
+   *    for the session (bounded — see ReconnectWait) and only then throw
    *  - list / stat / exists throw immediately (no cache fallback)
    *  - any write-side method throws with a clear "reconnecting" notice
    *
@@ -197,6 +217,15 @@ export class SftpDataAdapter {
    */
   setReconnecting(on: boolean): void {
     this.reconnecting = on;
+  }
+
+  /**
+   * Retire this adapter: wake anything parked waiting for a reconnect, and
+   * make every later read fail immediately instead of reaching for a
+   * transport nobody owns any more.
+   */
+  dispose(): void {
+    this.disposed = true;
   }
 
   isReconnecting(): boolean {
@@ -467,10 +496,11 @@ export class SftpDataAdapter {
     const __t1 = perfTracer.begin('S.adp');
     try {
       if (this.reconnecting) {
-        // Read locally (cache-only via readBuffer's reconnecting branch),
-        // splice, then queue as a full write. Reading + writing as
-        // separate ops would explode the queue size when the editor
-        // appends in a tight loop.
+        // Read through readBuffer, which serves a cached hit at once and
+        // otherwise waits for the session (bounded — see ReconnectWait)
+        // before giving up. Then splice and queue as a full write: reading
+        // and writing as separate ops would explode the queue size when the
+        // editor appends in a tight loop.
         let existing = '';
         try { existing = await this.read(normalizedPath); }
         catch { /* file did not exist; start empty so append acts like create */ }
@@ -801,17 +831,39 @@ export class SftpDataAdapter {
    */
   private async readBuffer(normalizedPath: string): Promise<Buffer> {
     const remote = this.toRemote(normalizedPath);
+
+    // A cached hit needs no session at all, so serve it without waiting on
+    // the reconnect below.
+    if (this.reconnecting) {
+      const cachedNow = this.readCache.peek(remote);
+      if (cachedNow) {
+        this.readCache.get(remote); // bump LRU on hit
+        return cachedNow.data;
+      }
+    }
+
+    // Everything past here talks to the remote. A read that lands while the
+    // session is reconnecting waits for it rather than failing: Obsidian's
+    // indexer never retries, so a "reconnecting" error is a note left with
+    // no metadata and nothing said about it — 9,756 of them in the 50,000
+    // note run (#513). The wait is bounded; if the session is still down
+    // afterwards, readBufferOverWire fails as it always did.
+    await this.reconnectWait.wait(() => this.reconnecting && !this.disposed);
+    return this.readBufferOverWire(remote, normalizedPath);
+  }
+
+  private async readBufferOverWire(remote: string, normalizedPath: string): Promise<Buffer> {
     const cached = this.readCache.peek(remote);
 
-    // While reconnecting we can't talk to the remote at all. Serve
-    // whatever is already in the cache so already-open editors keep
-    // working; throw on a miss rather than block forever.
-    if (this.reconnecting) {
+    // Still reconnecting after the wait, or retired while we waited: serve
+    // the cache if we can, and only then give up. Reaching the wire past this
+    // point would mean talking to a transport that is gone.
+    if (this.reconnecting || this.disposed) {
       if (cached) {
         this.readCache.get(remote); // bump LRU on hit
         return cached.data;
       }
-      throw reconnectingError();
+      throw this.disposed ? disconnectedError() : reconnectingError();
     }
 
     if (cached) {
@@ -1087,5 +1139,9 @@ function parentDirRemote(p: string): string {
  */
 function reconnectingError(): Error {
   return new Error('Remote SSH: reconnecting — try again once the connection is restored');
+}
+
+function disconnectedError(): Error {
+  return new Error('Remote SSH: the connection was closed — reconnect to read this file');
 }
 

@@ -62,6 +62,8 @@ export interface TestClient {
   ssh: SftpClient;
   pathMapper: PathMapper;
   adapter: SftpDataAdapter;
+  /** Exposed so a test can read hit/eviction counters off the live stack. */
+  readCache: ReadCache;
   vaultRoot: string;
   disconnect(): Promise<void>;
 }
@@ -76,6 +78,12 @@ export async function makeTestClient(opts: {
   vaultRoot: string;
   /** Label folded into the SshProfile id; just for logging clarity. */
   label?: string;
+  /**
+   * Read-cache budget. Production uses 64 MiB; a test that wants the
+   * cache-overflow regime (more content touched than the cache holds)
+   * passes something small rather than seeding gigabytes.
+   */
+  readCacheBytes?: number;
 }): Promise<TestClient> {
   const auth = new AuthResolver(new SecretStore());
   const hostKeys = new HostKeyStore();
@@ -85,15 +93,22 @@ export async function makeTestClient(opts: {
   const fsClient = new SftpRemoteFsClient(ssh);
   const pathMapper = new PathMapper(opts.clientId);
 
+  const readCache = new ReadCache(
+    opts.readCacheBytes === undefined ? {} : { maxBytes: opts.readCacheBytes },
+  );
   const adapter = new SftpDataAdapter(
     fsClient,
     opts.vaultRoot,
-    new ReadCache(),
+    readCache,
     new DirCache(),
     'integration-vault',
     pathMapper,
     null,  // no ResourceBridge in integration tests
     null,  // no write-conflict prompt
+    null,  // no AncestorTracker
+    null,  // no OfflineQueue
+    '',    // no shadow vault
+    null,  // no TransferTracker
   );
 
   return {
@@ -101,6 +116,7 @@ export async function makeTestClient(opts: {
     ssh,
     pathMapper,
     adapter,
+    readCache,
     vaultRoot: opts.vaultRoot,
     async disconnect() {
       try { await ssh.disconnect(); } catch { /* best effort */ }

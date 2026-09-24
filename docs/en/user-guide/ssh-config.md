@@ -20,6 +20,19 @@ Picked per profile in **Settings** → **Profile** → **Authentication**:
 
 Passphrase-protected keys: if your agent has the unlocked key, agent auth works transparently. Otherwise the plugin prompts for the passphrase per connect.
 
+### Which agent identities the plugin can use
+
+`ssh-rsa`, `ssh-dss`, `ecdsa-sha2-nistp256/384/521`, `ssh-ed25519` — and, since 1.1.9, **OpenSSH certificates** over any of them (`ssh-ed25519-cert-v01@openssh.com` and friends). That is the credential you get wherever a CA issues short-lived logins: Teleport, HashiCorp Vault, step-ca, Google OS Login. Nothing to configure — put the certificate in your agent as you would for `ssh`:
+
+```bash
+ssh-add ~/.ssh/id_ed25519      # picks up id_ed25519-cert.pub beside it
+ssh-add -l                     # both the key and the certificate should be listed
+```
+
+On **Windows**, this applies to the OpenSSH agent (the `\\.\pipe\openssh-ssh-agent` named pipe). **Pageant and Cygwin agents keep going through the SSH library's own client**, which drops certificates — so a certificate held by Pageant still will not work. Use the OpenSSH agent if you need one.
+
+**FIDO security keys** (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) are still **skipped** — the plugin's SSH library cannot parse them. An agent holding only those fails with "SSH authentication failed" while `ssh` on the same machine succeeds; the plugin names the skipped identities in that notice and in its log so you can tell it apart from a wrong username or a server-side rejection. Tracking issue: [#536](https://github.com/sotashimozono/obsidian-remote-ssh/issues/536).
+
 ## What the plugin reads from `~/.ssh/`
 
 Currently:

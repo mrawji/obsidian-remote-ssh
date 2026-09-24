@@ -112,6 +112,26 @@ describe('AdapterManager.restore()', () => {
     expect(unsubscribeSpy).toHaveBeenCalledOnce();
   });
 
+  it('wakes reads parked on the adapter it is about to discard', () => {
+    // Those reads poll the adapter's own `reconnecting` flag (ReconnectWait).
+    // Once `_dataAdapter` is null nothing can clear it — main.ts resets it via
+    // `dataAdapter?.setReconnecting(false)` — so they would sit out the full
+    // 30 s budget instead of failing promptly, which is what they did before
+    // the wait existed. Reaching into the private field is deliberate: this is
+    // teardown ordering, and there is no public seam for it.
+    const { mgr } = makeManager();
+    const dispose = vi.fn();
+    const setReconnecting = vi.fn();
+    (mgr as unknown as { _dataAdapter: unknown })._dataAdapter = { dispose, setReconnecting };
+
+    mgr.restore();
+
+    expect(dispose).toHaveBeenCalledOnce();
+    // NOT setReconnecting(false): that would also tell the read path the
+    // session is healthy, and it would hit a transport being abandoned.
+    expect(setReconnecting).not.toHaveBeenCalled();
+  });
+
   it('leaves isPatched() false after restore()', () => {
     const { mgr } = makeManager();
     mgr.restore();

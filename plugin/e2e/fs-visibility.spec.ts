@@ -2,8 +2,7 @@ import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import {
   launchObsidian,
-  driveConnectFlow,
-  findShadowVaultPath,
+  connectAndWaitForShadowVault,
   waitForShadowVaultLoaded,
   type ObsidianHandle,
 } from './helpers/obsidian';
@@ -242,8 +241,7 @@ test.beforeAll(async () => {
   // Building blocks rather than `connectAndOpenShadow`, because the shadow
   // vault PATH is itself part of the subject matter here: it is the local root
   // that `adapter.basePath` hands out to plugins.
-  await driveConnectFlow(obsidian.page);
-  shadowVaultPath = await findShadowVaultPath(scaffold.vaultPath, 15_000);
+  shadowVaultPath = await connectAndWaitForShadowVault(obsidian.page, scaffold.vaultPath);
   await obsidian.cleanup();
   obsidian = await launchObsidian(shadowVaultPath);
 
