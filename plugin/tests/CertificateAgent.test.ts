@@ -332,6 +332,28 @@ describe('key type helpers', () => {
     vi.resetModules();
   });
 
+  it('keeps going past a sample that throws, and past one with no marker', async () => {
+    // Three ways a sample can be useless, and only the last one used to be
+    // handled: ssh2 can throw, it can return an Error, or it can hand back
+    // something that simply does not carry the marker. All three must lead to
+    // the next sample rather than to a null.
+    vi.resetModules();
+    const ssh2 = await import('ssh2');
+    const real = ssh2.utils.parseKey;
+    const spy = vi.spyOn(ssh2.utils, 'parseKey').mockImplementation(((d: unknown, p?: unknown) => {
+      const text = typeof d === 'string' ? d : '';
+      if (text.startsWith('ssh-rsa')) throw new Error('boom');
+      if (text.startsWith('ecdsa-')) return {} as never;   // parsed, no marker
+      return (real as (a: unknown, b?: unknown) => unknown)(d, p);
+    }) as typeof ssh2.utils.parseKey);
+
+    const fresh = await import('../src/ssh/CertificateAgent');
+    expect(fresh.parsedKeySymbol(), 'the third sample still yields one').toBeTypeOf('symbol');
+
+    spy.mockRestore();
+    vi.resetModules();
+  });
+
   it('says which algorithms were refused when none of them parse', async () => {
     // The failure that hid: `parseKey` RETURNS an Error rather than throwing,
     // and only the throw path used to be logged — so a CI run reported
