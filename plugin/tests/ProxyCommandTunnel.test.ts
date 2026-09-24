@@ -96,6 +96,26 @@ describe('a proxy that goes away', () => {
     expect(err, 'a failed proxy must surface as an error on the stream').toBeInstanceOf(Error);
     expect(String(err?.message)).toMatch(/proxy|exit/i);
   });
+
+  it('still closes when the proxy is killed by a signal, which reports no exit code', async () => {
+    // `close` carries `code === null` when the child died on a signal — the
+    // OOM killer, a `docker stop` that reaped it, a user's Ctrl-C. `null` is
+    // falsy, so it takes the clean-exit branch; the reason is lost but the
+    // stream must still reach `close`, because reconnecting without knowing
+    // why beats not reconnecting at all.
+    const { spawnFn, child } = fakeSpawn();
+    const duplex = createProxyCommandTunnel('proxy %h', { host: 'h', port: 22 }, { spawnFn });
+    duplex.resume();
+
+    const closed = new Promise<void>((resolve) => duplex.once('close', resolve));
+    child.stdout.end();
+    child.emit('close', null);
+
+    await expect(Promise.race([
+      closed.then(() => 'closed'),
+      new Promise((r) => setTimeout(() => r('still open'), 1000)),
+    ])).resolves.toBe('closed');
+  });
 });
 
 describe('expandProxyCommandTokens (#430)', () => {

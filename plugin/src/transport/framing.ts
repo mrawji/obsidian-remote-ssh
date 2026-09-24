@@ -53,11 +53,24 @@ export class FramedDuplex extends EventEmitter {
     return this.stream.write(Buffer.concat([header, body]));
   }
 
-  /** Shut the wire down. Subsequent writeMessage calls throw. */
+  /**
+   * Shut the wire down. Subsequent writeMessage calls throw.
+   *
+   * Emits `'close'`, exactly as an involuntary end does. It has to: `close`
+   * is how `RpcClient` learns the wire is gone, and the only thing that
+   * rejects its in-flight calls and fires its own `onClose` handlers.
+   *
+   * That used to be swallowed here. Setting `closed` before ending the
+   * stream meant the stream's own `end`/`close` arrived to find the flag
+   * already set and bail out of `onEnd`, so nothing was ever emitted — a
+   * disconnect with a request in flight left that promise pending forever,
+   * with no resolve, no reject and no timeout behind it.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     try { this.stream.end(); } catch { /* ignore */ }
+    this.emit('close');
   }
 
   // ─── parser ──────────────────────────────────────────────────────────────

@@ -177,6 +177,14 @@ export default class RemoteSshPlugin extends Plugin {
     this.conn = new ConnectionManager(client, {
       locateDaemonBinary: () => this.locateDaemonBinary(),
       ensureDaemonBinary: (c) => this.ensureDaemonBinary(c),
+      // The daemon dying is a lost connection too, even though SSH is fine.
+      // It goes to the same place an SSH drop does — `startReconnect` is
+      // idempotent, so when both die together (the usual case) the second
+      // call is a no-op rather than a second loop.
+      onRpcClose: () => {
+        new Notice('Remote SSH: remote daemon stopped — reconnecting…');
+        void this.startReconnect();
+      },
     });
     this.conn.activeRemoteBasePath = null;
 
