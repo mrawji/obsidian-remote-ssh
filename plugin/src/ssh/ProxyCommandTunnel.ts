@@ -80,8 +80,15 @@ export function createProxyCommandTunnel(
     if (!duplex.push(chunk)) child.stdout.pause();
   });
   child.stdout.on('end', () => duplex.push(null));
+
+  // Kept so a non-zero exit can say WHY. A proxy writes its one-line reason
+  // here before exiting — `socks5-connect.mjs` does — and without carrying
+  // it onto the stream, ssh2 reports only "connection lost" and the cause
+  // is nowhere.
+  let lastStderr = '';
   child.stderr.on('data', (chunk: Buffer) => {
-    logger.warn(`ProxyCommandTunnel[${target.host}] stderr: ${chunk.toString().trim()}`);
+    lastStderr = chunk.toString().trim();
+    logger.warn(`ProxyCommandTunnel[${target.host}] stderr: ${lastStderr}`);
   });
 
   // Spawn failure (ENOENT for a missing proxy binary, EACCES, …) surfaces
@@ -90,10 +97,33 @@ export function createProxyCommandTunnel(
     duplex.destroy(err);
   });
   child.on('close', (code: number | null) => {
+    // EOF first, so anything the proxy managed to deliver is still read.
     duplex.push(null);
+
     if (code && code !== 0) {
       logger.warn(`ProxyCommandTunnel[${target.host}] proxy exited with code ${code}`);
+      duplex.destroy(new Error(
+        `ProxyCommand exited with code ${code}` + (lastStderr ? `: ${lastStderr}` : ''),
+      ));
+      return;
     }
+
+    // A clean exit still means the connection is over, and the stream has
+    // to say so the way a socket does — by reaching `close`, not by
+    // stopping at `end`.
+    //
+    // ssh2 listens for both, but only `close` makes its `Client` emit
+    // `close`, and that is the one event `SftpClient` reconnects on. Ending
+    // here (rather than destroying) lets the writable side finish and the
+    // stream auto-destroy once the reader has drained, so `end` still
+    // arrives first and nothing in flight is dropped.
+    //
+    // Without this, stopping the server behind a ProxyCommand produced no
+    // reconnect and no log line at all: the session looked healthy and idle
+    // for as long as anyone waited. Found by running the E2E suite over the
+    // tailnet, where every byte goes through a proxy — but it was every
+    // ProxyCommand user, not just that environment.
+    duplex.end();
   });
 
   // When ssh2 (or the caller) closes the tunnel, reap the proxy process

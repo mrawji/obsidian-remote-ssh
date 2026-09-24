@@ -37,6 +37,67 @@ function fakeSpawn() {
   return { spawnFn, calls, child };
 }
 
+describe('a proxy that goes away', () => {
+  /**
+   * Found by running the E2E suite over the tailnet, where every byte
+   * leaves through a `ProxyCommand`: the server was stopped and the plugin
+   * said nothing at all for 90 seconds — no "connection closed", no
+   * reconnect loop. It believed the session was still up.
+   *
+   * ssh2 subscribes to both `end` and `close` on the socket it is given,
+   * but only the latter makes its `Client` emit `close` — and `close` is
+   * the single event `SftpClient` reconnects on. A real `net.Socket` emits
+   * both, because it destroys itself once the peer is gone. This Duplex is
+   * hand-made, so unless it does the same, a dead proxy is indistinguishable
+   * from a healthy idle one.
+   *
+   * Not tailnet-specific: it is every `ProxyCommand` user — cloudflared, a
+   * jump host, `tailscale nc` — silently losing reconnect.
+   */
+  it('closes the stream, not merely ends it, so ssh2 reports a disconnect', async () => {
+    const { spawnFn, child } = fakeSpawn();
+    const duplex = createProxyCommandTunnel('proxy %h', { host: 'h', port: 22 }, { spawnFn });
+
+    // ssh2 resumes the socket and reads from it; without a reader the
+    // readable side never drains and `end` would not fire either.
+    duplex.resume();
+
+    const closed = new Promise<void>((resolve) => duplex.once('close', resolve));
+    const ended = new Promise<void>((resolve) => duplex.once('end', resolve));
+
+    // The proxy exits — because the remote hung up, or it was killed.
+    child.stdout.end();
+    child.emit('close', 0);
+
+    await expect(Promise.race([
+      Promise.all([ended, closed]).then(() => 'closed'),
+      new Promise((r) => setTimeout(() => r('still open'), 1000)),
+    ])).resolves.toBe('closed');
+  });
+
+  it('reports a proxy that failed as an error, not as a clean end', async () => {
+    const { spawnFn, child } = fakeSpawn();
+    const duplex = createProxyCommandTunnel('proxy %h', { host: 'h', port: 22 }, { spawnFn });
+    duplex.resume();
+
+    const seen = new Promise<Error | null>((resolve) => {
+      duplex.once('error', (e: Error) => resolve(e));
+      duplex.once('close', () => resolve(null));
+    });
+
+    // A non-zero exit is the proxy telling us why it could not carry the
+    // connection — `socks5-connect.mjs` exits 1 and explains itself on
+    // stderr. Swallowing that leaves ssh2 with "connection lost" and the
+    // reason nowhere.
+    child.stdout.end();
+    child.emit('close', 1);
+
+    const err = await seen;
+    expect(err, 'a failed proxy must surface as an error on the stream').toBeInstanceOf(Error);
+    expect(String(err?.message)).toMatch(/proxy|exit/i);
+  });
+});
+
 describe('expandProxyCommandTokens (#430)', () => {
   it('substitutes %h (host) and %p (port)', () => {
     expect(
