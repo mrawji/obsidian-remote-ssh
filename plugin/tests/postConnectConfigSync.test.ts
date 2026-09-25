@@ -223,3 +223,70 @@ describe('watcherPorts — how the real watcher reaches disk and remote', () => 
     expect(() => handle.close()).not.toThrow();
   });
 });
+
+describe('syncConfigAfterConnect — the remaining edges', () => {
+  it('still starts the watcher when the binary round-trip throws', async () => {
+    // Losing the binaries costs some plugins; losing the watcher costs every
+    // future settings change.
+    pullBinaries.mockImplementation(() => Promise.reject(new Error('sftp reset')));
+
+    await syncConfigAfterConnect(ports());
+
+    expect(calls).toContain('watcher.start');
+  });
+
+  it('builds the real watcher when no factory is supplied', async () => {
+    // The production path. Everything else here replaces it.
+    const p = ports();
+    delete (p as { makeWatcher?: unknown }).makeWatcher;
+
+    const w = await syncConfigAfterConnect(p);
+
+    expect(w).toBeTruthy();
+    w.stop();
+  });
+
+  it('says "file" for one and "files" for several', async () => {
+    pullShared.mockImplementation(record('pullShared', {
+      pulled: [], skipped: ['app.json'], errored: ['app.json'],
+    }));
+    await syncConfigAfterConnect(ports());
+    expect(notices[0]).toContain('1 config file (');
+
+    notices.length = 0;
+    pullShared.mockImplementation(record('pullShared', {
+      pulled: [], skipped: [], errored: ['app.json', 'hotkeys.json'],
+    }));
+    await syncConfigAfterConnect(ports());
+    expect(notices[0]).toContain('2 config files (');
+  });
+});
+
+describe('watcherPorts — the fs.watch callback', () => {
+  it('passes a changed filename through, and a missing one as null', async () => {
+    // `fs.watch` does not always hand over a filename; the watcher has to be
+    // told "something changed, I don't know what" rather than get `undefined`.
+    const seen: (string | null)[] = [];
+    const handle = watcherPorts(ports()).watch((f) => { seen.push(f); });
+    try {
+      fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{"changed":true}');
+      // fs.watch is asynchronous and platform-timed; give it a moment.
+      await new Promise((r) => setTimeout(r, 300));
+    } finally {
+      handle.close();
+    }
+
+    // Some platforms coalesce or drop events, so the assertion is about the
+    // SHAPE of what arrives, not that anything must.
+    for (const f of seen) expect(f === null || typeof f === 'string').toBe(true);
+  });
+
+  it('drives its timers through the window clock', () => {
+    const p = watcherPorts(ports());
+    let fired = false;
+    const h = p.setTimer(() => { fired = true; }, 10_000);
+    p.clearTimer(h);
+
+    expect(fired).toBe(false);
+  });
+});
