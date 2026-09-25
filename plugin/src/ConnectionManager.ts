@@ -338,8 +338,8 @@ export class ConnectionManager {
         // a permanent daemon-unavailable condition (unsupported arch /
         // declined / download failed) must NOT be retried by
         // ReconnectManager. Continue with rpcConnection still null so
-        // buildFsClient() yields an SFTP client. Any other error propagates
-        // to the reconnect retry loop as before.
+        // {@link buildBinding} yields the SFTP client AND the vault prefix
+        // that transport needs. Any other error propagates to the retry loop.
         if (e instanceof DaemonUnavailableError) {
           logger.warn(`reconnectAttempt: daemon unavailable, continuing on SFTP: ${e.message}`);
         } else {

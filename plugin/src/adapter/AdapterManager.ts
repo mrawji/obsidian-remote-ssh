@@ -51,6 +51,10 @@ export const PATCHED_METHODS = [
  * Owns the lifetime of the patched `app.vault.adapter`, the ResourceBridge
  * and the OfflineQueue. {@link patch} after a connect, {@link restore} on
  * disconnect or unload.
+ *
+ * Lifted out of `main.ts` (#197) so those three lifetimes sit together and
+ * can be tested without standing up a plugin — worth knowing before anyone
+ * folds it back in.
  */
 export class AdapterManager {
   private patcher: AdapterPatcher<Record<string, unknown>> | null = null;
