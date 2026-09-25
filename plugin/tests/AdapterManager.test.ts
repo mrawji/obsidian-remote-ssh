@@ -312,6 +312,38 @@ describe('AdapterManager.startResourceBridge()', () => {
     expect(got).toBe(bridge);
   });
 
+  it('hands the bridge a fetcher wired to this manager', async () => {
+    // The bridge serves Obsidian's <img> requests; if that callback does not
+    // reach the patched adapter, every remote image renders broken.
+    const { mgr } = makeManager();
+    const fetchSpy = vi.fn(async () => new Uint8Array([1]));
+    (mgr as unknown as Record<string, unknown>).fetchBinaryForBridge = fetchSpy;
+    let fetcher: ((p: string) => Promise<Uint8Array>) | undefined;
+    const bridge = { start: async (f: unknown) => { fetcher = f as typeof fetcher; } };
+
+    await priv<(b: unknown) => Promise<unknown>>(mgr, 'startResourceBridge').call(mgr, bridge);
+    await fetcher!('notes/diagram.png');
+
+    expect(fetchSpy).toHaveBeenCalledWith('notes/diagram.png');
+  });
+
+  it('enables the daemon fast paths only when the daemon offers them', async () => {
+    // Served from the daemon's resize path instead of pulling the full
+    // original on every <img> — but only when it advertises the method.
+    const { mgr } = makeManager();
+    const internals = mgr as unknown as Record<string, unknown>;
+    internals.makeThumbnailFetcherIfSupported = () => (() => Promise.resolve(new Uint8Array()));
+    internals.makeBinaryRangeFetcherIfSupported = () => (() => Promise.resolve(new Uint8Array()));
+    const passed: unknown[] = [];
+    const bridge = { start: async (...a: unknown[]) => { passed.push(...a); } };
+
+    const got = await priv<(b: unknown) => Promise<unknown>>(mgr, 'startResourceBridge')
+      .call(mgr, bridge);
+
+    expect(got).toBe(bridge);
+    expect(passed.filter((x) => typeof x === 'function')).toHaveLength(3);
+  });
+
   it('gives up the bridge, not the session, when it cannot bind', async () => {
     // Losing the bridge costs image rendering. Letting the throw escape would
     // cost the connection, which is the worse trade.
@@ -322,5 +354,101 @@ describe('AdapterManager.startResourceBridge()', () => {
       .call(mgr, bridge);
 
     expect(got).toBeNull();
+  });
+});
+
+// ─── patch() itself ──────────────────────────────────────────────────────────
+//
+// Never executed by anything: not the unit suite, and — measured — not the
+// integration suite either. Only the E2E run drives it, and that uploads no
+// coverage. It is the step that puts this plugin in front of the vault.
+
+describe('AdapterManager.patch()', () => {
+  function patchableManager() {
+    // Only `app.vault` is reached, so a literal says more than a real App.
+    const hostAdapter: Record<string, unknown> = { read: () => 'original' };
+    const app = {
+      vault: {
+        adapter: hostAdapter,
+        configDir: '.obsidian',
+        getName: () => 'test-vault',
+      },
+    };
+    const subscribe = vi.fn();
+    const mgr = new AdapterManager(
+      app as unknown as App,
+      { id: 'remote-ssh' } as unknown as PluginManifest,
+      {
+        activeRemoteBasePath: '/home/tester/vault',
+        rpcConnection: null,
+        buildBinding: () => ({ client: {}, remoteBase: '/home/tester/vault' }),
+      } as unknown as ConnectionManager,
+      { subscribe, unsubscribe: vi.fn() } as unknown as FsChangeListener,
+      { startPolling: vi.fn() } as unknown as PendingEditsBar,
+      () => ({ profiles: [] }) as unknown as PluginSettings,
+      null,
+    );
+    // The bridge binds a port and the queue touches disk; neither is what this
+    // test is about, and both have their own cases above.
+    const internals = mgr as unknown as Record<string, unknown>;
+    internals.startResourceBridge = () => Promise.resolve(null);
+    internals.openOfflineQueue = () => Promise.resolve({
+      stats: () => ({ entries: 0, bytes: 0 }),
+      pending: () => [],
+    });
+    return { mgr, hostAdapter, subscribe };
+  }
+
+  it('refuses to patch before a remote base path is known', async () => {
+    // Patching against no prefix would point every read and write at the
+    // remote home instead of the vault inside it.
+    const { mgr } = makeManager();
+
+    expect(await mgr.patch()).toBe(false);
+    expect(mgr.isPatched()).toBe(false);
+  });
+
+  it('replaces the host adapter\'s methods and reports success', async () => {
+    const { mgr, hostAdapter } = patchableManager();
+    const before = hostAdapter.read;
+
+    expect(await mgr.patch()).toBe(true);
+
+    expect(mgr.isPatched()).toBe(true);
+    expect(mgr.dataAdapter).not.toBeNull();
+    expect(hostAdapter.read).not.toBe(before);
+    // Not all of them are functions — `basePath` is a value, which is the
+    // whole point of #170: plugins read it and used to get `undefined`.
+    for (const m of PATCHED_METHODS) expect(hostAdapter[m]).toBeDefined();
+  });
+
+  it('is idempotent — a second patch does not re-wrap an already-wrapped adapter', async () => {
+    const { mgr, hostAdapter } = patchableManager();
+    await mgr.patch();
+    const afterFirst = hostAdapter.read;
+
+    expect(await mgr.patch()).toBe(true);
+
+    expect(hostAdapter.read).toBe(afterFirst);
+  });
+
+  it('gives the host adapter its own methods back on restore', async () => {
+    const { mgr, hostAdapter } = patchableManager();
+    const before = hostAdapter.read;
+    await mgr.patch();
+
+    mgr.restore();
+
+    expect(hostAdapter.read).toBe(before);
+    expect(mgr.isPatched()).toBe(false);
+    expect(mgr.dataAdapter).toBeNull();
+  });
+
+  it('does not subscribe to fs changes on an SFTP session', async () => {
+    const { mgr, subscribe } = patchableManager();
+
+    await mgr.patch();
+
+    expect(subscribe).not.toHaveBeenCalled();
   });
 });
