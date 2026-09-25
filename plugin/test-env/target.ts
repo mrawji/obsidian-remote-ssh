@@ -1,44 +1,19 @@
 import * as path from 'node:path';
 
 /**
- * Where the test suites point.
+ * The single answer to "which sshd am I talking to". `ORSSH_TEST_ENV`
+ * picks; `tests/integration/` and `e2e/` both read it rather than naming a
+ * host, so the same tests can be aimed elsewhere without editing a test.
  *
- * `tests/integration/` and `e2e/` used to carry their own copies of
- * `127.0.0.1` / `2222`. This module is the single place that answers "which
- * sshd am I talking to", so the same tests can be aimed at a different
- * environment without editing a test.
+ *   local (default)  docker-compose.yml          published on 127.0.0.1:2222
+ *   tailnet          docker-compose.tailnet.yml  MagicDNS over WireGuard,
+ *                                                via a SOCKS5 ProxyCommand
  *
- * Two of those copies (`config-consistency`, `restart-roundtrip`) were found
- * during review, having survived the first pass — they sat in profiles that
- * `ShadowVaultBootstrap` never dials, so pointing them at a port with
- * nothing behind it changed nothing and nothing failed. A constant that is
- * never used is not harmless: it reads as the address the test connects to,
- * and it is the first thing someone will trust when this file stops
- * matching reality. If you add a profile here, spread `targetConnection()`
- * into it even when you believe nothing will dial it.
+ * Rationale and setup: docs/en/contributing/testing-strategy.md.
  *
- * ## The environments
- *
- * `local` (default) — `docker-compose.yml`: sshd published straight onto
- * `127.0.0.1:2222`. Fast, and what `npm run test:integration` has always
- * used.
- *
- * `tailnet` — `docker-compose.tailnet.yml`: the *same* sshd image and the
- * *same* keypair, but the container publishes nothing. The only route to
- * port 22 is through a private WireGuard mesh built by a self-hosted
- * headscale control plane, reached from here through a SOCKS5
- * `ProxyCommand`, addressed by its MagicDNS name.
- *
- * Why that second environment exists: `docs/en/cookbook/share-via-tailscale.md`
- * tells users to run their vault over Tailscale, on the argument that the
- * plugin needs no special handling because the host is just an SSH host on a
- * different path. That is a claim about every read, write, watch and
- * reconnect in the suite — not about one connection — so the way to check it
- * is to run the whole suite over that path, which is what
- * `ORSSH_TEST_ENV=tailnet` does.
- *
- * Neither environment needs a Tailscale account, an auth key, or any network
- * beyond pulling images.
+ * Spread `targetConnection()` into any profile you add here, even one you
+ * believe nothing dials — two such profiles kept working copies of
+ * `127.0.0.1` alive through the first pass of this refactor.
  */
 
 export type TestEnvName = 'local' | 'tailnet';
@@ -60,53 +35,33 @@ export const TEST_PRIVATE_KEY = path.join(repoRoot, 'docker', 'keys', 'id_test')
 export const TEST_USER = 'tester';
 export const TEST_VAULT = `/home/${TEST_USER}/vault`;
 
-/**
- * The `ProxyCommand` that reaches the tailnet, or `undefined` in the local
- * environment. Quoted because the command line is handed to `sh -c` and the
- * repo may live under a path with spaces.
- */
+/** Quoted: the line goes to `sh -c`, and the repo path may contain spaces. */
 const TAILNET_PROXY_COMMAND =
   `node "${path.join(repoRoot, 'plugin', 'scripts', 'socks5-connect.mjs')}" %h %p`;
 
 /**
- * What a caller actually needs to know about an environment.
- *
- * These are capabilities and budgets, not a name. Callers that ask
- * "is this the tailnet?" instead of "can this link be shaped?" have to be
- * found and updated by hand when a third environment appears; callers that
- * read a field get the answer from here, and `Record<TestEnvName, …>` below
- * makes the compiler insist the new environment fills every one in.
+ * Capabilities and budgets, deliberately not a name: a caller that asks
+ * "can this link be shaped?" keeps working when a third environment
+ * appears, and `Record<TestEnvName, …>` makes the compiler demand every
+ * field for it. A caller that asks "is this the tailnet?" does not.
  */
 interface TestTarget {
   host: string;
   port: number;
   /** Set only where the host is not directly reachable. */
   proxyCommand?: string;
-  /**
-   * The container running sshd. Tests that reach past the SSH connection —
-   * `certificate-auth` rewrites sshd_config, `netem` shapes the link — need
-   * to name it, and the two environments name it differently.
-   */
+  /** Named differently per environment; `netem` and `certificate-auth` need it. */
   sshdContainer: string;
-  /**
-   * How long a connect may take. Not a preference: bringing up a proxy
-   * process and a WireGuard path before the SSH handshake starts does not
-   * fit in the budget a published local port needs.
-   */
+  /** A proxy process plus a WireGuard path does not fit a local port's budget. */
   connectTimeoutMs: number;
   /** Whether `tc` can shape this link — i.e. whether its sshd has NET_ADMIN. */
   canShapeLink: boolean;
   /** The npm script that brings this environment up, for "run X first" errors. */
   startCommand: string;
   /**
-   * How to drop and restore *just sshd*, for the reconnect spec.
-   *
-   * Not the same thing as tearing the environment down: in the tailnet
-   * environment that would take the control plane with it, and a headscale
-   * restart leaves every node without a netmap (see
-   * `docs/en/contributing/testing-strategy.md`). What the spec means by "an
-   * unexpected sshd drop" is the server going away while the path to it
-   * stays up, which is one container in either environment.
+   * Just sshd, for the reconnect spec — never the whole environment. Taking
+   * the tailnet down would take headscale with it, and a node that loses
+   * its control connection never comes back (testing-strategy.md).
    */
   sshdStopCommand: string;
   sshdStartCommand: string;

@@ -4,42 +4,18 @@ import { errorMessage } from '../util/errorMessage';
 /**
  * Notices a daemon that has stopped answering without the wire going down.
  *
- * ## Why this is not a per-call timeout
+ * Not a per-call timeout: a large `readBinary` over a slow link is
+ * legitimately slow, and a budget generous enough for it is useless as a
+ * budget. This asks whether the daemon is there at all instead.
  *
- * The obvious fix for "a call that never returns" is a deadline on every
- * call. It is the wrong one here: a `vault.readBinary` of a large note over
- * a slow link is legitimately slow, and any deadline generous enough to
- * survive that is too generous to be useful. Worse, the failure it would
- * introduce — a working transfer cancelled at an arbitrary size — is more
- * damaging than the one it fixes.
+ * A probe goes out only when the line is quiet AND nothing is waiting on
+ * it. The daemon serves one request at a time per connection
+ * (`server/internal/server/server.go`), so a probe sent mid-call queues and
+ * then times out on our own account — which would fire during a large
+ * write, where the daemon is busy and silent by design.
  *
- * So this asks a different question. Not "is this call taking too long" but
- * "is the daemon still there at all", which a cheap round trip answers
- * without putting a clock on anyone's transfer.
- *
- * ## Why it waits for silence AND an idle line
- *
- * The daemon serves one request at a time per connection
- * (`server/internal/server/server.go` is a plain read-dispatch-write loop,
- * no goroutine per request). A probe sent while a call is outstanding does
- * not overtake it — it queues, and then times out for reasons that have
- * nothing to do with the daemon's health.
- *
- * That matters most for a large write, where the daemon is busy and silent
- * by design: it is taking bytes and has nothing to say until it is done.
- * Probing then would declare a perfectly healthy transfer dead.
- *
- * So a probe goes out only when the line has been quiet AND nothing is
- * waiting on it. What that buys is the common case — the laptop that slept,
- * the daemon the OOM killer took, the box that rebooted — where the plugin
- * used to sit believing it was still connected.
- *
- * ## What it deliberately does not catch
- *
- * A daemon wedged *mid-call* holds the line, so no probe is sent and this
- * says nothing. Catching that needs a deadline on the call itself, at the
- * cost above. If it ever becomes a real complaint, the answer is a progress
- * signal from the daemon, not a stopwatch on this side.
+ * Does NOT catch a daemon wedged mid-call: it holds the line, so no probe
+ * is sent. That needs a deadline on the call, at the cost above.
  */
 
 export interface RpcHeartbeatOptions {
@@ -66,11 +42,7 @@ export interface RpcHeartbeatOptions {
   clearTimer?: (handle: unknown) => void;
 }
 
-/**
- * Deliberately unhurried. This exists to catch a daemon that is gone, not
- * to measure latency: noticing 90 seconds late costs a stale status bar,
- * while a false positive tears down a working session.
- */
+/** Unhurried on purpose: a false positive tears down a working session. */
 const DEFAULT_IDLE_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_MISSES = 3;
@@ -94,8 +66,7 @@ export class RpcHeartbeat {
     this.probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
     this.maxMisses = opts.maxMisses ?? DEFAULT_MAX_MISSES;
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
-    // `window.` deliberately: Obsidian tears down a popout window's timers
-    // with the window, and a bare `setTimeout` would outlive it.
+    // `window.` so a popout window's teardown takes these with it.
     this.setTimer = opts.setTimer ?? ((fn, ms) => window.setTimeout(fn, ms));
     this.clearTimer = opts.clearTimer ?? ((h) => { window.clearTimeout(h as number); });
   }
@@ -125,8 +96,7 @@ export class RpcHeartbeat {
   private async tick(): Promise<void> {
     if (this.stopped) return;
 
-    // Someone is waiting on the line, or it has spoken recently. Either way
-    // the daemon is demonstrably there, and a probe would only queue.
+    // Busy or recently heard from: demonstrably alive, and a probe would queue.
     if (this.probing
       || this.opts.pendingCount() > 0
       || this.opts.msSinceLastMessage() < this.idleMs) {
