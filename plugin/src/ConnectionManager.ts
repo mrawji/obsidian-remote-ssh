@@ -37,7 +37,8 @@ export interface ConnectionDeps {
    * at a time with "stream is closed" and the status bar still said
    * connected.
    */
-  onRpcClose: () => void;
+  /** Why the wire died, when the layer that noticed could tell. */
+  onRpcClose: (reason?: Error) => void;
 }
 
 /**
@@ -226,7 +227,7 @@ export class ConnectionManager {
       if (this.closingRpcIntentionally) return;
       logger.warn(`RPC wire closed unexpectedly${err ? `: ${errorMessage(err)}` : ''}`);
       this.stopHeartbeat();
-      this.deps.onRpcClose();
+      this.deps.onRpcClose(err);
     });
 
     // A closed wire is the loud case. The quiet one is a daemon that is
@@ -242,7 +243,7 @@ export class ConnectionManager {
       onDead: (reason) => {
         if (this.closingRpcIntentionally) return;
         logger.warn(`RPC heartbeat: ${reason.message}`);
-        this.deps.onRpcClose();
+        this.deps.onRpcClose(reason);
       },
     });
     this.heartbeat.start();

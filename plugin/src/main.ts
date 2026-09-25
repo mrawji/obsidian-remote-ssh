@@ -184,23 +184,17 @@ export default class RemoteSshPlugin extends Plugin {
       (prompts) => new KbdInteractiveModal(this.app, prompts).prompt(),
       (info) => new HostKeyMismatchModal(this.app, info).prompt(),
     );
-    client.onClose(({ unexpected }) => {
-      if (unexpected) {
-        new Notice('Remote SSH: connection lost — reconnecting…');
-        void this.startReconnect();
-      }
+    client.onClose(({ unexpected, reason }) => {
+      if (unexpected) void this.startReconnect(reason);
     });
     this.conn = new ConnectionManager(client, {
       locateDaemonBinary: () => this.locateDaemonBinary(),
       ensureDaemonBinary: (c) => this.ensureDaemonBinary(c),
-      // The daemon dying is a lost connection too, even though SSH is fine.
-      // It goes to the same place an SSH drop does — `startReconnect` is
-      // idempotent, so when both die together (the usual case) the second
-      // call is a no-op rather than a second loop.
-      onRpcClose: () => {
-        new Notice('Remote SSH: remote daemon stopped — reconnecting…');
-        void this.startReconnect();
-      },
+      // The daemon dying is a lost connection too, even though SSH may be
+      // fine. Both go to the same place, and `startReconnect` announces —
+      // on the RPC transport an SSH drop kills the tunnel with it, so both
+      // paths fire for one failure and the user must still see one notice.
+      onRpcClose: (reason) => { void this.startReconnect(reason); },
     });
     this.conn.activeRemoteBasePath = null;
 
@@ -669,19 +663,33 @@ export default class RemoteSshPlugin extends Plugin {
     new Notice('Remote SSH: reconnect cancelled');
   }
 
-  private async startReconnect(): Promise<void> {
+  private async startReconnect(cause?: Error): Promise<void> {
     if (!this.conn.activeProfile) {
       logger.warn('startReconnect: no active profile to reconnect with');
       this.setState(SyncState.ERROR);
       return;
     }
+    // One failure, one notice. Both close paths lead here, and on the RPC
+    // transport a dropped SSH connection takes the tunnel with it, so both
+    // fire for the same event — announcing from the callers stacked two
+    // toasts on the most ordinary disconnect there is.
+    if (this.state === SyncState.RECONNECTING) {
+      logger.info(`startReconnect: already reconnecting${cause ? ` (${cause.message})` : ''}`);
+      return;
+    }
+    // Say WHY, not just that. The transports go to some trouble to keep the
+    // reason a session died; discarding it here is what made every drop read
+    // as the same contentless line.
+    const lost = cause?.message ? `connection lost (${cause.message})` : 'connection lost';
     const maxRetries = this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries;
     if (maxRetries <= 0) {
       logger.info('startReconnect: auto-reconnect disabled (reconnectMaxRetries <= 0)');
+      new Notice(`Remote SSH: ${lost}. Auto-reconnect is off.`);
       this.adapterMgr.restore();
       this.setState(SyncState.ERROR);
       return;
     }
+    new Notice(`Remote SSH: ${lost} — reconnecting…`);
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
       maxRetries,
