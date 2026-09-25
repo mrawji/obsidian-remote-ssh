@@ -292,8 +292,12 @@ describe('ensureDaemonBinary — how the bytes land', () => {
 
     expect(result).toBe(abs);
     expect(fs.readFileSync(abs)).toEqual(bytes);
-    // Executable, and no `.tmp` left behind.
-    expect(fs.statSync(abs).mode & 0o111).toBeTruthy();
+    // No `.tmp` left behind — the rename is what makes the write atomic.
     expect(seenDuringWrite.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    // Windows has no execute bit and `chmod` there is a no-op, so this half
+    // only means anything on POSIX.
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(abs).mode & 0o111).toBeTruthy();
+    }
   });
 });
