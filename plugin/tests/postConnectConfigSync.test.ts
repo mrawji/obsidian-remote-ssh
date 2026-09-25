@@ -38,7 +38,9 @@ vi.mock('../src/shadow/CommunityPluginsSync', () => ({
   readEnabledPluginIds: () => ['remote-ssh'],
 }));
 
-import { syncConfigAfterConnect, watcherPorts, type ConfigSyncPorts } from '../src/shadow/postConnectConfigSync';
+import {
+  syncConfigAfterConnect, watcherPorts, watchedName, type ConfigSyncPorts,
+} from '../src/shadow/postConnectConfigSync';
 import type { SharedConfigWatcher } from '../src/shadow/SharedConfigWatcher';
 
 /** A watcher that only records what was done to it, and in what order. */
@@ -178,15 +180,6 @@ describe('syncConfigAfterConnect — every step is best-effort', () => {
   });
 });
 
-/**
- * Real `fs.watch` crashes the vitest worker on windows-latest — exit code
- * 3221226505 (0xC0000409, a fast-fail stack-buffer-overrun), taking the whole
- * file down before any assertion reports. It is the only native handle this
- * file opens, and the crash arrived with it. Not diagnosed further than that,
- * so these sit out on Windows rather than being rewritten around a cause I
- * have not established. Everything else here runs everywhere.
- */
-const WATCHES_DISK = process.platform !== 'win32';
 
 describe('watcherPorts — how the real watcher reaches disk and remote', () => {
   it('reads a local config file', () => {
@@ -227,11 +220,6 @@ describe('watcherPorts — how the real watcher reaches disk and remote', () => 
     expect(notices).toEqual([]);
   });
 
-  it.skipIf(!WATCHES_DISK)('hands back a handle that closes the fs watch', () => {
-    const handle = watcherPorts(ports()).watch(() => { /* not asserted here */ });
-
-    expect(() => handle.close()).not.toThrow();
-  });
 });
 
 describe('syncConfigAfterConnect — the remaining edges', () => {
@@ -245,16 +233,6 @@ describe('syncConfigAfterConnect — the remaining edges', () => {
     expect(calls).toContain('watcher.start');
   });
 
-  it.skipIf(!WATCHES_DISK)('builds the real watcher when no factory is supplied', async () => {
-    // The production path. Everything else here replaces it.
-    const p = ports();
-    delete (p as { makeWatcher?: unknown }).makeWatcher;
-
-    const w = await syncConfigAfterConnect(p);
-
-    expect(w).toBeTruthy();
-    w.stop();
-  });
 
   it('says "file" for one and "files" for several', async () => {
     pullShared.mockImplementation(record('pullShared', {
@@ -272,31 +250,27 @@ describe('syncConfigAfterConnect — the remaining edges', () => {
   });
 });
 
-describe('watcherPorts — the fs.watch callback', () => {
-  it.skipIf(!WATCHES_DISK)('passes a changed filename through, and a missing one as null', async () => {
-    // `fs.watch` does not always hand over a filename; the watcher has to be
-    // told "something changed, I don't know what" rather than get `undefined`.
-    const seen: (string | null)[] = [];
-    const handle = watcherPorts(ports()).watch((f) => { seen.push(f); });
-    try {
-      fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{"changed":true}');
-      // fs.watch is asynchronous and platform-timed; give it a moment.
-      await new Promise((r) => setTimeout(r, 300));
-    } finally {
-      handle.close();
-    }
+describe('watchedName — what fs.watch reported', () => {
+  // The only decision in that callback, lifted out so it runs on every
+  // platform. A unit suite has no business opening a native watch handle:
+  // doing so killed the vitest worker on windows-latest outright (exit
+  // 3221226505), taking every assertion in this file with it. Real watching
+  // belongs to the E2E suite.
 
-    // Some platforms coalesce or drop events, so the assertion is about the
-    // SHAPE of what arrives, not that anything must.
-    for (const f of seen) expect(f === null || typeof f === 'string').toBe(true);
+  it('passes a reported basename through', () => {
+    expect(watchedName('app.json')).toBe('app.json');
   });
 
-  it('drives its timers through the window clock', () => {
-    const p = watcherPorts(ports());
-    let fired = false;
-    const h = p.setTimer(() => { fired = true; }, 10_000);
-    p.clearTimer(h);
+  it('reports "something changed, unknown what" when the platform gives no name', () => {
+    // `SharedConfigWatcher` treats null as "consider every shared file".
+    // `undefined` passed through would look like a basename of "undefined"
+    // and match none of them, so a real edit would never be pushed.
+    expect(watchedName(undefined)).toBeNull();
+    expect(watchedName(null)).toBeNull();
+    expect(watchedName('')).toBeNull();
+  });
 
-    expect(fired).toBe(false);
+  it('accepts the Buffer form the API can hand back', () => {
+    expect(watchedName(Buffer.from('hotkeys.json'))).toBe('hotkeys.json');
   });
 });

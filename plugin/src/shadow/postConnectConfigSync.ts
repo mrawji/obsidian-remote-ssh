@@ -45,6 +45,24 @@ export interface ConfigSyncPorts {
 }
 
 /**
+ * What `fs.watch` reported, as a basename or "something changed, unknown what".
+ *
+ * The platform does not always give a filename — Windows and some network
+ * filesystems report the event without one — and `SharedConfigWatcher` treats
+ * null as "consider every shared file". Passing `undefined` straight through
+ * would instead look like a basename of "undefined" and match nothing.
+ *
+ * Its own function so it can be checked on every platform: a unit suite has
+ * no business opening a native watch handle, and this is the only part of
+ * that callback with a decision in it.
+ *
+ * @internal Exported for testing.
+ */
+export function watchedName(filename: string | Buffer | null | undefined): string | null {
+  return filename ? String(filename) : null;
+}
+
+/**
  * How the real watcher reaches the disk and the remote.
  *
  * Separate from constructing it so the three callbacks can be exercised: one
@@ -58,7 +76,7 @@ export function watcherPorts(p: ConfigSyncPorts): ConstructorParameters<typeof S
     watch: (onChange) => {
       const w = fs.watch(
         p.localConfigDir, { persistent: false },
-        (_evt, filename) => onChange(filename ? String(filename) : null),
+        (_evt, filename) => onChange(watchedName(filename)),
       );
       return { close: () => w.close() };
     },
