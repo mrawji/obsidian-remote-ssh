@@ -67,20 +67,6 @@ export interface StartResult {
 }
 
 /**
- * Localhost HTTP server that serves binary vault assets to Obsidian's
- * webview so `<img>`, `<iframe>`, `<audio>`, etc. can render content
- * that lives on a remote host.
- *
- * The server binds to 127.0.0.1 on an OS-assigned random port. Every
- * URL embeds a token that's regenerated on each `start()` so a leaked
- * URL from a prior session can't replay against a new one.
- *
- * The server is intentionally minimal: GET requests only, no Range,
- * full body in memory (the underlying readBinary already loads the
- * whole file). Phase 6-B can add streaming + Range when large PDFs
- * become a real pain point.
- */
-/**
  * TTL in ms for entries in the per-path mtime cache. After this much
  * time has elapsed since the last hit the entry is treated as stale
  * and the next range request goes out without `expectedMtime`. 30 s
@@ -104,6 +90,20 @@ interface MtimeCacheEntry {
   lastUsed: number;
 }
 
+/**
+ * Localhost HTTP server that serves binary vault assets to Obsidian's
+ * webview so `<img>`, `<iframe>`, `<audio>`, etc. can render content
+ * that lives on a remote host.
+ *
+ * The server binds to 127.0.0.1 on an OS-assigned random port. Every
+ * URL embeds a token that's regenerated on each `start()` so a leaked
+ * URL from a prior session can't replay against a new one.
+ *
+ * The server is intentionally minimal: GET requests only, no Range,
+ * full body in memory (the underlying readBinary already loads the
+ * whole file). Phase 6-B can add streaming + Range when large PDFs
+ * become a real pain point.
+ */
 export class ResourceBridge {
   private server: http.Server | null = null;
   private token: string | null = null;
