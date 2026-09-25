@@ -1,6 +1,6 @@
 {
   "name": "obsidian-remote-ssh",
-  "version": "1.1.10-beta.8",
+  "version": "1.1.10-beta.10",
   "description": "VS Code Remote SSH-like experience for Obsidian",
   "main": "main.js",
   "scripts": {
@@ -15,7 +15,7 @@
     "test:coverage": "vitest run --coverage",
     "test:replay": "node scripts/replay-prev-tests.mjs",
     "test:integration": "vitest run --config vitest.integration.config.ts --exclude **/perf.sync.bench.test.ts",
-    "test:integration:tailnet": "ORSSH_TEST_ENV=tailnet npm run test:integration",
+    "test:integration:tailnet": "ORSSH_TEST_ENV=tailnet npm run test:integration --",
     "test:integration:bench": "vitest run --config vitest.integration.config.ts tests/integration/perf.sync.bench.test.ts",
     "test:e2e": "playwright test --config e2e/playwright.config.ts",
     "test:e2e:tailnet": "ORSSH_TEST_ENV=tailnet npm run test:e2e",

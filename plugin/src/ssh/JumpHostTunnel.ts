@@ -139,6 +139,32 @@ export async function createJumpTunnel(
           ));
           return;
         }
+        // A forwarded channel whose far end goes away emits `end` and stops
+        // there: the bastion is still healthy, so ssh2 has no reason to
+        // close the channel. But `end` alone never reaches ssh2's outer
+        // `Client` as a `close`, and `close` is the only event
+        // `SftpClient` reconnects on — so a target that restarted behind a
+        // working bastion left the session looking live indefinitely.
+        //
+        // The same defect ProxyCommandTunnel had, reached differently, and
+        // missed for the same reason: the only test that had ever dropped a
+        // jump session dropped the BASTION, which tears every channel down
+        // and hides this case entirely.
+        //
+        // Ending our own half lets the Duplex auto-destroy once both
+        // directions are finished, so `end` still arrives first and nothing
+        // in flight is lost.
+        stream.on('end', () => {
+          if (lastJumpError) {
+            // ssh2 types a Channel's `destroy()` as taking nothing, but it
+            // is a Duplex and carries the error through to `'error'` — the
+            // only way this route can say why it ended.
+            (stream as unknown as Duplex).destroy(lastJumpError);
+            return;
+          }
+          stream.end();
+        });
+
         // The forwarded stream owns the jump client lifetime: when
         // the tunnel closes we tear the jump session down so the OS
         // socket isn't left hanging.

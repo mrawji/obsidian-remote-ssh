@@ -7,8 +7,7 @@ import { AuthResolver } from './AuthResolver';
 import { CertificateAgent, canSpeakToAgent } from './CertificateAgent';
 import { enableCertificateAuth } from './certificateAuth';
 import { HostKeyStore, type HostKeyMismatchHandler } from './HostKeyStore';
-import { createJumpTunnel } from './JumpHostTunnel';
-import { createProxyCommandTunnel } from './ProxyCommandTunnel';
+import { selectTransport } from './Transport';
 import { logger } from '../util/logger';
 import { asError, errorMessage } from '../util/errorMessage';
 
@@ -232,36 +231,17 @@ export class SftpClient {
     logger.info(`SftpClient: connecting to ${profile.host}:${profile.port} as ${profile.username}`);
 
     const authConfig = this.authResolver.buildAuthConfig(profile);
+    // `null` means direct: ssh2 opens its own socket. Anything else is a
+    // route with a contract — see `Transport`.
+    const transport = selectTransport(profile, {
+      authResolver:           this.authResolver,
+      hostKeyStore:           this.hostKeyStore,
+      hostKeyMismatchHandler: this.hostKeyMismatchHandler,
+    });
     let sock: Duplex | undefined;
-    if (profile.jumpHost) {
-      logger.info(`SftpClient: opening jump tunnel via ${profile.jumpHost.host}`);
-      // Share the host-key store + connect timings between the jump
-      // and target so a compromised bastion is caught the same way
-      // as a compromised target, and the jump session tears down
-      // around the same time the target idle-keepalive does.
-      sock = await createJumpTunnel(
-        profile.jumpHost,
-        profile.host,
-        profile.port,
-        this.authResolver,
-        {
-          hostKeyStore:           this.hostKeyStore,
-          // Pass the same mismatch handler we use for the target
-          // host so a jump-host fingerprint change also surfaces the
-          // recovery modal instead of failing with a generic "Jump
-          // host connect failed" error (#132 follow-up).
-          hostKeyMismatchHandler: this.hostKeyMismatchHandler,
-          connectTimeoutMs:       profile.connectTimeoutMs,
-          keepaliveIntervalMs:    profile.keepaliveIntervalMs,
-        },
-      );
-    } else if (profile.proxyCommand) {
-      // ProxyCommand transport (#430): run the command (e.g.
-      // `cloudflared access ssh --hostname %h`) and hand ssh2 its
-      // stdio as the `sock`. Mutually exclusive with jumpHost; if both
-      // are somehow set, the bastion jump above wins (it already ran).
-      logger.info(`SftpClient: opening ProxyCommand transport for ${profile.host}`);
-      sock = createProxyCommandTunnel(profile.proxyCommand, {
+    if (transport) {
+      logger.info(`SftpClient: opening ${transport.name} for ${profile.host}`);
+      sock = await transport.open({
         host: profile.host,
         port: profile.port,
         user: profile.username,

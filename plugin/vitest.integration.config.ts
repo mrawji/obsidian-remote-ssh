@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { coverageScope } from './vitest.coverage';
 
 // Integration tests against the docker sshd container started by
 // `npm run sshd:start`. Slower than unit tests (real network +
@@ -18,5 +19,12 @@ export default defineConfig({
     fileParallelism: false,
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    // Same scope as the unit config, no thresholds: this suite covers the
+    // transport and daemon seams on purpose and would fail any number set
+    // for the whole tree. CI runs it with `--coverage` and uploads the
+    // result, so code that only the real sshd can reach stops reading as
+    // untested — `SftpClient.connect()` and the jump-host route are only
+    // ever executed here.
+    coverage: { ...coverageScope },
   },
 });

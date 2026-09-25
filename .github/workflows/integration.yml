@@ -50,7 +50,29 @@ jobs:
         run: npm run sshd:start
 
       - name: Run integration tests
-        run: npm run test:integration
+        run: npm run test:integration -- --coverage
+
+      # Upload it. Without this, code that only a real sshd can reach reads
+      # as untested: `SftpClient.connect()` and both transport routes are
+      # executed nowhere else, so a refactor that touched them reported no
+      # patch coverage while every line of it was in fact being run.
+      #
+      # A separate flag, so a drop here is legible as "the integration suite
+      # stopped reaching something" rather than a unit regression. Codecov
+      # unions the uploads, so a line either run covers counts as covered.
+      #
+      # On a fork's PR the token is absent and this step fails; deliberately
+      # not fatal (same as ci.yml), but patch coverage there falls back to
+      # unit-only.
+      - name: Upload integration coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          slug: sotashimozono/obsidian-remote-ssh
+          files: plugin/coverage/lcov.info
+          flags: integration
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       # Before the teardown, not after: `sshd:stop` runs `docker compose
       # down -v`, which removes the container. Collected afterwards this
@@ -117,7 +139,18 @@ jobs:
         run: npm run tailnet:start
 
       - name: Run integration tests over the tailnet
-        run: npm run test:integration:tailnet
+        run: npm run test:integration:tailnet -- --coverage
+
+      # As above; the ProxyCommand route is reached only here.
+      - name: Upload integration coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          slug: sotashimozono/obsidian-remote-ssh
+          files: plugin/coverage/lcov.info
+          flags: integration-tailnet
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       # Before the teardown: `tailnet:stop` does `down -v`, which removes the
       # containers these logs live in.

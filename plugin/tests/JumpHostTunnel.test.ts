@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
+import { Duplex } from 'stream';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -404,5 +405,60 @@ describe('createJumpTunnel: host-key mismatch handler (#132 follow-up)', () => {
     expect(verifyCb).toHaveBeenCalledWith(false);
     // The handler was never reached since verifyAsync rejected before consulting it.
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe('createJumpTunnel: the far end goes away', () => {
+  /**
+   * A real Duplex, because these tests turn on Node's stream semantics
+   * rather than on our own bookkeeping: `push(null)` is exactly "the far
+   * end EOF'd", and whether that reaches `close` is the whole question.
+   * The bare EventEmitter above cannot answer it.
+   *
+   * The genuine article is an ssh2 Channel; `tests/integration/
+   * transport.contract.test.ts` drives one over a real bastion. This half
+   * covers the branch that one cannot reach — a bastion that fails
+   * mid-session, which needs the bastion to break on cue.
+   */
+  function duplexChannel(): Duplex {
+    return new Duplex({ read() { /* pushed by the test */ }, write(_c, _e, cb) { cb(); } });
+  }
+
+  it('destroys with the bastion\'s reason when the jump host failed', async () => {
+    // Otherwise all anyone downstream sees is the TARGET's connection
+    // ending, which points at the wrong machine entirely.
+    fake.forwardStream = duplexChannel() as typeof fake.forwardStream;
+    const stream = await createJumpTunnel(
+      baseJump, 'target.example.com', 22, authResolver,
+      { clientFactory: () => fake },
+    );
+    const failed = new Promise<Error>((resolve) => stream.once('error', resolve));
+
+    fake.emit('error', new Error('bastion went away'));
+    (stream as Duplex).push(null);
+    (stream as Duplex).resume();
+
+    expect((await failed).message).toBe('bastion went away');
+  });
+
+  it('ends quietly when the target merely hung up', async () => {
+    // A silent close is reserved for a clean hang-up — but it must still
+    // BE a close: `end` alone never reaches ssh2's Client, and a session
+    // that never hears `close` never reconnects.
+    fake.forwardStream = duplexChannel() as typeof fake.forwardStream;
+    const stream = await createJumpTunnel(
+      baseJump, 'target.example.com', 22, authResolver,
+      { clientFactory: () => fake },
+    );
+    const errors: Error[] = [];
+    stream.on('error', (e: Error) => errors.push(e));
+    const closed = new Promise<void>((resolve) => stream.once('close', () => resolve()));
+
+    (stream as Duplex).push(null);
+    (stream as Duplex).resume();
+    await closed;
+
+    expect(errors).toEqual([]);
+    expect(fake.ended).toBe(1);   // and the jump client is reaped
   });
 });
