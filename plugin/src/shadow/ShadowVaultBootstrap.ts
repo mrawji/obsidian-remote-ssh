@@ -22,12 +22,7 @@ function isNonEmptyArray(v: unknown): boolean {
   return Array.isArray(v) && v.length > 0;
 }
 
-/**
- * Narrow an unknown `secrets` (or `hostKeyStore`) blob to a plain
- * string-keyed record, defaulting to `{}` for anything that isn't a
- * non-array object. Keeps the #399 secret-merge below total even when a
- * data.json holds a malformed `secrets` value.
- */
+/** `{}` for anything not a plain object, so the #399 merge stays total. */
 function asSecretRecord(v: unknown): Record<string, unknown> {
   return (v && typeof v === 'object' && !Array.isArray(v))
     ? (v as Record<string, unknown>)
@@ -55,11 +50,9 @@ export interface BootstrapResult {
   /** True if the vault entry was newly added (false = was already registered). */
   registryCreated: boolean;
   /**
-   * True if an existing shadow dir (located by profile id, under any
-   * prior naming scheme) was renamed to the current `<name>--<tail>` on
-   * this bootstrap. Like a newly-registered vault, the renamed path isn't
-   * in the running Obsidian's cached vault list, so the connect flow
-   * surfaces the one-time "restart Obsidian" notice.
+   * An existing shadow was renamed to the current scheme. The new path is not
+   * in the running Obsidian's cached vault list, so the connect flow shows the
+   * one-time "restart Obsidian" notice.
    */
   migrated: boolean;
   /**
@@ -87,10 +80,8 @@ export interface BootstrapResult {
  *   │           └── data.json         ← profile data + autoConnectProfileId
  *   └── (no other files — Obsidian fills the rest on first open)
  *
- * Idempotent: re-running for the same profile refreshes the plugin
- * install (so dev iterations land immediately) and rewrites data.json
- * but never touches files Obsidian itself created (workspace.json,
- * app.json, etc.).
+ * Idempotent: re-running refreshes the plugin install and rewrites
+ * data.json, but never touches what Obsidian itself wrote.
  */
 export class ShadowVaultBootstrap {
   constructor(
@@ -100,11 +91,8 @@ export class ShadowVaultBootstrap {
     private readonly sourcePluginDir: string,
     private readonly registry: ObsidianRegistry,
     /**
-     * Root of this device's never-synced sync state (e.g.
-     * `~/.obsidian-remote/`), parent of the `state/` dir that holds the
-     * community-plugins base snapshots — see
-     * {@link communityPluginsBasePath}. Defaults to
-     * `baseDir`'s parent, which is exactly that on every real call site.
+     * This device's never-synced state root, holding the community-plugins
+     * base snapshots ({@link communityPluginsBasePath}).
      */
     private readonly stateRoot: string = path.dirname(baseDir),
   ) {}
@@ -114,11 +102,8 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Synchronous body of `bootstrap`. Kept private so the public
-   * `bootstrap` keeps its `Promise<BootstrapResult>` shape (callers
-   * already `await` it) without needing an `async` keyword that
-   * `@typescript-eslint/require-await` would flag — every step here
-   * is `fs.*Sync` and JSON arithmetic, no I/O actually awaits.
+   * Every step here is `fs.*Sync`, so `bootstrap` keeps its Promise shape for
+   * callers without an `async` that `require-await` would flag.
    */
   private bootstrapSync(profile: SshProfile, allProfiles: ReadonlyArray<SshProfile>): BootstrapResult {
     // Resolve (and, when safe, migrate to) the `<name>--<tail>` shadow
@@ -135,33 +120,20 @@ export class ShadowVaultBootstrap {
     // before the `readBaseDataJson` call below side-effects state.
     const isFirstBootstrap = !fs.existsSync(layout.pluginDataFile);
 
-    // A first bootstrap means this device has no shadow vault for the
-    // profile — either it never had one, or the user deleted it (the
-    // documented recovery step). Either way any base snapshot left over
-    // from a previous incarnation is STALE, and keeping it would be
-    // actively destructive: the fresh shadow's list is the `["remote-ssh"]`
-    // seed below, so every id in that old base would look like a local
-    // uninstall and the first push would strip the user's whole
-    // enabled-plugin list off the remote. Drop it — the round-trip then
-    // falls back to the union (nothing lost) and re-establishes a base on
-    // the first successful push.
+    // A leftover base from a deleted shadow is destructive, not merely
+    // stale: the fresh list is the `["remote-ssh"]` seed below, so every id
+    // in that base reads as a local uninstall and the first push strips the
+    // user's whole enabled-plugin list off the remote. Dropping it falls the
+    // round-trip back to the union, and the next push writes a real base.
     if (isFirstBootstrap) this.discardCommunityPluginsBase(profile.id);
 
-    // `community-plugins.json` always starts as `["remote-ssh"]` only.
-    // Inheriting source's full enabled list at bootstrap time was too
-    // surprising — the shadow window would auto-install every plugin
-    // from the marketplace right after Obsidian's "trust this vault"
-    // prompt, which felt like the plugin was acting on its own. Now
-    // the user opts in via a modal (see `pendingPluginSuggestions`
-    // below) and the install only happens for what they tick.
+    // `["remote-ssh"]` only. Inheriting source's full list auto-installed
+    // every plugin right after the "trust this vault" prompt, which read as
+    // the plugin acting on its own; the user now opts in per plugin.
     this.seedCommunityPlugins(layout.configDir);
 
-    // Without this, a freshly-bootstrapped shadow vault has an empty
-    // app.json → Obsidian treats it as "never configured", opens it
-    // in first-run / Restricted mode, and never loads remote-ssh — so
-    // runAutoConnect (and the pullSharedObsidianConfig that would
-    // populate the real app.json) never run. Deadlock: the very first
-    // connect to any new profile silently does nothing.
+    // Without this the first connect to a new profile silently does nothing;
+    // see the method for the deadlock.
     this.seedObsidianFirstRunState(layout.configDir);
 
     // Install our own plugin source (symlink preferred so dev
@@ -169,20 +141,14 @@ export class ShadowVaultBootstrap {
     // Per-file install means data.json stays per-vault.
     const pluginInstallMethod = this.installPlugin(layout.pluginDir);
 
-    // data.json strategy: MERGE rather than overwrite, so accumulated
-    // state on the shadow side (hostKeyStore from past TOFU prompts,
-    // secrets, etc.) survives a re-bootstrap. On first bootstrap we
-    // seed from the source vault's data.json so the shadow inherits
-    // the source's already-trusted host keys — without that, every
-    // freshly-bootstrapped shadow vault would TOFU-prompt on the
-    // very first auto-connect.
+    // MERGE, not overwrite, so shadow-side state (host keys from past TOFU
+    // prompts, secrets) survives a re-bootstrap; the first bootstrap seeds
+    // from source so a new shadow inherits already-trusted host keys instead
+    // of TOFU-prompting on its first connect.
     //
-    // Bootstrap-managed fields (profiles list, activeProfileId,
-    // autoConnectProfileId) are always overwritten to reflect the
-    // current Connect click. `pendingPluginSuggestions` is set only
-    // on first bootstrap (and only if source has community plugins
-    // worth suggesting) so re-bootstrap doesn't re-prompt a user
-    // who's already made their decision.
+    // Bootstrap-managed fields are always overwritten.
+    // `pendingPluginSuggestions` is set only on the first bootstrap, so a
+    // user who has already decided is not asked again.
     const baseData = this.readBaseDataJson(layout.pluginDataFile);
     const data: Record<string, unknown> = {
       ...baseData,
@@ -191,16 +157,11 @@ export class ShadowVaultBootstrap {
       autoConnectProfileId: profile.id,
     };
 
-    // #399: a password entered in the SOURCE (local) vault must reach
-    // the shadow vault that actually runs the connect. `readBaseDataJson`
-    // prefers the EXISTING shadow data.json, so a secret persisted to
-    // source AFTER the first bootstrap would otherwise never propagate —
-    // the shadow's auto-connect then dies with "No password stored for
-    // profile" and the vault opens empty. Union the source's secrets
-    // over whatever the shadow has accumulated: source wins on a
-    // conflicting ref (it's the user's latest, just flushed by
-    // openShadowVaultFor before this bootstrap), while a secret typed
-    // directly in the shadow window (a ref absent from source) survives.
+    // #399: `readBaseDataJson` prefers the existing shadow data.json, so a
+    // password entered in the source AFTER the first bootstrap would never
+    // reach the window that runs the connect — which then dies with "No
+    // password stored for profile". Source wins on a conflicting ref (it is
+    // the user's latest), and a secret typed in the shadow window survives.
     const mergedSecrets = {
       ...asSecretRecord(baseData.secrets),
       ...this.readSourceSecrets(),
@@ -227,12 +188,7 @@ export class ShadowVaultBootstrap {
     return { layout, registryId, registryCreated: created, migrated, pluginInstallMethod };
   }
 
-  /**
-   * Delete this device's community-plugins base snapshot for `profileId`
-   * (see the call site in `bootstrapSync`). Best-effort — an absent file
-   * is the normal case, and a failure only means the next round-trip
-   * falls back to the union.
-   */
+  /** Best-effort; absent is normal, and failing only falls back to the union. */
   private discardCommunityPluginsBase(profileId: string): void {
     const basePath = communityPluginsBasePath(this.stateRoot, profileId);
     try {
@@ -243,10 +199,8 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Compute the shadow paths for a profile without doing any I/O: the
-   * pure `<name>--<tail>` layout, before any collision ` (n)` suffix
-   * (which only resolveLayout applies). A thin, side-effect-free path
-   * builder — resolveLayout is the sole caller.
+   * The pure `<name>--<tail>` layout, before any collision ` (n)` suffix —
+   * no I/O. Only `resolveLayout` calls it.
    */
   layoutFor(profile: Pick<SshProfile, 'name' | 'remotePath'>): ShadowVaultLayout {
     return this.layoutForDir(path.join(this.baseDir, friendlyVaultDirName(profile)));
@@ -254,22 +208,16 @@ export class ShadowVaultBootstrap {
 
   /** Derive the `.obsidian/...` sub-paths for a concrete vault dir. */
   private layoutForDir(vaultDir: string): ShadowVaultLayout {
-    // The shadow vault is freshly created on disk by us before Obsidian
-    // ever opens it; there's no live `App` instance whose
-    // `vault.configDir` we could query, so we build the directory name
-    // (`.obsidian`) via concatenation. That stays out of the AST as a
-    // single string literal, which keeps
-    // `obsidianmd/hardcoded-config-path` happy. Once the shadow window
-    // opens and the user customises `configDir`, subsequent reads use
-    // `app.vault.configDir` like the rest of the plugin.
+    // No live `App` exists yet, so there is no `vault.configDir` to read;
+    // concatenated to keep the literal out of the AST for
+    // `obsidianmd/hardcoded-config-path`.
     //
-    // KNOWN GAP (#553, reverted): a user who renames the config folder
-    // makes this disagree with the live value, so the pre-spawn pull
-    // reads and writes a directory Obsidian no longer uses. Detecting it
-    // from disk was tried and reverted — an ambiguous detection can seed a
-    // fresh `community-plugins.json` at the wrong path and push it over
-    // the user's real list. A safe version needs the detection to fail
-    // closed (skip the pre-spawn pull) rather than guess.
+    // KNOWN GAP (#553, reverted): if the user renames the config folder this
+    // disagrees with the live value and the pre-spawn pull works on a
+    // directory Obsidian no longer uses. Disk detection was tried and
+    // reverted — an ambiguous guess can seed `community-plugins.json` at the
+    // wrong path and push it over the real list. A safe version must fail
+    // closed and skip the pull.
     const configDir = path.join(vaultDir, '.' + 'obsidian');
     const pluginDir = path.join(configDir, 'plugins', 'remote-ssh');
     const pluginDataFile = path.join(pluginDir, 'data.json');
@@ -279,13 +227,9 @@ export class ShadowVaultBootstrap {
   /**
    * Resolve the shadow layout to use for this profile.
    *
-   * Identity is the profile *id* (persisted as `autoConnectProfileId`
-   * in the shadow's data.json), NOT the directory name — so a profile
-   * rename, a display-name collision, or an older `<uuid>` / `--<id8>`
-   * naming scheme all still resolve to the same shadow via
-   * `findShadowByProfileId`. When the existing shadow's dir name no
-   * longer matches the desired `<name>--<tail>`, we migrate it once by
-   * renaming, EXCEPT:
+   * Identity is the profile *id*, not the directory name, so a rename, a
+   * display-name collision or a legacy naming scheme all resolve to the same
+   * shadow. A dir whose name no longer matches is migrated once, EXCEPT:
    *
    *  - the vault is currently open (obsidian.json `open` flag): renaming
    *    an open vault's dir on Windows corrupts the live junction/handles
@@ -295,10 +239,10 @@ export class ShadowVaultBootstrap {
    *    `uniqueVaultDir` appends ` (2)` so two vaults never share one dir
    *    (which would merge their data.json / secrets / host keys).
    *
-   * The rename and the obsidian.json path update are separate `try`s:
-   * once the dir physically moves we commit to the new path even if
-   * updating the registry throws, because falling back would recreate
-   * the old dir empty and orphan the real config (#438 review).
+   * The rename and the registry update are separate `try`s: once the dir has
+   * moved we commit to the new path even if the registry write throws, since
+   * falling back would recreate the old dir empty and orphan the real
+   * config (#438).
    */
   private resolveLayout(
     profile: Pick<SshProfile, 'id' | 'name' | 'remotePath'>,
@@ -307,13 +251,10 @@ export class ShadowVaultBootstrap {
     const found = this.findShadowByProfileId(profile.id);
 
     if (found) {
-      // Where this profile's shadow SHOULD live (collision-safe): its own
-      // dir if it already owns one, else the free `<name>--<tail>` or a
-      // ` (n)` variant. Compare `found` to this resolved target — NOT to
-      // the bare desired name — otherwise a profile permanently parked in a
-      // ` (2)` dir (a display-name collision) would "migrate" to itself on
-      // every reconnect: a no-op same-path rename that falsely reports
-      // migrated=true and re-shows the one-time "restart Obsidian" notice.
+      // Compare `found` against this resolved target, not the bare desired
+      // name: a profile parked in a ` (2)` dir would otherwise "migrate" to
+      // itself every reconnect — a same-path rename reporting migrated=true
+      // and re-showing the one-time "restart Obsidian" notice.
       const target = this.uniqueVaultDir(desired.vaultDir, profile.id);
       if (path.basename(found) === path.basename(target)) {
         return { layout: this.layoutForDir(found), migrated: false };
@@ -354,12 +295,8 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Scan `baseDir` for the shadow whose data.json `autoConnectProfileId`
-   * matches. Identity is the id, not the dir name, so this is naming-scheme
-   * agnostic — it reuses the existing config whether the dir is a legacy
-   * `<uuid>`, an older `<name>--<id8>`, or the current `<name>--<tail>`,
-   * instead of stranding it. Returns the first match in sorted order
-   * (deterministic) or null.
+   * The shadow whose data.json carries this `autoConnectProfileId`, under any
+   * naming scheme. First match in sorted order, so it is deterministic.
    */
   private findShadowByProfileId(profileId: string): string | null {
     let entries: string[];
@@ -378,14 +315,12 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * The `autoConnectProfileId` recorded in `dir`'s shadow data.json, or
-   * null if `dir` isn't a bootstrapped shadow. A genuinely absent data.json
-   * (ENOENT) is the normal "not a shadow dir" case and stays silent; an
-   * EXISTING-but-unreadable data.json — a transient lock (AV / Dropbox sync
-   * / a mid-write) or malformed JSON — is logged, because it can briefly
-   * hide this profile's OWN shadow and make resolveLayout fork a duplicate
-   * ` (2)` dir instead of reusing it. A non-string id is treated as no
-   * match (only a false negative is possible, never a false reuse).
+   * The `autoConnectProfileId` in `dir`, or null if it is not a shadow.
+   *
+   * An absent data.json is the ordinary "not a shadow" case and stays silent.
+   * An EXISTING but unreadable one is logged: a transient lock or malformed
+   * JSON briefly hides this profile's own shadow, and `resolveLayout` then
+   * forks a duplicate ` (2)` dir instead of reusing it.
    */
   private readShadowProfileId(dir: string): string | null {
     const dataFile = this.layoutForDir(dir).pluginDataFile;
@@ -408,11 +343,9 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * A dir the given profile may safely occupy: the desired name if it's
-   * free or already this profile's, else `desired (2)`, `desired (3)`, …
-   * Two profiles must never share a dir — that would merge their
-   * data.json (secrets, host keys, active profile). Display-name
-   * collisions are allowed; only the on-disk dir is disambiguated.
+   * The desired name if free or already this profile's, else `desired (2)`…
+   * Two profiles sharing a dir would merge their data.json — secrets, host
+   * keys, active profile — so only the on-disk name is disambiguated.
    */
   private uniqueVaultDir(desiredVaultDir: string, profileId: string): string {
     // Free (absent) or already ours → safe to take. An existing dir whose
@@ -468,25 +401,18 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Seed the minimal `.obsidian/` state Obsidian needs to treat a
-   * freshly-created shadow vault as *already configured*, so it loads
-   * community plugins (incl. remote-ssh) on first open instead of
-   * coming up in first-run / Restricted mode. Without this the very
-   * first connect to a new profile deadlocks: the plugin never loads
-   * → runAutoConnect never runs → pullSharedObsidianConfig never runs
-   * → the real app.json is never pulled → the vault stays "never
-   * configured" forever (observed in the field: a brand-new shadow
-   * vault with an empty app.json and zero plugin log).
+   * Make a fresh shadow vault look *already configured*, so Obsidian loads
+   * community plugins on first open instead of coming up in Restricted mode.
    *
-   * Idempotent and non-destructive — only writes a file that is a
-   * first-run placeholder: absent, blank, unparseable, or the literal
-   * empty `{}` / `[]` Obsidian itself writes on first run. A real
-   * app.json / core-plugins.json (written later by
-   * pullSharedObsidianConfig, or by Obsidian once the vault has been
-   * used) has ≥1 key/element and is never clobbered. The e2e scaffold
-   * (`e2e/helpers/vault-scaffold.ts`) has always pre-written exactly
-   * this; the production bootstrap was the one missing it — which is
-   * also why the connect e2e never reproduced the failure.
+   * Without it the first connect to a new profile deadlocks: the plugin never
+   * loads, so `runAutoConnect` never runs, so the real app.json is never
+   * pulled, so the vault stays "never configured" — seen in the field as a
+   * new shadow vault with an empty app.json and no plugin log.
+   *
+   * Only ever writes a first-run placeholder: absent, blank, unparseable, or
+   * the empty `{}` / `[]` Obsidian writes itself. A real config has ≥1
+   * key and is never clobbered. The e2e scaffold had always pre-written this,
+   * which is why the connect e2e never reproduced the failure.
    */
   private seedObsidianFirstRunState(configDir: string): void {
     const appPath = path.join(configDir, 'app.json');
@@ -522,13 +448,10 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * True when `filePath` is a first-run placeholder that must be
-   * (re)seeded: absent, blank, unparseable, or parses to a value the
-   * `isConfigured` predicate rejects (e.g. `{}` / `[]`).
+   * Absent, blank, unparseable, or rejected by `isConfigured`.
    *
-   * A non-ENOENT read error (EACCES, EISDIR, …) is NOT "absent" — it
-   * is rethrown rather than silently treated as "needs seed", which
-   * would clobber a file we merely failed to read.
+   * A non-ENOENT read error is NOT "absent" and is rethrown — treating it as
+   * "needs seed" would clobber a file we merely failed to read.
    */
   private needsFirstRunSeed(
     filePath: string,
@@ -552,15 +475,9 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Snapshot the source vault's enabled community plugins (other
-   * than our own `remote-ssh`) plus each one's source-side
-   * `data.json`. Stored in shadow `data.json` as
-   * `pendingPluginSuggestions` so the shadow window can prompt the
-   * user to install only what they want — no surprise auto-install
-   * after Obsidian's "trust this vault" dialog.
-   *
-   * Returns an empty array if source has no community-plugins.json,
-   * if it has only `remote-ssh`, or if it can't be parsed.
+   * The source vault's enabled plugins and their `data.json`, stored as
+   * `pendingPluginSuggestions` so the shadow window can offer them instead of
+   * installing them unasked. Empty when there is nothing to suggest.
    */
   private collectPendingPluginSuggestions(): PendingPluginSuggestion[] {
     const sourceConfigDir = this.sourceConfigDir();
@@ -609,20 +526,13 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Decide what to use as the base for the shadow vault's
-   * `data.json` before merging the bootstrap-managed fields:
+   * The base for the shadow's `data.json`, in order: the shadow's own copy
+   * (keeping host keys and secrets accumulated since the last bootstrap),
+   * else the source's (so the first connect reuses already-trusted host keys
+   * rather than TOFU-prompting), else `{}`.
    *
-   * - If a shadow `data.json` already exists, parse and use it.
-   *   Preserves anything the shadow has accumulated since last
-   *   bootstrap (hostKeyStore, secrets, user preferences).
-   * - Otherwise, fall back to the source vault's `data.json` so the
-   *   first shadow connect can re-use the user's already-trusted
-   *   host keys instead of TOFU-prompting.
-   * - Otherwise, start fresh `{}`.
-   *
-   * Parse failures are logged and treated as "start fresh" — better
-   * to lose accumulated state than write a corrupted JSON file
-   * that would brick the plugin on next load.
+   * A parse failure starts fresh: losing accumulated state beats writing
+   * corrupt JSON that would brick the plugin on next load.
    */
   private readBaseDataJson(shadowDataPath: string): Record<string, unknown> {
     const candidates = [shadowDataPath, path.join(this.sourcePluginDir, 'data.json')];
@@ -644,16 +554,9 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Read just the `secrets` blob from the SOURCE vault's data.json.
-   *
-   * Used to propagate a password persisted in the source (local) vault
-   * into the shadow that runs the connect (#399). Unlike
-   * `readBaseDataJson` — which prefers the shadow's own copy so its
-   * accumulated state survives — this always reads source, so the merge
-   * in `bootstrapSync` can let the source's latest secret win.
-   *
-   * Returns `{}` when source has no data.json, it can't be parsed, or it
-   * carries no (well-formed) secrets — all benign "nothing to add" cases.
+   * The SOURCE vault's `secrets` blob, for #399. Always source — unlike
+   * {@link readBaseDataJson}, which prefers the shadow — so the merge can let
+   * the user's latest password win. `{}` whenever there is nothing to add.
    */
   private readSourceSecrets(): Record<string, unknown> {
     const sourceDataPath = path.join(this.sourcePluginDir, 'data.json');
@@ -673,21 +576,15 @@ export class ShadowVaultBootstrap {
   }
 
   /**
-   * Install the plugin per-file rather than as one big symlinked
-   * directory.
+   * Per-file, not one symlinked directory.
    *
-   * The earlier "symlink the whole plugin dir" approach was tighter
-   * and one fewer step, but it sneakily broke the source vault: the
-   * shadow vault's plugin would write its own per-vault `data.json`
-   * THROUGH the symlink, clobbering the source vault's settings
-   * (hostKeyStore, secrets, …) on the very first connect.
+   * Symlinking the whole dir was tighter and quietly broke the source vault:
+   * the shadow's plugin wrote its own `data.json` THROUGH the link,
+   * clobbering the source's host keys and secrets on the first connect.
    *
-   * Fix: pluginDir is a **real directory**. Code + assets
-   * (`main.js`, `manifest.json`, `styles.css`, `server-bin/`) are
-   * symlinked individually so dev-build iterations land immediately,
-   * but `data.json` is **never touched** by install — the caller
-   * writes the per-vault data.json into pluginDir as a real file,
-   * leaving the source vault's data.json untouched.
+   * So `pluginDir` is a real directory. Code and assets are symlinked
+   * individually, so dev builds land immediately, and `data.json` is never
+   * touched here — the caller writes a real one into it.
    */
   private installPlugin(pluginDir: string): 'symlink' | 'copy' | 'in-place' {
     // If pluginDir is a stale whole-dir symlink from an older build
@@ -703,13 +600,10 @@ export class ShadowVaultBootstrap {
       // Doesn't exist yet, fine.
     }
 
-    // Self-install guard: when the bootstrap runs from INSIDE the
-    // shadow window it targets, sourcePluginDir IS pluginDir. The
-    // rm+symlink cycle below would then delete each real plugin file
-    // and replace it with a symlink pointing at its own path — a
-    // self-referential link Obsidian can't resolve, so the plugin
-    // "disappears" on the next start. The bundle is already here;
-    // there is nothing to install.
+    // Running from inside the shadow window it targets: source IS pluginDir,
+    // and the rm+symlink cycle below would replace each real file with a link
+    // to its own path. Obsidian cannot resolve that, so the plugin vanishes
+    // on the next start. The bundle is already here.
     try {
       if (fs.realpathSync(this.sourcePluginDir) === fs.realpathSync(pluginDir)) {
         return 'in-place';

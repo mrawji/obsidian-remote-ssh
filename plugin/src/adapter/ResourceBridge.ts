@@ -5,32 +5,17 @@ import { logger } from '../util/logger';
 import { isPreconditionFailed } from '../proto/rpcError';
 import { errorMessage } from "../util/errorMessage";
 
-/**
- * Async fetcher for vault binary content. The bridge calls this with a
- * vault-relative path; the implementation goes through whatever adapter
- * + cache + transport stack the plugin is using.
- */
+/** Fetches whole vault binaries, through whatever adapter stack is wired. */
 export type FetchBinaryFn = (vaultPath: string) => Promise<Uint8Array>;
 
 /**
- * Async fetcher for partial binary reads. Optional: the bridge falls
- * back to {@link FetchBinaryFn} + post-fetch slicing when a request
- * carries a `Range:` header but no range fetcher was wired (= SFTP
- * transport, or a daemon that doesn't advertise `fs.readBinaryRange`).
+ * Partial reads. Optional — without it a `Range:` request falls back to
+ * fetching the whole file and slicing.
  *
- * `bytes` may be shorter than the requested `length` when the request
- * runs past EOF; the bridge uses `totalSize` to build the
- * `Content-Range: bytes start-end/<total>` header regardless of how
- * much was actually returned. `mtime` is the source file's mtime at
- * read time, threaded back as `expectedMtime` on follow-up requests
- * so a mid-scrub edit invalidates cleanly (#171).
- *
- * `expectedMtime`, when set, asks the implementation to reject the
- * read with `PreconditionFailed` (-32020) if the remote mtime no
- * longer matches. The bridge passes the cached mtime here on
- * follow-up requests for the same path; on rejection it drops the
- * cache entry and re-issues with `expectedMtime: undefined` so the
- * webview gets a fresh slice rather than a stale one.
+ * `bytes` may be short of `length` at EOF; `totalSize` builds the
+ * `Content-Range` header either way. `expectedMtime` asks the implementation
+ * to fail with `PreconditionFailed` (-32020) on a newer generation; see
+ * {@link ResourceBridge.mtimeCache} for why that matters.
  */
 export interface BinaryRange {
   bytes: Uint8Array;
@@ -46,14 +31,9 @@ export type FetchBinaryRangeFn = (
 ) => Promise<BinaryRange>;
 
 /**
- * Async fetcher for daemon-resized image thumbnails. Optional: the
- * bridge falls back to `FetchBinaryFn` when the request asks for a
- * thumbnail but no fetcher is wired (= SFTP transport, or a daemon
- * that doesn't advertise `fs.thumbnail`).
- *
- * The returned `format` lets the bridge set the right MIME type
- * without re-sniffing; PNG is used when the source had alpha so
- * transparency survives.
+ * Daemon-resized thumbnails. Optional — falls back to the full binary.
+ * `format` sets the MIME type without re-sniffing; PNG when the source had
+ * alpha, so transparency survives.
  */
 export type FetchThumbnailFn = (
   vaultPath: string,
@@ -67,21 +47,12 @@ export interface StartResult {
 }
 
 /**
- * TTL in ms for entries in the per-path mtime cache. After this much
- * time has elapsed since the last hit the entry is treated as stale
- * and the next range request goes out without `expectedMtime`. 30 s
- * is short enough that an idle scrubbing session doesn't pin
- * arbitrarily-old generations and long enough to cover the typical
- * "scrub a video for a minute" usage pattern. #171.
+ * Long enough to cover scrubbing a video for a minute, short enough that an
+ * idle session stops pinning an old generation. #171.
  */
 const MTIME_CACHE_TTL_MS = 30_000;
 
-/**
- * Maximum number of paths kept in the mtime cache. A small cap is
- * enough because the cache is sized to "currently-being-scrubbed
- * media files", which is one or two at a time in practice. When
- * full, the least-recently-used entry is evicted. #171.
- */
+/** Sized for the one or two media files being scrubbed at once; LRU beyond. */
 const MTIME_CACHE_MAX_ENTRIES = 64;
 
 interface MtimeCacheEntry {
@@ -92,17 +63,15 @@ interface MtimeCacheEntry {
 
 /**
  * Localhost HTTP server that serves binary vault assets to Obsidian's
- * webview so `<img>`, `<iframe>`, `<audio>`, etc. can render content
- * that lives on a remote host.
+ * webview, so `<img>`, `<iframe>` and `<audio>` can render content that
+ * lives on a remote host.
  *
- * The server binds to 127.0.0.1 on an OS-assigned random port. Every
- * URL embeds a token that's regenerated on each `start()` so a leaked
- * URL from a prior session can't replay against a new one.
+ * Binds 127.0.0.1 on an OS-assigned port. Every URL embeds a token
+ * regenerated on each `start()`, so a leaked URL from a past session cannot
+ * replay against a new one.
  *
- * The server is intentionally minimal: GET requests only, no Range,
- * full body in memory (the underlying readBinary already loads the
- * whole file). Phase 6-B can add streaming + Range when large PDFs
- * become a real pain point.
+ * GET only. `Range:` is served from a single `fs.readBinaryRange` RPC when
+ * one is wired, and otherwise by fetching the whole file and slicing.
  */
 export class ResourceBridge {
   private server: http.Server | null = null;
@@ -113,38 +82,26 @@ export class ResourceBridge {
   private fetchBinaryRange: FetchBinaryRangeFn | null = null;
 
   /**
-   * Per-path mtime cache for the range fast path (#171). The first
-   * range request for a path goes out without `expectedMtime` and
-   * caches the daemon's reported mtime; subsequent requests pin to
-   * that mtime so the daemon rejects (with `PreconditionFailed`)
-   * any slice from a newer file generation rather than silently
-   * returning a mismatched mid-stream chunk. On rejection the
-   * bridge drops the entry and re-issues without `expectedMtime`,
-   * caching the new mtime — so a mid-scrub edit takes one extra
-   * round-trip but never produces a corrupt response.
+   * Pins each path to one file generation for the range fast path (#171).
    *
-   * Bounded by {@link MTIME_CACHE_MAX_ENTRIES}; entries older than
-   * {@link MTIME_CACHE_TTL_MS} since their last hit are treated as
-   * stale on read. Cleared on `stop()`.
+   * The first request caches the daemon's mtime; later ones send it back as
+   * `expectedMtime`, so a slice from a NEWER generation is rejected instead of
+   * silently splicing into the stream. On rejection the entry is dropped and
+   * the read re-issued unpinned: a mid-scrub edit costs one round-trip and
+   * never a corrupt response.
+   *
+   * Bounded and TTL'd; cleared on `stop()`.
    */
   private mtimeCache = new Map<string, MtimeCacheEntry>();
 
   /**
-   * Start the HTTP server and return the chosen port + token. Calling
-   * `start` while already running is an error; `stop` first.
+   * Start the server and return its port and token. Starting one that is
+   * already running is an error — `stop` first.
    *
-   * `fetchThumbnail` is optional: when supplied, requests with a
-   * `?thumb=N` query string get served from the daemon's resize path;
-   * when omitted, the bridge falls back to `fetchBinary` for the same
-   * URL (so the webview's `<img>` still renders, just without the
-   * bandwidth + CPU savings).
-   *
-   * `fetchBinaryRange` is optional: when supplied, requests with a
-   * `Range:` header are served from a single `fs.readBinaryRange` RPC
-   * (= true partial read, no full-file allocation); when omitted, the
-   * bridge falls back to fetching the full file via `fetchBinary` and
-   * slicing post-hoc (the existing path; correct but bandwidth-
-   * expensive on >ReadCache-sized files like long videos and big PDFs).
+   * Both optional fetchers are fast paths, not requirements: without them a
+   * `?thumb=N` or `Range:` request is still answered from the full binary,
+   * correctly but at the cost of the whole file. See {@link FetchThumbnailFn}
+   * and {@link FetchBinaryRangeFn}.
    */
   async start(
     fetchBinary: FetchBinaryFn,
@@ -211,17 +168,12 @@ export class ResourceBridge {
   }
 
   /**
-   * URL Obsidian's webview should hit to retrieve `vaultPath`. The
-   * bridge must already be started; the path is the vault-canonical
-   * form (post `PathMapper.toVault`) — translation back to the
-   * per-client subtree is handled by the `fetchBinary` callback when
-   * it goes through `SftpDataAdapter.readBinary`.
+   * URL for the webview to fetch `vaultPath`. The bridge must be started, and
+   * the path is vault-canonical — mapping back into the per-client subtree
+   * happens inside the `fetchBinary` callback.
    *
-   * Pass `opts.thumbMaxDim` to ask for a daemon-resized thumbnail
-   * (longer side capped at that many pixels). The bridge serves the
-   * resized bytes if `fetchThumbnail` is wired and the daemon honours
-   * the request; otherwise it transparently falls back to the full
-   * binary so the webview still renders something.
+   * `opts.thumbMaxDim` asks for a resized image, falling back to the full
+   * binary so something always renders.
    */
   urlFor(vaultPath: string, opts?: { thumbMaxDim?: number }): string {
     if (!this.server || !this.token || this.port === null) {
@@ -426,11 +378,8 @@ export class ResourceBridge {
   }
 
   /**
-   * Read a non-stale entry from {@link mtimeCache}. A hit refreshes
-   * `lastUsed` so a continuously-scrubbed file doesn't TTL-expire.
-   * Returns `undefined` for misses and for entries older than
-   * {@link MTIME_CACHE_TTL_MS}; the stale entry is dropped on the
-   * spot so the next caller goes through the cache-miss path.
+   * A hit refreshes `lastUsed`, so a file being scrubbed does not TTL out.
+   * A stale entry is dropped on the spot rather than left to be re-checked.
    */
   private lookupMtime(vaultPath: string): number | undefined {
     const entry = this.mtimeCache.get(vaultPath);
@@ -444,20 +393,12 @@ export class ResourceBridge {
     return entry.mtime;
   }
 
-  /**
-   * Insert (or refresh) a path's mtime, then evict the
-   * least-recently-used entry if the map exceeds
-   * {@link MTIME_CACHE_MAX_ENTRIES}. The cache only sees range
-   * requests, so churn is naturally bounded; the eviction here is
-   * defensive against pathological access patterns.
-   */
+  /** Insert or refresh, evicting the LRU past {@link MTIME_CACHE_MAX_ENTRIES}. */
   private storeMtime(vaultPath: string, mtime: number): void {
     const now = Date.now();
-    // Map preserves insertion order; deleting + re-setting puts the
-    // entry at the back so the eviction sweep below picks the true
-    // LRU. Without the delete, an in-place update would leave the
-    // entry in its original slot and we'd evict a more-recently-used
-    // path next time the cap is hit.
+    // Map keeps insertion order, so delete-then-set moves the entry to the
+    // back. An in-place update would leave it where it was and the sweep
+    // below would evict a more recently used path.
     this.mtimeCache.delete(vaultPath);
     this.mtimeCache.set(vaultPath, { mtime, lastUsed: now });
     if (this.mtimeCache.size > MTIME_CACHE_MAX_ENTRIES) {
@@ -468,24 +409,13 @@ export class ResourceBridge {
 }
 
 /**
- * Parse an HTTP `Range:` header against a known total resource size.
- * Pure function so the rules can be unit-tested without spinning up
- * a server.
+ * Parse a `Range:` header against a known total size. Pure, so the rules are
+ * testable without a server.
  *
- * Returns:
- *   - `'invalid'` for syntactically broken or out-of-range requests
- *     (caller should reply 416 with `Content-Range: bytes *\/total`)
- *   - `{start, end}` for a satisfiable single-range request (caller
- *     should reply 206 with `Content-Range: bytes start-end/total`)
- *
- * Multi-range (`bytes=0-50,100-150`) is intentionally rejected as
- * invalid — the webview only ever asks for one range at a time, and
- * supporting multipart/byteranges is a much bigger change.
- *
- * Forms understood (mirroring RFC 7233):
- *   - `bytes=N-M`      — explicit start and end (inclusive)
- *   - `bytes=N-`       — from N to the end of the resource
- *   - `bytes=-N`       — last N bytes (a "suffix" range)
+ * `'invalid'` means reply 416; `{start, end}` means reply 206. RFC 7233 forms
+ * `bytes=N-M`, `bytes=N-` and `bytes=-N` are understood. Multi-range is
+ * rejected on purpose: the webview asks for one at a time, and
+ * multipart/byteranges is a much larger change.
  */
 export function parseRangeHeader(
   headerValue: string,
@@ -521,22 +451,13 @@ export function parseRangeHeader(
 }
 
 /**
- * Parse a `Range:` header WITHOUT knowing the resource's total size,
- * for the {@link FetchBinaryRangeFn} fast path (#134) that fetches
- * the slice in a single round-trip and learns the total from the
- * daemon's response.
+ * The same, WITHOUT knowing the total — for the fast path (#134) that learns
+ * it from the daemon's reply.
  *
- * Only the **explicit** form `bytes=N-M` is handled — the only
- * widely-used shape that doesn't require advance knowledge of the
- * resource size. `bytes=N-` (open-ended) needs total to compute
- * `end`, and `bytes=-N` (suffix) needs total to compute `start`;
- * both forms return `null` so the caller can fall back to the
- * full-file path that has total in hand.
- *
- * Returns `null` for non-explicit forms or syntax errors; returns
- * `{ start, length }` for an explicit `bytes=N-M`. Length is `M-N+1`
- * (inclusive end). The daemon clamps past-EOF reads, so callers do
- * not need to bound `length` against any local size estimate.
+ * Only `bytes=N-M` can be answered that way: `bytes=N-` needs the total for
+ * `end` and `bytes=-N` needs it for `start`, so both return `null` and the
+ * caller takes the full-file path, which has it. The daemon clamps past EOF,
+ * so `length` needs no local bound.
  */
 export function parseExplicitByteRange(
   headerValue: string,
