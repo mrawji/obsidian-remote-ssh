@@ -56,6 +56,7 @@ import {
   readEnabledPluginIds,
 } from './shadow/CommunityPluginsSync';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
+import { syncConfigAfterConnect } from './shadow/postConnectConfigSync';
 import { ShadowVaultManager } from './shadow/ShadowVaultManager';
 import { WindowSpawner } from './shadow/WindowSpawner';
 import { ShadowStartupCoordinator } from './shadow/ShadowStartupCoordinator';
@@ -642,143 +643,23 @@ export default class RemoteSshPlugin extends Plugin {
       return;
     }
 
-    // Pull this device's Obsidian config (app.json / appearance.json /
-    // core-plugins.json / hotkeys.json — now per-client via PathMapper)
-    // from the remote onto the local shadow disk *before* the populate, so
-    // the next time this window restarts Obsidian reads fresh settings
-    // instead of the stale local copy (#342). Best-effort: a failure here
-    // must not block rendering the vault.
     const da = this.adapterMgr.dataAdapter;
     const hostAdapter = this.app.vault.adapter;
     if (da && hostAdapter instanceof FileSystemAdapter) {
-      const localConfigDir = path.join(
-        hostAdapter.getBasePath(), this.app.vault.configDir,
-      );
-      const remoteConfigDir = this.app.vault.configDir;
-      try {
-        const cfg = await pullSharedObsidianConfig(
-          da, remoteConfigDir, localConfigDir,
-        );
-        if (cfg.errored.length > 0) {
-          // The connection is up but some shared-config files the
-          // remote *had* couldn't be pulled (transient SSH error /
-          // corrupt file). Without a signal the user would just see
-          // settings silently not update — the #342 symptom. Absent
-          // files are not errored, so a fresh vault stays quiet.
-          new Notice(
-            `Remote SSH: ${cfg.errored.length} config file` +
-            `${cfg.errored.length === 1 ? '' : 's'} (${cfg.errored.join(', ')}) ` +
-            'could not be synced — settings may be stale until the next connect',
-          );
-        }
-      } catch (e) {
-        logger.warn(
-          `runAutoConnect(${tag}): shared-config pull failed: ${errorMessage(e)}`,
-        );
-      }
-
-      // #429 / #342 residual: round-trip the enabled community-plugins
-      // list. Pull first so plugins set up on the remote load in the
-      // shadow vault (the marketplace installer then fetches any missing
-      // binaries); then push the converged result so a plugin enabled —
-      // or UNINSTALLED — only here reaches the remote for other machines.
-      // Kept out of the verbatim shared-config set because `remote-ssh`
-      // must be force-preserved through the merge (a verbatim copy of a
-      // remote list omitting it would disable this very plugin).
-      //
-      // Both halves take this device's BASE snapshot: the converged list
-      // as of the last successful round-trip HERE. It is what turns the
-      // old monotonic union into a real 3-way merge, so a local uninstall
-      // propagates instead of being resurrected by the next pull. The
-      // pull only reads it; the push commits it once both sides agree.
-      const cpBasePath = communityPluginsBasePath(
-        shadowStateRoot(), profile.id,
-      );
-      try {
-        await pullCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
-        await pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
-      } catch (e) {
-        logger.warn(
-          `runAutoConnect(${tag}): community-plugins round-trip failed: ${errorMessage(e)}`,
-        );
-      }
-
-      // #429b: the startup installer (prepareForAutoConnect) ran BEFORE
-      // the pull above — and not at all on a reconnect — so a plugin the
-      // pull just added to community-plugins.json has no binary staged yet
-      // and won't load. Re-run the marketplace installer now the list is
-      // current; `enablePluginAndSave` loads a marketplace plugin live, no
-      // restart. Idempotent (already-installed ids are skipped). BRAT /
-      // non-marketplace plugins still need their binary on the remote.
-      try {
-        await new ShadowStartupCoordinator(this.app, this.settings, () => this.saveSettings())
-          .installMissingShadowPlugins();
-      } catch (e) {
-        logger.warn(`runAutoConnect(${tag}): post-pull plugin install failed: ${errorMessage(e)}`);
-      }
-
-      // #429b binary round-trip: the marketplace installer above can't
-      // fetch a BRAT / sideloaded plugin (it isn't on the registry). Run
-      // AFTER the installer so the plugins it just fetched are on disk —
-      // the pull then only stages what's STILL missing (the non-market
-      // ones), which keeps the installer's live load intact and also
-      // acts as a fallback if a marketplace fetch failed. The push makes
-      // the remote `.obsidian/plugins/` a complete vault so every machine
-      // can pull. A pulled binary loads on the next vault open (Obsidian
-      // scans the plugins dir at startup).
-      try {
-        const enabledIds = readEnabledPluginIds(localConfigDir);
-        await pullPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
-        await pushPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
-      } catch (e) {
-        logger.warn(`runAutoConnect(${tag}): plugin-binary round-trip failed: ${errorMessage(e)}`);
-      }
-
-      // #342 push half: pull only brought remote→local. Without this,
-      // a settings change made HERE never reaches the remote, so the
-      // next session's pull finds nothing and the change evaporates.
-      // Watch the local config dir and push divergent shared files.
+      const localConfigDir = path.join(hostAdapter.getBasePath(), this.app.vault.configDir);
       this.sharedConfigWatcher?.stop();
-      const watcher = new SharedConfigWatcher({
-        watch: (onChange) => {
-          const w = fs.watch(
-            localConfigDir, { persistent: false },
-            (_evt, filename) => onChange(filename ? String(filename) : null),
-          );
-          return { close: () => w.close() };
-        },
-        readLocal: (b) => {
-          try { return fs.readFileSync(path.join(localConfigDir, b), 'utf-8'); }
-          catch { return null; }
-        },
-        flush: async () => {
-          const r = await pushSharedObsidianConfig(
-            da, remoteConfigDir, localConfigDir,
-          );
-          if (r.errored.length > 0) {
-            new Notice(
-              `Remote SSH: ${r.errored.length} config file` +
-              `${r.errored.length === 1 ? '' : 's'} (${r.errored.join(', ')}) ` +
-              'could not be pushed — settings change not yet saved remotely',
-            );
-          }
-        },
-        debounceMs: 1500,
-        setTimer: (cb, ms) => window.setTimeout(cb, ms),
-        clearTimer: (h) => window.clearTimeout(h as number),
+      this.sharedConfigWatcher = await syncConfigAfterConnect({
+        adapter: da,
+        remoteConfigDir: this.app.vault.configDir,
+        localConfigDir,
+        stateRoot: shadowStateRoot(),
+        profileId: profile.id,
+        installMissingPlugins: () =>
+          new ShadowStartupCoordinator(this.app, this.settings, () => this.saveSettings())
+            .installMissingShadowPlugins(),
+        notify: (m) => { new Notice(m); },
+        tag,
       });
-      // Seed the just-pulled bytes as the synced baseline so the
-      // pull's own writes (and Obsidian re-saving an identical file
-      // on open) don't immediately echo back to the remote.
-      for (const base of SHARED_OBSIDIAN_CONFIG_FILES) {
-        try {
-          watcher.markSynced(
-            base, fs.readFileSync(path.join(localConfigDir, base), 'utf-8'),
-          );
-        } catch { /* absent locally — nothing to baseline */ }
-      }
-      watcher.start();
-      this.sharedConfigWatcher = watcher;
     }
 
     // Adapter is patched; build the file model so File Explorer
