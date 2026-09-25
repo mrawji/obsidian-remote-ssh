@@ -785,7 +785,7 @@ describe('ShadowVaultBootstrap: installPlugin symlink fallback', () => {
 
 // ─── pullSharedObsidianConfig (#342 shared-config round-trip) ─────────────────
 
-describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
+describe('pullSharedObsidianConfig', () => {
   let localConfigDir: string;
 
   beforeEach(() => {
@@ -888,7 +888,7 @@ describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
 
 // ─── pushSharedObsidianConfig (#342 round-trip: local → remote) ───────────────
 
-describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
+describe('pushSharedObsidianConfig', () => {
   let localConfigDir: string;
 
   beforeEach(() => {

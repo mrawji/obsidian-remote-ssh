@@ -7,24 +7,18 @@ import type { SharedConfigReader, SharedConfigWriter } from './SharedObsidianCon
 
 // ─── community-plugins list round-trip (#429 / #342 / uninstall) ─────────
 //
-// `community-plugins.json` is the *enabled community plugins* list.
-// It deliberately does NOT join SHARED_OBSIDIAN_CONFIG_FILES (whose
-// pull/push copy bytes verbatim): a remote list that omitted
-// `remote-ssh` would, written verbatim, disable the very plugin doing
-// the sync. Instead these two methods round-trip the list so a plugin
-// enabled on one machine reaches another machine's shadow vault and
-// reopening no longer "loses" installed plugins. The marketplace
-// installer re-fetches any binaries the list names but that aren't
-// staged locally yet.
+// `community-plugins.json` is the *enabled community plugins* list. It is
+// round-tripped rather than copied verbatim like the shared-config files:
+// a remote list that omitted `remote-ssh` would, written as-is, disable the
+// very plugin doing the sync. The marketplace installer re-fetches any
+// binaries the merged list names but that aren't staged locally yet.
 //
-// Convergence is a 3-WAY MERGE against a per-device BASE snapshot, not
-// a union. The union was MONOTONIC — the list could only ever GROW —
-// so an uninstall on one device never reached the remote, and the next
-// connect's pull RESURRECTED the plugin locally: a fleet-wide uninstall
-// was impossible. A union cannot tell "I never had it" from "I removed
-// it"; only a base can. The base is the converged list as it stood at
-// the END of the last successful round-trip ON THIS DEVICE (see
-// {@link communityPluginsBasePath} for where it lives and why).
+// Convergence is a 3-WAY MERGE against a per-device BASE — the converged
+// list as it stood at the END of the last successful round-trip ON THIS
+// DEVICE ({@link communityPluginsBasePath}). Not a union: a union is
+// monotonic, so an uninstall never reached the remote and the next pull
+// RESURRECTED the plugin. A union cannot tell "I never had it" from "I
+// removed it"; only a base can.
 //
 //     added   = local  \ base   -> add to remote
 //     removed = base   \ local  -> remove from remote
@@ -34,29 +28,21 @@ import type { SharedConfigReader, SharedConfigWriter } from './SharedObsidianCon
 // Rules, all encoded in {@link mergePluginIds}:
 //
 //  - `remote-ssh` (SELF_PLUGIN_ID) is NEVER removable from either side.
-//  - NO BASE YET (first run, or a shadow vault that was deleted and
-//    re-bootstrapped): a removal is indistinguishable from never-had,
-//    so we fall back to the old UNION. Safe — nothing is lost; removals
-//    simply don't propagate until a base exists, which the first
-//    successful push then writes.
-//  - A device that was OFFLINE while another device removed a plugin
-//    has a stale base, so `base \ remote` sees the removal and drops it
-//    locally. Correct — that is the whole point of the base.
-//  - TIE-BREAK — concurrent ADD on A vs REMOVE on B: **ADD WINS**. It
-//    falls out of the definition: an id in neither the base nor either
-//    side's removal set (`base \ local`, `base \ remote`) is by
-//    definition an addition, and additions are unioned in. Rationale:
-//    re-uninstalling a plugin someone else re-installed is one click;
-//    silently losing a plugin you just installed is invisible data loss.
+//  - NO BASE YET (first run, or a re-bootstrapped shadow vault): a removal
+//    is indistinguishable from never-had, so fall back to the union.
+//    Nothing is lost; removals just don't propagate until the first
+//    successful push writes a base.
+//  - TIE-BREAK — concurrent ADD on A vs REMOVE on B: **ADD WINS**, which
+//    falls out of the definitions above. Re-uninstalling a plugin someone
+//    else re-installed is one click; silently losing one you just
+//    installed is invisible data loss.
 //
-// The base is committed by the PUSH only, once BOTH sides hold the
-// converged list. `pullCommunityPlugins` deliberately never writes it:
-// a pull-only caller (`preSpawnPull`) would otherwise record the pulled
-// list as the base, and the push later in the real connect would then
-// read `base \ remote` as a *remote removal* of everything this device
-// had locally added — deleting the user's own additions. Never writing
-// the base on pull also keeps the merge idempotent (a second pull over
-// the same base+remote recomputes the same list), so the
+// Only the PUSH commits the base, once both sides hold the converged list.
+// `pullCommunityPlugins` must never write it: a pull-only caller
+// (`preSpawnPull`) would record the pulled list as the base, and the push
+// later in the real connect would then read `base \ remote` as a remote
+// removal of everything this device had added locally — deleting the
+// user's own plugins. It also keeps the merge idempotent, so the
 // pre-spawn-pull → connect-pull → connect-push sequence cannot
 // double-apply a removal.
 
@@ -64,28 +50,18 @@ import type { SharedConfigReader, SharedConfigWriter } from './SharedObsidianCon
 export const SELF_PLUGIN_ID = 'remote-ssh';
 
 /**
- * Absolute path to THIS DEVICE's base snapshot of the enabled-plugin
- * list for `profileId`:
+ * THIS DEVICE's base snapshot of the enabled-plugin list for `profileId`:
  *
  *   <stateRoot>/state/<profile-id>/community-plugins.base.json
  *
- * i.e. `~/.obsidian-remote/state/<id>/…`, a SIBLING of the shadow
- * `vaults/` dir — deliberately outside every vault:
- *
- *  - It must be PER-DEVICE and must NOT sync. A base that synced would
- *    record another machine's view and removals would ping-pong.
- *  - It must not live under a vault's `<configDir>/`: everything there
- *    is write-through-mirrored to the remote by
- *    `SftpDataAdapter.writeThroughConfig`, and `PathMapper` redirects
- *    the four core config files (plus `plugins/&lowast;/data.json`) per
- *    device. A new file there would either be shared (wrong) or entangle
- *    with that machinery.
- *  - Outside the vault root entirely also keeps it invisible to Obsidian
- *    and out of the populate.
- *
- * NOT under `vaults/` itself: `findShadowByProfileId` enumerates that
- * dir looking for shadow vaults, and `uniqueVaultDir` could collide with
- * a profile literally named "state".
+ * A sibling of the shadow `vaults/` dir, deliberately outside every vault.
+ * It must be per-device and must not sync — a base that synced would record
+ * another machine's view and removals would ping-pong. Under a vault's
+ * `<configDir>/` it would be write-through-mirrored to the remote by
+ * `SftpDataAdapter.writeThroughConfig` and redirected by `PathMapper`;
+ * outside the vault root it is also invisible to Obsidian and out of the
+ * populate. Not under `vaults/` either: `findShadowByProfileId` enumerates
+ * that dir, and `uniqueVaultDir` could collide with a profile named "state".
  */
 export function communityPluginsBasePath(stateRoot: string, profileId: string): string {
   return path.join(

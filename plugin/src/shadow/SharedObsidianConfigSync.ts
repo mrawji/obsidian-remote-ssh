@@ -28,21 +28,17 @@ export interface SharedConfigWriter {
 // ─── shared-config round-trip (#342) ────────────────────────────────────
 
 /**
- * Obsidian config files this vault round-trips to the remote so a
- * settings change survives a shadow-window restart (#342: without the
- * pull half, the next startup read a stale local copy and settings
- * appeared to evaporate).
+ * Obsidian config files this vault round-trips to the remote so a settings
+ * change survives a shadow-window restart (#342: without the pull half, the
+ * next startup read a stale local copy and settings appeared to evaporate).
  *
- * These are now **per-device**, not shared: `PathMapper` redirects each
- * basename into this client's `<configDir>/user/<client-id>/` subtree
- * (they were added to `DEFAULT_PRIVATE_PATTERN_BASENAMES`). So the
- * round-trip below reads/writes THIS device's own copy — giving each
- * machine a remote backup + cross-session persistence without two
- * devices ever colliding on one shared `<configDir>/app.json` (the
- * perpetual write-conflict this round-trip used to cause). The name is
- * kept for back-compat; "shared" is historical.
+ * "Shared" is historical — these are **per-device**. `PathMapper` redirects
+ * each basename into this client's `<configDir>/user/<client-id>/` subtree,
+ * so the round-trip reads and writes THIS device's copy: a remote backup
+ * per machine, without two of them colliding on one `<configDir>/app.json`
+ * (the perpetual write-conflict this round-trip used to cause).
  *
- * `workspace.json` is deliberately NOT here — it's per-client UI state
+ * `workspace.json` is deliberately NOT here — per-client UI state that
  * `PathMapper` already redirects AND that Obsidian rewrites constantly.
  */
 export const SHARED_OBSIDIAN_CONFIG_FILES = [
@@ -53,31 +49,23 @@ export const SHARED_OBSIDIAN_CONFIG_FILES = [
 ] as const satisfies readonly string[];
 
 /**
- * Pull the shared-config allowlist from the remote into the local
- * shadow vault's config dir, closing the #342 round-trip gap.
+ * Pull the allowlist from the remote into the local shadow vault's config
+ * dir, closing the #342 round-trip gap.
  *
- * The remote bytes are written **verbatim** (no re-serialise, so
- * key order / formatting survive), but only after `JSON.parse`
- * confirms they're well-formed: a truncated or half-written remote
- * file must not clobber a healthy local copy and leave Obsidian
- * unable to read its own settings on next start (which is the very
- * #342 symptom this method exists to fix). The write is atomic
- * (tmp + rename) so an interrupted pull can't tear the local file.
+ * Remote bytes are written **verbatim** (key order and formatting survive)
+ * but only after `JSON.parse` confirms they are well-formed, and atomically
+ * (tmp + rename): a truncated remote file, or an interrupted pull, must not
+ * leave Obsidian unable to read its own settings on the next start — which
+ * is the #342 symptom itself.
  *
- * The result distinguishes two kinds of non-pull:
- *  - `skipped`: every basename not pulled (absent OR errored) — the
- *    superset, kept for back-compat / logging.
- *  - `errored`: the subset where the remote *had* the file but it
- *    couldn't be pulled (read/exists threw, corrupt JSON, write or
- *    rename failed). A file absent on the remote is NOT errored (a
- *    fresh remote vault legitimately has none yet). The connect flow
- *    surfaces a Notice when `errored` is non-empty so a transient
- *    SSH hiccup doesn't silently leave settings stale — the #342
- *    symptom this method exists to prevent.
- *
- * Static because both call sites (the connect flow in `main.ts`
- * and the Layer-2 test helper) have a reader + paths but not
- * necessarily a constructed `ShadowVaultBootstrap` to hand.
+ * Two kinds of non-pull:
+ *  - `skipped`: every basename not pulled, absent OR errored — the superset,
+ *    kept for back-compat and logging.
+ *  - `errored`: the remote HAD the file but it could not be pulled (read or
+ *    exists threw, corrupt JSON, write or rename failed). Absent on the
+ *    remote is not an error — a fresh remote vault legitimately has none.
+ *    The connect flow raises a Notice on a non-empty `errored`, so a
+ *    transient SSH hiccup does not silently leave settings stale.
  */
 export async function pullSharedObsidianConfig(
   reader: SharedConfigReader,
@@ -148,21 +136,14 @@ export async function pullSharedObsidianConfig(
 }
 
 /**
- * Push the local shadow vault's shared-config files to the remote —
- * the other half of the #342 round-trip. Without this, a settings
- * change made in the shadow window only ever lives on the local
- * shadow disk: the next session's `pullSharedObsidianConfig` finds
- * nothing new on the remote and the change "evaporates".
+ * The other half of the #342 round-trip. Without it a settings change made
+ * in the shadow window only ever lives on local disk: the next session's
+ * `pullSharedObsidianConfig` finds nothing new and the change "evaporates".
  *
- * Symmetric with the pull: each local file is `JSON.parse`-validated
- * before it is sent, so a half-written local file (Obsidian saving
- * mid-flush) never clobbers a healthy remote copy. Absent local
- * files are skipped (not an error — a fresh vault legitimately has
- * none yet); a remote write that throws is `errored` so the caller
- * can surface it instead of silently losing settings again.
- *
- * Static for the same reason as the pull: callers have a writer +
- * paths but not necessarily a constructed instance.
+ * Symmetric with the pull — each local file is `JSON.parse`-validated before
+ * it is sent, so a half-written one (Obsidian saving mid-flush) never
+ * clobbers a healthy remote copy. Absent locally is skipped, not an error; a
+ * remote write that throws is `errored` for the caller to surface.
  */
 export async function pushSharedObsidianConfig(
   writer: SharedConfigWriter,

@@ -19,7 +19,7 @@ import type { TestClient } from './makeAdapter';
  * whose remote already carries `<configDir>/app.json` (etc.), the
  * local file must equal the remote.
  *
- * The remote-pull step is `ShadowVaultBootstrap.pullSharedObsidianConfig`
+ * The remote-pull step is `pullSharedObsidianConfig`
  * (#342 fix): `bootstrap()` itself is still purely-local, so this
  * helper runs the pull right after it — the same sequence the
  * production connect flow uses (`runAutoConnect` → pull → populate).

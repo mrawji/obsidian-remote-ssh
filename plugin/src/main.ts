@@ -88,7 +88,7 @@ const DAEMON_RELEASE_REPO = 'sotashimozono/obsidian-remote-ssh';
  * Everything this plugin keeps OUTSIDE any vault, on every OS:
  * `~/.obsidian-remote/` — the shadow `vaults/` themselves, plus the
  * per-device, never-synced `state/` (the community-plugins base
- * snapshots; see `ShadowVaultBootstrap.communityPluginsBasePath`).
+ * snapshots; see `communityPluginsBasePath` in CommunityPluginsSync).
  * `os.homedir()` resolves at runtime — no hardcoded user.
  */
 const shadowStateRoot = (): string => path.join(os.homedir(), '.obsidian-remote');

@@ -103,7 +103,7 @@ export class ShadowVaultBootstrap {
      * Root of this device's never-synced sync state (e.g.
      * `~/.obsidian-remote/`), parent of the `state/` dir that holds the
      * community-plugins base snapshots — see
-     * {@link ShadowVaultBootstrap.communityPluginsBasePath}. Defaults to
+     * {@link communityPluginsBasePath}. Defaults to
      * `baseDir`'s parent, which is exactly that on every real call site.
      */
     private readonly stateRoot: string = path.dirname(baseDir),
