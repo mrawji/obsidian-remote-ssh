@@ -149,6 +149,14 @@ services:
     environment:
       ORSSH_TEST_ENV: tailnet
       ORSSH_SOCKS5: ts-client:1055
+      # The repo is bind-mounted from the host, so on a CI runner its files
+      # belong to uid 1001 while this container is root. Git refuses to read
+      # a tree it considers someone else's, `go build` cannot stamp the
+      # revision, and the daemon build exits 1 before Playwright ever starts.
+      # Docker Desktop hides this by remapping ownership, so it reproduces
+      # only in CI — which is where this job has failed every time it ran.
+      # A test binary has no use for a VCS stamp.
+      GOFLAGS: -buildvcs=false
     volumes:
       - .:/work
       # Over the mount: a macOS `node_modules` is the wrong platform's, and
