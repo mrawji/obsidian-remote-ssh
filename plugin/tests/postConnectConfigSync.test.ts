@@ -38,7 +38,10 @@ vi.mock('../src/shadow/CommunityPluginsSync', () => ({
   readEnabledPluginIds: () => ['remote-ssh'],
 }));
 
-import { syncConfigAfterConnect, watcherPorts, type ConfigSyncPorts } from '../src/shadow/postConnectConfigSync';
+import {
+  syncConfigAfterConnect, watcherPorts, watchedName, watchListener, openConfigWatch,
+  type ConfigSyncPorts,
+} from '../src/shadow/postConnectConfigSync';
 import type { SharedConfigWatcher } from '../src/shadow/SharedConfigWatcher';
 
 /** A watcher that only records what was done to it, and in what order. */
@@ -178,6 +181,7 @@ describe('syncConfigAfterConnect — every step is best-effort', () => {
   });
 });
 
+
 describe('watcherPorts — how the real watcher reaches disk and remote', () => {
   it('reads a local config file', () => {
     fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{"theme":"obsidian"}');
@@ -217,11 +221,6 @@ describe('watcherPorts — how the real watcher reaches disk and remote', () => 
     expect(notices).toEqual([]);
   });
 
-  it('hands back a handle that closes the fs watch', () => {
-    const handle = watcherPorts(ports()).watch(() => { /* not asserted here */ });
-
-    expect(() => handle.close()).not.toThrow();
-  });
 });
 
 describe('syncConfigAfterConnect — the remaining edges', () => {
@@ -235,16 +234,6 @@ describe('syncConfigAfterConnect — the remaining edges', () => {
     expect(calls).toContain('watcher.start');
   });
 
-  it('builds the real watcher when no factory is supplied', async () => {
-    // The production path. Everything else here replaces it.
-    const p = ports();
-    delete (p as { makeWatcher?: unknown }).makeWatcher;
-
-    const w = await syncConfigAfterConnect(p);
-
-    expect(w).toBeTruthy();
-    w.stop();
-  });
 
   it('says "file" for one and "files" for several', async () => {
     pullShared.mockImplementation(record('pullShared', {
@@ -262,31 +251,83 @@ describe('syncConfigAfterConnect — the remaining edges', () => {
   });
 });
 
-describe('watcherPorts — the fs.watch callback', () => {
-  it('passes a changed filename through, and a missing one as null', async () => {
-    // `fs.watch` does not always hand over a filename; the watcher has to be
-    // told "something changed, I don't know what" rather than get `undefined`.
-    const seen: (string | null)[] = [];
-    const handle = watcherPorts(ports()).watch((f) => { seen.push(f); });
-    try {
-      fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{"changed":true}');
-      // fs.watch is asynchronous and platform-timed; give it a moment.
-      await new Promise((r) => setTimeout(r, 300));
-    } finally {
-      handle.close();
-    }
+describe('watchedName — what fs.watch reported', () => {
+  // The only decision in that callback, lifted out so it runs on every
+  // platform. A unit suite has no business opening a native watch handle:
+  // doing so killed the vitest worker on windows-latest outright (exit
+  // 3221226505), taking every assertion in this file with it. Real watching
+  // belongs to the E2E suite.
 
-    // Some platforms coalesce or drop events, so the assertion is about the
-    // SHAPE of what arrives, not that anything must.
-    for (const f of seen) expect(f === null || typeof f === 'string').toBe(true);
+  it('passes a reported basename through', () => {
+    expect(watchedName('app.json')).toBe('app.json');
   });
 
-  it('drives its timers through the window clock', () => {
-    const p = watcherPorts(ports());
-    let fired = false;
-    const h = p.setTimer(() => { fired = true; }, 10_000);
-    p.clearTimer(h);
+  it('reports "something changed, unknown what" when the platform gives no name', () => {
+    // `SharedConfigWatcher` treats null as "consider every shared file".
+    // `undefined` passed through would look like a basename of "undefined"
+    // and match none of them, so a real edit would never be pushed.
+    expect(watchedName(undefined)).toBeNull();
+    expect(watchedName(null)).toBeNull();
+    expect(watchedName('')).toBeNull();
+  });
 
-    expect(fired).toBe(false);
+  it('accepts the Buffer form the API can hand back', () => {
+    expect(watchedName(Buffer.from('hotkeys.json'))).toBe('hotkeys.json');
+  });
+
+  it('ignores which kind of event fs.watch reported', () => {
+    // `rename` and `change` both mean "look at this file again";
+    // SharedConfigWatcher decides by comparing content, not by the kind.
+    const seen: Array<string | null> = [];
+    const listen = watchListener((n) => seen.push(n));
+
+    listen('rename', 'app.json');
+    listen('change', 'app.json');
+    listen('change', undefined as unknown as null);
+
+    expect(seen).toEqual(['app.json', 'app.json', null]);
+  });
+});
+
+describe('openConfigWatch', () => {
+  /** Stands in for `fs.watch` so no native handle is opened. */
+  function fakeOpen() {
+    const close = vi.fn();
+    const calls: Array<{ dir: string; listener: (e: string, f: unknown) => void }> = [];
+    const open = ((dir: string, _opts: unknown, listener: (e: string, f: unknown) => void) => {
+      calls.push({ dir, listener });
+      return { close };
+    }) as unknown as typeof import('node:fs').watch;
+    return { open, calls, close };
+  }
+
+  it('watches the local config dir', () => {
+    const { open, calls } = fakeOpen();
+
+    openConfigWatch('/shadow/.obsidian', () => { /* unused */ }, open);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].dir).toBe('/shadow/.obsidian');
+  });
+
+  it('closes the watcher it opened', () => {
+    // `SharedConfigWatcher.stop()` calls through this. A closer that did
+    // nothing would leak one OS watch handle per connect.
+    const { open, close } = fakeOpen();
+
+    openConfigWatch('/shadow/.obsidian', () => { /* unused */ }, open).close();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers normalised names to the caller', () => {
+    const { open, calls } = fakeOpen();
+    const seen: Array<string | null> = [];
+
+    openConfigWatch('/shadow/.obsidian', (n) => seen.push(n), open);
+    calls[0].listener('change', 'app.json');
+    calls[0].listener('rename', undefined);
+
+    expect(seen).toEqual(['app.json', null]);
   });
 });
