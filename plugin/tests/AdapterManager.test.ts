@@ -1,4 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
+import type { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
+import type { PathMapper } from '../src/path/PathMapper';
 import { AdapterManager, PATCHED_METHODS } from '../src/adapter/AdapterManager';
 import type { App, PluginManifest } from 'obsidian';
 import type { ConnectionManager } from '../src/ConnectionManager';
@@ -155,5 +157,170 @@ describe('AdapterManager.restore()', () => {
     const { mgr } = makeManager({ transferTracker: { clear: clearSpy } });
     mgr.restore();
     expect(clearSpy).toHaveBeenCalledOnce();
+  });
+});
+
+// ─── the pieces patch() is built from ────────────────────────────────────────
+//
+// `patch()` itself needs a real vault, a live transport and a bound port, so
+// nothing had ever executed it — the helper above says as much. These three
+// steps were lifted out of it precisely so they could be reached, in the same
+// way `wireKeyboardInteractiveHandler` was lifted out of `SftpClient.connect`.
+
+/** Reach a private method without widening the class's surface. */
+function priv<T>(mgr: unknown, name: string): T {
+  return (mgr as unknown as Record<string, T>)[name];
+}
+
+describe('AdapterManager.ensureOfflineQueue()', () => {
+  function withQueue(mgr: unknown, queue: unknown, calls: { n: number }) {
+    (mgr as Record<string, unknown>).openOfflineQueue = () => {
+      calls.n++;
+      return Promise.resolve(queue);
+    };
+  }
+
+  it('opens the queue once and reuses it', async () => {
+    // Reused across patches on purpose: re-opening would replay a queue that
+    // has already been drained.
+    const { mgr } = makeManager();
+    const calls = { n: 0 };
+    withQueue(mgr, { stats: () => ({ entries: 0, bytes: 0 }), pending: () => [] }, calls);
+
+    await priv<() => Promise<void>>(mgr, 'ensureOfflineQueue').call(mgr);
+    await priv<() => Promise<void>>(mgr, 'ensureOfflineQueue').call(mgr);
+
+    expect(calls.n).toBe(1);
+  });
+
+  it('points the status bar at the queue it just opened', async () => {
+    const startPolling = vi.fn();
+    const mgr = new AdapterManager(
+      {} as App,
+      { id: 'remote-ssh' } as unknown as PluginManifest,
+      { rpcConnection: null, activeRemoteBasePath: null } as unknown as ConnectionManager,
+      { subscribe: vi.fn(), unsubscribe: vi.fn() } as unknown as FsChangeListener,
+      { startPolling } as unknown as PendingEditsBar,
+      () => ({}) as unknown as PluginSettings,
+      null,
+    );
+    withQueue(mgr, {
+      stats: () => ({ entries: 2, bytes: 10 }),
+      pending: () => [{}, {}, {}],
+    }, { n: 0 });
+
+    await priv<() => Promise<void>>(mgr, 'ensureOfflineQueue').call(mgr);
+
+    expect(startPolling).toHaveBeenCalledTimes(1);
+    // The bar must read the live queue, not a count captured at wiring time.
+    const read = startPolling.mock.calls[0][0] as () => number;
+    expect(read()).toBe(3);
+  });
+
+  it('survives a queue that will not open, leaving offline writes to throw', async () => {
+    // Louder than pretending: with no queue, an offline write raises instead
+    // of being accepted and silently lost.
+    const { mgr } = makeManager();
+    (mgr as unknown as Record<string, unknown>).openOfflineQueue =
+      () => Promise.reject(new Error('disk is full'));
+
+    await expect(priv<() => Promise<void>>(mgr, 'ensureOfflineQueue').call(mgr))
+      .resolves.toBeUndefined();
+    expect((mgr as unknown as { offlineQueue: unknown }).offlineQueue).toBeNull();
+  });
+});
+
+describe('AdapterManager.wireLiveUpdates()', () => {
+  function fakeAdapter() {
+    return {
+      setWriterReflector: vi.fn(),
+      setLocalOpRegistry: vi.fn(),
+    } as unknown as SftpDataAdapter & {
+      setWriterReflector: ReturnType<typeof vi.fn>;
+      setLocalOpRegistry: ReturnType<typeof vi.fn>;
+    };
+  }
+  const mapper = {} as PathMapper;
+
+  it('wires the reflector so a write shows up without waiting for an echo', () => {
+    const { mgr } = makeManager();
+    const adapter = fakeAdapter();
+
+    priv<(a: unknown, m: unknown) => void>(mgr, 'wireLiveUpdates').call(mgr, adapter, mapper);
+
+    expect(adapter.setWriterReflector).toHaveBeenCalledTimes(1);
+    expect(adapter.setLocalOpRegistry).toHaveBeenCalledTimes(1);
+  });
+
+  it('subscribes to fs changes only when the session is RPC', () => {
+    // SFTP has no notification channel, so there is nothing to subscribe to.
+    const subscribe = vi.fn();
+    const mgr = new AdapterManager(
+      {} as App,
+      { id: 'remote-ssh' } as unknown as PluginManifest,
+      { rpcConnection: null, activeRemoteBasePath: null } as unknown as ConnectionManager,
+      { subscribe, unsubscribe: vi.fn() } as unknown as FsChangeListener,
+      { startPolling: vi.fn() } as unknown as PendingEditsBar,
+      () => ({}) as unknown as PluginSettings,
+      null,
+    );
+
+    priv<(a: unknown, m: unknown) => void>(mgr, 'wireLiveUpdates').call(mgr, fakeAdapter(), mapper);
+
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it('gives the adapter and the listener the SAME registry', () => {
+    // The whole echo-drop rests on this identity. Two registries and the
+    // daemon's echo of our own write would no longer match anything the
+    // reflector recorded, so every local write would fire twice.
+    const subscribe = vi.fn();
+    const mgr = new AdapterManager(
+      {} as App,
+      { id: 'remote-ssh' } as unknown as PluginManifest,
+      { rpcConnection: {}, activeRemoteBasePath: '' } as unknown as ConnectionManager,
+      { subscribe, unsubscribe: vi.fn() } as unknown as FsChangeListener,
+      { startPolling: vi.fn() } as unknown as PendingEditsBar,
+      () => ({}) as unknown as PluginSettings,
+      null,
+    );
+    const adapter = fakeAdapter();
+
+    priv<(a: unknown, m: unknown) => void>(mgr, 'wireLiveUpdates').call(mgr, adapter, mapper);
+
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    const passedToAdapter = adapter.setLocalOpRegistry.mock.calls[0][0];
+    const passedToListener = (subscribe.mock.calls[0][0] as { localOpRegistry: unknown }).localOpRegistry;
+    expect(passedToListener).toBe(passedToAdapter);
+  });
+});
+
+describe('AdapterManager.startResourceBridge()', () => {
+  function fakeBridge(start: () => Promise<void>) {
+    return { start: vi.fn(start) } as unknown as Parameters<
+      (b: never) => void
+    >[0];
+  }
+
+  it('returns the bridge once it is listening', async () => {
+    const { mgr } = makeManager();
+    const bridge = fakeBridge(() => Promise.resolve());
+
+    const got = await priv<(b: unknown) => Promise<unknown>>(mgr, 'startResourceBridge')
+      .call(mgr, bridge);
+
+    expect(got).toBe(bridge);
+  });
+
+  it('gives up the bridge, not the session, when it cannot bind', async () => {
+    // Losing the bridge costs image rendering. Letting the throw escape would
+    // cost the connection, which is the worse trade.
+    const { mgr } = makeManager();
+    const bridge = fakeBridge(() => Promise.reject(new Error('EADDRINUSE')));
+
+    const got = await priv<(b: unknown) => Promise<unknown>>(mgr, 'startResourceBridge')
+      .call(mgr, bridge);
+
+    expect(got).toBeNull();
   });
 });
