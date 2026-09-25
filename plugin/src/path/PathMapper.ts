@@ -52,7 +52,7 @@ export const DEFAULT_PRIVATE_PATTERN_BASENAMES: readonly string[] = [
   // Deliberately `plugins/*/data.json` and NOT `plugins`: the plugin's CODE
   // (manifest.json / main.js / styles.css) must stay SHARED at the identity
   // path so a plugin installed on one machine still loads on every other —
-  // that round-trip is `ShadowVaultBootstrap.PLUGIN_BINARY_FILES`. Only the
+  // that round-trip is CommunityPluginsSync's `PLUGIN_BINARY_FILES`. Only the
   // settings go per-device.
   'plugins/*/data.json',
   'cache',

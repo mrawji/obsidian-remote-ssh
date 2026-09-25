@@ -15,7 +15,21 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { ShadowVaultBootstrap } from '../src/shadow/ShadowVaultBootstrap';
-import type { SharedConfigReader, SharedConfigWriter } from '../src/shadow/ShadowVaultBootstrap';
+import {
+  pullSharedObsidianConfig,
+  pushSharedObsidianConfig,
+  SHARED_OBSIDIAN_CONFIG_FILES,
+} from '../src/shadow/SharedObsidianConfigSync';
+import type { SharedConfigReader, SharedConfigWriter } from '../src/shadow/SharedObsidianConfigSync';
+import {
+  communityPluginsBasePath,
+  pullCommunityPlugins,
+  pushCommunityPlugins,
+  pullPluginBinaries,
+  pushPluginBinaries,
+  readEnabledPluginIds,
+  SELF_PLUGIN_ID,
+} from '../src/shadow/CommunityPluginsSync';
 import { ObsidianRegistry } from '../src/shadow/ObsidianRegistry';
 import type { SshProfile, PendingPluginSuggestion } from '../src/types';
 
@@ -771,7 +785,7 @@ describe('ShadowVaultBootstrap: installPlugin symlink fallback', () => {
 
 // ─── pullSharedObsidianConfig (#342 shared-config round-trip) ─────────────────
 
-describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
+describe('pullSharedObsidianConfig', () => {
   let localConfigDir: string;
 
   beforeEach(() => {
@@ -812,12 +826,12 @@ describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
       'hotkeys.json':      JSON.stringify({ 'editor:toggle-bold': [] }),
     });
 
-    const { pulled, skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
+    const { pulled, skipped, errored } = await pullSharedObsidianConfig(
       reader, '.obsidian', localConfigDir,
     );
 
     expect(pulled.sort()).toEqual(
-      [...ShadowVaultBootstrap.SHARED_OBSIDIAN_CONFIG_FILES].sort(),
+      [...SHARED_OBSIDIAN_CONFIG_FILES].sort(),
     );
     expect(skipped).toEqual([]);
     expect(errored).toEqual([]);
@@ -829,14 +843,14 @@ describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
 
   it('creates localConfigDir when it does not exist yet', async () => {
     expect(fs.existsSync(localConfigDir)).toBe(false);
-    await ShadowVaultBootstrap.pullSharedObsidianConfig(
+    await pullSharedObsidianConfig(
       makeReader({ 'app.json': '{}' }), '.obsidian', localConfigDir,
     );
     expect(fs.existsSync(localConfigDir)).toBe(true);
   });
 
   it('skips a file that is absent on the remote without writing it', async () => {
-    const { pulled, skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
+    const { pulled, skipped, errored } = await pullSharedObsidianConfig(
       makeReader({ 'appearance.json': '{}' }), '.obsidian', localConfigDir,
     );
     expect(pulled).toEqual(['appearance.json']);
@@ -847,7 +861,7 @@ describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
   });
 
   it('skips a file whose read throws but still processes the rest', async () => {
-    const { pulled, skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
+    const { pulled, skipped, errored } = await pullSharedObsidianConfig(
       makeReader({ 'app.json': 'throw', 'hotkeys.json': '{}' }),
       '.obsidian', localConfigDir,
     );
@@ -861,7 +875,7 @@ describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
     const healthy = JSON.stringify({ theme: 'keepme' });
     fs.writeFileSync(path.join(localConfigDir, 'app.json'), healthy, 'utf-8');
 
-    const { skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
+    const { skipped, errored } = await pullSharedObsidianConfig(
       makeReader({ 'app.json': 'invalid' }), '.obsidian', localConfigDir,
     );
 
@@ -874,7 +888,7 @@ describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
 
 // ─── pushSharedObsidianConfig (#342 round-trip: local → remote) ───────────────
 
-describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
+describe('pushSharedObsidianConfig', () => {
   let localConfigDir: string;
 
   beforeEach(() => {
@@ -909,7 +923,7 @@ describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
     const w = makeWriter();
 
     const { pushed, skipped, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
+      await pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
 
     expect(pushed.sort()).toEqual(['app.json', 'hotkeys.json']);
     expect(errored).toEqual([]);
@@ -921,7 +935,7 @@ describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
   it('skips files absent locally (fresh vault — not an error)', async () => {
     const w = makeWriter();
     const { pushed, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
+      await pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
     expect(pushed).toEqual([]);
     expect(errored).toEqual([]);
     expect(w.write).not.toHaveBeenCalled();
@@ -932,7 +946,7 @@ describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
     const w = makeWriter();
 
     const { pushed, skipped, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
+      await pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
 
     expect(pushed).not.toContain('app.json');
     expect(skipped).toContain('app.json');
@@ -945,7 +959,7 @@ describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
     const w = makeWriter('app.json');
 
     const { pushed, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
+      await pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
 
     expect(pushed).not.toContain('app.json');
     expect(errored).toContain('app.json');
@@ -1109,7 +1123,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
       read: (p) => Promise.resolve(remote[p]),
     };
 
-    await ShadowVaultBootstrap.pullCommunityPlugins(reader, '.obsidian', localConfigDir);
+    await pullCommunityPlugins(reader, '.obsidian', localConfigDir);
 
     expect(readLocal(localConfigDir)).toEqual(
       expect.arrayContaining(['dataview', 'templater', 'remote-ssh']),
@@ -1126,7 +1140,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
       read: (p) => Promise.resolve(remote[p]),
     };
 
-    await ShadowVaultBootstrap.pullCommunityPlugins(reader, '.obsidian', localConfigDir);
+    await pullCommunityPlugins(reader, '.obsidian', localConfigDir);
 
     const local = readLocal(localConfigDir);
     expect(local, 'remote-ssh must survive a pull that omits it').toContain('remote-ssh');
@@ -1141,7 +1155,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     };
 
     await expect(
-      ShadowVaultBootstrap.pullCommunityPlugins(reader, '.obsidian', localConfigDir),
+      pullCommunityPlugins(reader, '.obsidian', localConfigDir),
     ).resolves.toBeDefined();
     expect(readLocal(localConfigDir)).toEqual(['remote-ssh']);
   });
@@ -1156,7 +1170,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
       read: (p) => Promise.resolve(remote[p]),
     };
 
-    await ShadowVaultBootstrap.pullCommunityPlugins(reader, '.obsidian', localConfigDir);
+    await pullCommunityPlugins(reader, '.obsidian', localConfigDir);
 
     expect(readLocal(localConfigDir)).toEqual(
       expect.arrayContaining(['remote-ssh', 'dataview']),
@@ -1182,7 +1196,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
   it('seeds the remote (union with local) when the remote has none yet', async () => {
     const localConfigDir = makeLocalConfigDir(['remote-ssh', 'dataview']);
     const { rw, store } = makeRemoteRW();
-    await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localConfigDir);
+    await pushCommunityPlugins(rw, '.obsidian', localConfigDir);
     expect(store['.obsidian/community-plugins.json'], 'a push must seed the remote').toBeDefined();
     expect(JSON.parse(store['.obsidian/community-plugins.json'])).toEqual(
       expect.arrayContaining(['dataview', 'remote-ssh']),
@@ -1192,7 +1206,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
   it('unions with the remote list and never drops a plugin enabled elsewhere', async () => {
     const localConfigDir = makeLocalConfigDir(['remote-ssh', 'templater']);
     const { rw, store } = makeRemoteRW(['remote-ssh', 'dataview']);
-    await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localConfigDir);
+    await pushCommunityPlugins(rw, '.obsidian', localConfigDir);
     const pushed = JSON.parse(store['.obsidian/community-plugins.json']);
     expect(pushed, 'remote dataview must survive + local templater added')
       .toEqual(expect.arrayContaining(['dataview', 'templater', 'remote-ssh']));
@@ -1202,7 +1216,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     const localConfigDir = makeLocalConfigDir(['remote-ssh']); // minimal local
     const { rw, store } = makeRemoteRW(['remote-ssh', 'dataview', 'obsidian-git'], /*readThrows*/ true);
     const before = store['.obsidian/community-plugins.json'];
-    const r = await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localConfigDir);
+    const r = await pushCommunityPlugins(rw, '.obsidian', localConfigDir);
     expect(r.pushed).toBe(false);
     expect(store['.obsidian/community-plugins.json'], 'remote list must be untouched (no data loss)').toBe(before);
   });
@@ -1211,7 +1225,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     const localConfigDir = makeLocalConfigDir(['remote-ssh']);
     const { rw, store } = makeRemoteRW();
     store['.obsidian/community-plugins.json'] = '{ not : json';
-    const r = await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localConfigDir);
+    const r = await pushCommunityPlugins(rw, '.obsidian', localConfigDir);
     expect(r.pushed).toBe(false);
     expect(store['.obsidian/community-plugins.json']).toBe('{ not : json');
   });
@@ -1240,7 +1254,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     fs.rmSync(scratchRoot, { recursive: true, force: true });
   });
 
-  const SELF = ShadowVaultBootstrap.SELF_PLUGIN_ID; // 'remote-ssh'
+  const SELF = SELF_PLUGIN_ID; // 'remote-ssh'
   const CP = '.obsidian/community-plugins.json';
 
   /** A shadow config dir seeded with `local`. */
@@ -1255,7 +1269,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
 
   /** The per-device base path, optionally pre-seeded (omitted = no base yet). */
   function basePathFor(seed?: string[]): string {
-    const p = ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, 'profile-1');
+    const p = communityPluginsBasePath(scratchRoot, 'profile-1');
     if (seed) {
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, JSON.stringify(seed), 'utf-8');
@@ -1288,8 +1302,8 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     localConfigDir: string,
     basePath: string,
   ): Promise<void> {
-    await ShadowVaultBootstrap.pullCommunityPlugins(rw, '.obsidian', localConfigDir, basePath);
-    await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localConfigDir, basePath);
+    await pullCommunityPlugins(rw, '.obsidian', localConfigDir, basePath);
+    await pushCommunityPlugins(rw, '.obsidian', localConfigDir, basePath);
   }
 
   it('falls back to a UNION when there is no base yet (first run — nothing is lost)', async () => {
@@ -1333,15 +1347,15 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     // share a state dir share a merge base, which is how a plugin uninstalled
     // on one profile disappears from another.
     const paths = ['a/b', 'a?b', '///', '???']
-      .map((id) => ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, id));
+      .map((id) => communityPluginsBasePath(scratchRoot, id));
     expect(new Set(paths).size, 'every id needs its own state dir').toBe(paths.length);
     for (const p of paths) {
       expect(p.startsWith(path.join(scratchRoot, 'state') + path.sep)).toBe(true);
     }
     // Stable across calls, and a normal UUID id is untouched (no migration).
-    expect(ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, 'a/b')).toBe(paths[0]);
+    expect(communityPluginsBasePath(scratchRoot, 'a/b')).toBe(paths[0]);
     const uuid = '3f2504e0-4f89-11d3-9a0c-0305e82c3301';
-    expect(ShadowVaultBootstrap.communityPluginsBasePath(scratchRoot, uuid))
+    expect(communityPluginsBasePath(scratchRoot, uuid))
       .toBe(path.join(scratchRoot, 'state', uuid, 'community-plugins.base.json'));
   });
 
@@ -1390,7 +1404,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     await roundTrip(rw, localDir, basePath);
 
     expect(read(), 'an unreadable local list must never reach the remote').toEqual([SELF, 'dataview']);
-    expect(ShadowVaultBootstrap.readEnabledPluginIds(localDir), 'and binaries round-trip nothing')
+    expect(readEnabledPluginIds(localDir), 'and binaries round-trip nothing')
       .toEqual([]);
   });
 
@@ -1484,8 +1498,8 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
       write: () => Promise.reject(new Error('must not push a list built from an unread remote')),
     };
 
-    await ShadowVaultBootstrap.pullCommunityPlugins(rw, '.obsidian', localDir, basePath);
-    const r = await ShadowVaultBootstrap.pushCommunityPlugins(rw, '.obsidian', localDir, basePath);
+    await pullCommunityPlugins(rw, '.obsidian', localDir, basePath);
+    const r = await pushCommunityPlugins(rw, '.obsidian', localDir, basePath);
 
     expect(r.pushed).toBe(false);
     expect(readLocal(localDir), 'the local list must survive an unreadable remote intact')
@@ -1515,7 +1529,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     const basePath = basePathFor([SELF, 'dataview']);
 
     // pre-spawn: pull only — must NOT commit the base
-    await ShadowVaultBootstrap.pullCommunityPlugins(rw, '.obsidian', localDir, basePath);
+    await pullCommunityPlugins(rw, '.obsidian', localDir, basePath);
     expect(readBase(basePath), 'a pull must never commit the base').toEqual([SELF, 'dataview']);
 
     // …then the real connect.
@@ -1601,7 +1615,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
       '.obsidian/plugins/brat-x/main.js': '/* brat code */\n',
     });
 
-    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['brat-x']);
+    const { pulled } = await pullPluginBinaries(rw, '.obsidian', cfg, ['brat-x']);
 
     expect(pulled).toContain('brat-x');
     expect(fs.readFileSync(pluginFile(cfg, 'brat-x', 'main.js'), 'utf-8')).toBe('/* brat code */\n');
@@ -1617,7 +1631,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
       '.obsidian/plugins/p/main.js': '/* NEW v2 */\n',
     });
 
-    await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
+    await pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
 
     expect(fs.readFileSync(pluginFile(cfg, 'p', 'main.js'), 'utf-8'), 'newer remote must upgrade local')
       .toBe('/* NEW v2 */\n');
@@ -1632,7 +1646,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
       '.obsidian/plugins/p/main.js': '/* OLD v1 */\n',
     });
 
-    await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
+    await pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
 
     expect(fs.readFileSync(pluginFile(cfg, 'p', 'main.js'), 'utf-8'), 'older remote must NOT clobber newer local')
       .toBe('/* NEW v2 */\n');
@@ -1642,7 +1656,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     const cfg = makeLocalConfigDir();
     const { rw } = makeRW({ '.obsidian/plugins/p/main.js': '/* orphan main, no manifest */\n' });
 
-    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
+    const { pulled } = await pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
 
     expect(pulled).not.toContain('p');
     expect(fs.existsSync(pluginFile(cfg, 'p', 'main.js'))).toBe(false);
@@ -1652,7 +1666,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     const cfg = makeLocalConfigDir();
     const { rw } = makeRW({ '.obsidian/plugins/remote-ssh/manifest.json': manifest('remote-ssh', '9.9.9') });
 
-    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['remote-ssh']);
+    const { pulled } = await pullPluginBinaries(rw, '.obsidian', cfg, ['remote-ssh']);
 
     expect(pulled).not.toContain('remote-ssh');
     expect(fs.existsSync(pluginFile(cfg, 'remote-ssh', 'manifest.json'))).toBe(false);
@@ -1664,7 +1678,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     seedLocal(cfg, 'q', 'main.js', '/* q code */\n');
     const { rw, store } = makeRW();
 
-    const { pushed } = await ShadowVaultBootstrap.pushPluginBinaries(rw, '.obsidian', cfg, ['q']);
+    const { pushed } = await pushPluginBinaries(rw, '.obsidian', cfg, ['q']);
 
     expect(pushed).toContain('q');
     expect(store['.obsidian/plugins/q/main.js']).toBe('/* q code */\n');
@@ -1680,7 +1694,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
       '.obsidian/plugins/q/main.js': '/* OLD v1 */\n',
     });
 
-    const { pushed } = await ShadowVaultBootstrap.pushPluginBinaries(rw, '.obsidian', cfg, ['q']);
+    const { pushed } = await pushPluginBinaries(rw, '.obsidian', cfg, ['q']);
 
     expect(pushed).toContain('q');
     expect(store['.obsidian/plugins/q/main.js'], 'newer local must upgrade the remote').toBe('/* NEW v2 */\n');
@@ -1695,7 +1709,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
       '.obsidian/plugins/q/main.js': '/* NEW v2 */\n',
     });
 
-    const { pushed } = await ShadowVaultBootstrap.pushPluginBinaries(rw, '.obsidian', cfg, ['q']);
+    const { pushed } = await pushPluginBinaries(rw, '.obsidian', cfg, ['q']);
 
     expect(pushed).not.toContain('q');
     expect(store['.obsidian/plugins/q/main.js'], 'older local must NOT clobber newer remote').toBe('/* NEW v2 */\n');
@@ -1706,7 +1720,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     seedLocal(cfg, 'r', 'main.js', '/* code, no manifest */\n');
     const { rw, store } = makeRW();
 
-    const { pushed } = await ShadowVaultBootstrap.pushPluginBinaries(rw, '.obsidian', cfg, ['r']);
+    const { pushed } = await pushPluginBinaries(rw, '.obsidian', cfg, ['r']);
 
     expect(pushed).not.toContain('r');
     expect(store['.obsidian/plugins/r/main.js']).toBeUndefined();
@@ -1722,11 +1736,11 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     });
 
     // Round 1 pull: the newer remote upgrades local to v2.
-    await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['c']);
+    await pullPluginBinaries(rw, '.obsidian', cfg, ['c']);
     expect(fs.readFileSync(pluginFile(cfg, 'c', 'main.js'), 'utf-8')).toBe('/* v2 */\n');
 
     // Then push: local == remote (both v2) → nothing pushed, no oscillation.
-    const { pushed } = await ShadowVaultBootstrap.pushPluginBinaries(rw, '.obsidian', cfg, ['c']);
+    const { pushed } = await pushPluginBinaries(rw, '.obsidian', cfg, ['c']);
     expect(pushed, 'after converging on v2 the push must be a no-op').not.toContain('c');
     expect(store['.obsidian/plugins/c/main.js']).toBe('/* v2 */\n');
   });
@@ -1741,7 +1755,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     const origRead = rw.read;
     rw.read = (p) => (p.includes('/bad/') ? Promise.reject(new Error('SSH hiccup')) : origRead(p));
 
-    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['bad', 'good']);
+    const { pulled } = await pullPluginBinaries(rw, '.obsidian', cfg, ['bad', 'good']);
 
     expect(pulled, 'good pulls even though bad errored').toContain('good');
     expect(pulled).not.toContain('bad');

@@ -33,7 +33,7 @@ import { errorMessage } from '../util/errorMessage';
  *
  * Lives beside `community-plugins.base.json` in
  * `~/.obsidian-remote/state/<profile>/`: per-device, never synced, outside
- * every vault (see `ShadowVaultBootstrap.communityPluginsBasePath`).
+ * every vault (see `communityPluginsBasePath` in CommunityPluginsSync).
  */
 
 const VERSION = 1;
