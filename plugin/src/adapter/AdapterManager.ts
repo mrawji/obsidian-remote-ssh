@@ -139,34 +139,7 @@ export class AdapterManager {
     const mapper = new PathMapper(clientId, this.app.vault.configDir);
     logger.info(`PathMapper: clientId="${clientId}"`);
 
-    // Spin up the localhost binary bridge so getResourcePath has
-    // somewhere to send Obsidian. The bridge is best-effort: if it
-    // fails to bind we still patch and just lose image rendering.
-    //
-    // When the active session is RPC AND the daemon advertises
-    // `fs.thumbnail`, also wire the thumbnail fetcher — image-extension
-    // requests get served from the daemon's resize path (small, cached)
-    // instead of pulling the full original on every <img>.
-    const bridge = new ResourceBridge();
-    const fetchThumbnail = this.makeThumbnailFetcherIfSupported();
-    const fetchBinaryRange = this.makeBinaryRangeFetcherIfSupported();
-    try {
-      await bridge.start(
-        p => this.fetchBinaryForBridge(p),
-        fetchThumbnail ?? undefined,
-        fetchBinaryRange ?? undefined,
-      );
-      this.resourceBridge = bridge;
-      if (fetchThumbnail) {
-        logger.info('ResourceBridge: thumbnail fast path enabled (daemon supports fs.thumbnail)');
-      }
-      if (fetchBinaryRange) {
-        logger.info('ResourceBridge: range fast path enabled (daemon supports fs.readBinaryRange)');
-      }
-    } catch (e) {
-      logger.warn(`ResourceBridge: start failed: ${errorMessage(e)}`);
-      this.resourceBridge = null;
-    }
+    this.resourceBridge = await this.startResourceBridge();
 
     // The Go daemon already knows the absolute vault root via its
     // `--vault-root` flag, so RPC clients must send paths RELATIVE to
@@ -181,30 +154,7 @@ export class AdapterManager {
     // Per-session ancestor snapshot store. Powers the 3-way merge UI;
     // cleared on disconnect with the rest of the patched-adapter state.
     this.ancestorTracker = new AncestorTracker();
-    // Persistent offline-write queue. Survives Electron restarts and
-    // adapter restores so an in-flight disconnect doesn't drop user
-    // edits. Lazily-opened the first time the adapter is patched;
-    // reused on subsequent patches so the queue isn't re-replayed.
-    if (!this.offlineQueue) {
-      try {
-        this.offlineQueue = await this.openOfflineQueue();
-        const stats = this.offlineQueue.stats();
-        if (stats.entries > 0) {
-          logger.info(
-            `OfflineQueue: opened with ${stats.entries} pending entries (${stats.bytes} bytes) ` +
-            'from a previous session — the QueueReplayer will drain them on connect',
-          );
-        }
-        // Wire the status-bar indicator to this queue. Polls every
-        // 2 s; cheap (Map.size) and the user expects an at-a-glance
-        // count rather than per-event live updates.
-        const queue = this.offlineQueue;
-        this.pendingEditsBar.startPolling(() => queue.pending().length);
-      } catch (e) {
-        logger.warn(`OfflineQueue: open failed (${errorMessage(e)}); offline writes will throw`);
-        this.offlineQueue = null;
-      }
-    }
+    await this.ensureOfflineQueue();
     const conflictResolver = new ConflictResolver(
       fsClient,
       this.readCache,
@@ -242,35 +192,106 @@ export class AdapterManager {
       return false;
     }
 
-    // Writer self-reflect (#341) — transport-independent. The adapter
-    // mirrors every applied write/rename/remove/mkdir into the
-    // writer's own vault.fileMap + trigger bus *immediately* and
-    // records the op in a LocalOpRegistry. VaultModelBuilder is
-    // stateless (only mutates the live Vault) and the adapter object
-    // outlives a reconnect's swapClient, so wiring once here holds for
-    // the whole patched lifetime — no per-swap re-policy needed.
-    const localOpRegistry = new LocalOpRegistry();
-    this._dataAdapter.setWriterReflector(
-      new VaultModelBuilder(this.app.vault, { TFile, TFolder }),
-    );
-    this._dataAdapter.setLocalOpRegistry(localOpRegistry);
+    this.wireLiveUpdates(this._dataAdapter, mapper);
 
-    // The live-update subscription is only meaningful on RPC (SFTP has
-    // no notification channel). On RPC the daemon also echoes our own
-    // writes back; the shared registry lets FsChangeListener drop that
-    // echo so it doesn't double-fire what the reflector already did.
-    // Multi-client changes never pass through `record`, so other
-    // clients' echoes still apply.
+    return true;
+  }
+
+  /**
+   * Start the localhost binary bridge `getResourcePath` sends Obsidian to.
+   *
+   * Best-effort: a bridge that cannot bind costs image rendering, not the
+   * session, so a failure returns null and the patch goes ahead.
+   *
+   * On RPC, a daemon advertising `fs.thumbnail` / `fs.readBinaryRange` also
+   * gets the fast paths wired — image requests are served from the daemon's
+   * resize path instead of pulling the full original on every `<img>`.
+   *
+   * `bridge` is a test seam, same as `JumpHostTunnel`'s `clientFactory`: a
+   * bridge that fails to bind is the branch worth pinning, and it cannot be
+   * provoked through a real one.
+   */
+  private async startResourceBridge(
+    bridge: ResourceBridge = new ResourceBridge(),
+  ): Promise<ResourceBridge | null> {
+    const fetchThumbnail = this.makeThumbnailFetcherIfSupported();
+    const fetchBinaryRange = this.makeBinaryRangeFetcherIfSupported();
+    try {
+      await bridge.start(
+        p => this.fetchBinaryForBridge(p),
+        fetchThumbnail ?? undefined,
+        fetchBinaryRange ?? undefined,
+      );
+      if (fetchThumbnail) {
+        logger.info('ResourceBridge: thumbnail fast path enabled (daemon supports fs.thumbnail)');
+      }
+      if (fetchBinaryRange) {
+        logger.info('ResourceBridge: range fast path enabled (daemon supports fs.readBinaryRange)');
+      }
+      return bridge;
+    } catch (e) {
+      logger.warn(`ResourceBridge: start failed: ${errorMessage(e)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Open the persistent offline-write queue, once.
+   *
+   * It survives Electron restarts and adapter restores so an in-flight
+   * disconnect does not drop user edits, and it is reused across patches so
+   * the queue is not replayed twice. A queue that will not open leaves
+   * offline writes throwing, which is louder than losing them.
+   */
+  private async ensureOfflineQueue(): Promise<void> {
+    if (this.offlineQueue) return;
+    try {
+      this.offlineQueue = await this.openOfflineQueue();
+      const stats = this.offlineQueue.stats();
+      if (stats.entries > 0) {
+        logger.info(
+          `OfflineQueue: opened with ${stats.entries} pending entries (${stats.bytes} bytes) ` +
+          'from a previous session — the QueueReplayer will drain them on connect',
+        );
+      }
+      // Polls every 2 s: cheap (Map.size), and an at-a-glance count is what
+      // the user wants from a status bar, not per-event updates.
+      const queue = this.offlineQueue;
+      this.pendingEditsBar.startPolling(() => queue.pending().length);
+    } catch (e) {
+      logger.warn(`OfflineQueue: open failed (${errorMessage(e)}); offline writes will throw`);
+      this.offlineQueue = null;
+    }
+  }
+
+  /**
+   * Wire the two paths that keep the vault model current.
+   *
+   * Writer self-reflect (#341) is transport-independent: the adapter mirrors
+   * every applied write/rename/remove/mkdir straight into this window's own
+   * `vault.fileMap` and trigger bus, and records the op. `VaultModelBuilder`
+   * is stateless and the adapter outlives a reconnect's `rebind`, so wiring
+   * it once holds for the whole patched lifetime.
+   *
+   * The subscription only means anything on RPC — SFTP has no notification
+   * channel. There the daemon echoes our own writes back, and the shared
+   * registry is what lets `FsChangeListener` drop that echo instead of
+   * double-firing what the reflector already did. Other clients' changes
+   * never pass through `record`, so their echoes still apply.
+   */
+  private wireLiveUpdates(adapter: SftpDataAdapter, mapper: PathMapper): void {
+    const localOpRegistry = new LocalOpRegistry();
+    adapter.setWriterReflector(new VaultModelBuilder(this.app.vault, { TFile, TFolder }));
+    adapter.setLocalOpRegistry(localOpRegistry);
+
     if (this.conn.rpcConnection) {
       void this.fsChangeListener.subscribe({
         rpcConnection: this.conn.rpcConnection,
-        dataAdapter: this._dataAdapter,
+        dataAdapter: adapter,
         pathMapper: mapper,
         localOpRegistry,
       });
     }
-
-    return true;
   }
 
   /**
