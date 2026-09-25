@@ -231,10 +231,6 @@ export class SftpDataAdapter {
     this.disposed = true;
   }
 
-  isReconnecting(): boolean {
-    return this.reconnecting;
-  }
-
   /**
    * Writer-side vault-model reflector (#341). When wired, every
    * mutation that actually lands on the remote is mirrored into the
