@@ -24,9 +24,10 @@ import { createProxyCommandTunnel } from './ProxyCommandTunnel';
  *   2. reach `'close'` when the far end goes away, for ANY reason;
  *   3. emit `'end'` before `'close'`, so bytes already delivered are still
  *      readable;
- *   4. emit `'error'` naming the cause when the end was abnormal (a proxy's
- *      exit code, a bastion's failure), and stay silent when the peer
- *      merely hung up;
+ *   4. emit `'error'` naming the cause when the end was abnormal AND the
+ *      route can tell — a ProxyCommand sees its child's exit code and
+ *      stderr; a bastion cannot, because `direct-tcpip` carries no reason,
+ *      so it owes only the close. Stay silent when the peer merely hung up;
  *   5. own what it started — child process, jump client, socket — and reap
  *      it on `'close'`; the caller holds no second handle;
  *   6. tolerate `destroy()` twice, and emit `'close'` at most once;

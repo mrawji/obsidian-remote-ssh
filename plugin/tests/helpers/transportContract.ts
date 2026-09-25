@@ -7,10 +7,12 @@ import type { Transport, TransportTarget } from '../../src/ssh/Transport';
  *
  * ssh2 takes the stream a transport returns and treats it as a socket, and
  * `SftpClient` reconnects on the `close` ssh2 relays from it. Before this
- * suite the contract lived in one implementation's head: `JumpHostTunnel`
- * returns a real ssh2 Channel and satisfied it for free, `ProxyCommandTunnel`
- * hand-rolled a Duplex and did not, and a dropped server went unnoticed
- * behind a ProxyCommand for 87 days.
+ * suite the contract was written down nowhere, and BOTH implementations
+ * turned out to break it: `ProxyCommandTunnel` pushed EOF without closing
+ * (87 days of silent disconnects), and `JumpHostTunnel` did the same
+ * whenever the target died behind a healthy bastion — which no test had
+ * ever tried, because the only one that dropped a jump session dropped the
+ * bastion, and that tears every channel down and hides the case.
  *
  * Call this from a test file per implementation. `makeHarness` supplies a
  * transport already pointed at a far end the test can control.
@@ -22,6 +24,17 @@ export interface TransportHarness {
   hangUp(): Promise<void>;
   /** The peer dies abnormally — a crash, a kill. */
   killAbnormally(): Promise<void>;
+  /**
+   * Whether this route can tell an abnormal end from a clean one.
+   *
+   * A ProxyCommand can: it sees its child's exit code and stderr. A
+   * bastion cannot: SSH's `direct-tcpip` carries no reason, so the channel
+   * simply closes whether the target exited or was killed. Declaring that
+   * here keeps the obligation strong for routes that can, and records the
+   * limit for the one that cannot — rather than quietly weakening it for
+   * everyone.
+   */
+  canNameAbnormalCause?: boolean;
   /** Send bytes from the far end, to check they arrive before `close`. */
   send(bytes: string): Promise<void>;
   cleanup(): Promise<void>;
@@ -83,18 +96,22 @@ export function describeTransportContract(
       }
     });
 
-    it('names the cause when the end was abnormal', async () => {
+    it('reports an abnormal end as best this route can', async () => {
       // A silent close is reserved for "the peer hung up cleanly". Anything
       // else has a reason, and without it ssh2 can only say "connection
-      // lost".
+      // lost" — so a route that CAN name the cause must.
+      //
+      // A route that cannot still owes the close: reconnecting without
+      // knowing why beats not reconnecting.
       const h = await makeHarness();
+      const canName = h.canNameAbnormalCause !== false;
       try {
         const stream = await h.transport.open(h.target);
         stream.on('error', () => { /* asserted via firstOf below */ });
         stream.resume();
-        const outcome = firstOf(stream, ['error']);
+        const outcome = firstOf(stream, canName ? ['error'] : ['close']);
         await h.killAbnormally();
-        await expect(outcome).resolves.toBe('error');
+        await expect(outcome).resolves.toBe(canName ? 'error' : 'close');
       } finally {
         await h.cleanup();
       }
