@@ -22,6 +22,8 @@ import { ensureDaemonBinary, type DaemonBinaryHost } from '../src/transport/ensu
 import { DaemonVerificationError } from '../src/transport/DaemonDownloader';
 
 const BIN_NAME = 'obsidian-remote-server-linux-amd64';
+/** A path that deliberately does not exist, for the dangling-link case. */
+const dir0 = path.join(os.tmpdir(), `rs-daemon-absent-${process.pid}`);
 
 /** Answers the `uname` probe as a linux/amd64 host. */
 const linuxAmd64Client = {
@@ -89,6 +91,20 @@ describe('ensureDaemonBinary — cached fast path', () => {
     }, { confirmDownload: async () => false }));
 
     expect(result).toBeNull(); // fell through (not reused) → declined → SFTP
+  });
+
+  it('does NOT trust a marker whose binary is gone', async () => {
+    // The marker says "verified"; the file it describes was deleted. Hashing
+    // it fails, which must read as "not cached" rather than as a match.
+    const dir = scratchPluginDir(); // server-bin exists, binary does not
+
+    const result = await ensureDaemonBinary(linuxAmd64Client, makeHost(dir, {
+      daemonBinaryVersion: '1.2.0',
+      daemonBinarySha: 'a'.repeat(64),
+      daemonDownloadConsented: false,
+    }, { confirmDownload: async () => false }));
+
+    expect(result).toBeNull(); // fell through → declined → SFTP
   });
 
   it('does NOT take the fast path when the recorded version differs from the plugin version', async () => {
@@ -201,5 +217,83 @@ describe('ensureDaemonBinary — after a successful download', () => {
     expect(result).toBeNull();
     expect(asked).toBe(1);
     expect(settings.daemonDownloadConsented).toBe(false);
+  });
+});
+
+describe('ensureDaemonBinary — a broken server-bin cache dir', () => {
+  /** Like scratchPluginDir, but `server-bin` is whatever the caller makes it. */
+  function dirWithBrokenCache(make: (cacheDir: string) => void): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `rs-daemon-bad-${process.pid}-`));
+    tmpDirs.push(dir);
+    make(path.join(dir, 'server-bin'));
+    return dir;
+  }
+
+  it('relinks a dangling server-bin symlink rather than degrading to SFTP', async () => {
+    // Dev installs used to propagate `server-bin` as a junction to ANOTHER
+    // vault. Delete that vault and mkdir throws a raw ENOENT, which used to
+    // read as "no daemon" and quietly drop the session to SFTP.
+    const dir = dirWithBrokenCache((cacheDir) => {
+      fs.symlinkSync(path.join(dir0, 'gone'), cacheDir);
+    });
+    const bytes = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+    const abs = path.join(dir, 'server-bin', BIN_NAME);
+    downloadSpy.mockImplementation(async () => { fs.writeFileSync(abs, bytes); return abs; });
+
+    const result = await ensureDaemonBinary(
+      linuxAmd64Client,
+      makeHost(dir, { daemonDownloadConsented: true }),
+    );
+
+    expect(result).toBe(abs);
+    // The link was replaced by a real dir — and its target was never followed.
+    expect(fs.lstatSync(path.join(dir, 'server-bin')).isDirectory()).toBe(true);
+  });
+
+  it('stays on SFTP, loudly, when server-bin cannot be made usable', async () => {
+    // A plain file in the way is not a stale link, so there is nothing to
+    // repair. The user is told, because the alternative is a session that
+    // silently never uses the daemon.
+    const dir = dirWithBrokenCache((cacheDir) => fs.writeFileSync(cacheDir, 'not a dir'));
+
+    const result = await ensureDaemonBinary(
+      linuxAmd64Client,
+      makeHost(dir, { daemonDownloadConsented: true }),
+    );
+
+    expect(result).toBeNull();
+    expect(downloadSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('ensureDaemonBinary — how the bytes land', () => {
+  it('writes through a temp sibling and renames, so a crash cannot leave a torn binary', async () => {
+    // A half-written file that a later sha re-check hands back would be an
+    // unverified binary deployed to the remote.
+    const dir = scratchPluginDir();
+    const bytes = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x11, 0x22]);
+    const abs = path.join(dir, 'server-bin', BIN_NAME);
+    const seenDuringWrite: string[] = [];
+
+    downloadSpy.mockImplementation(async (deps: {
+      writeExecutable: (abs: string, b: Uint8Array) => Promise<void>;
+      readCached: (abs: string) => Promise<Uint8Array | null>;
+    }) => {
+      expect(await deps.readCached(abs)).toBeNull();   // nothing staged yet
+      await deps.writeExecutable(abs, bytes);
+      seenDuringWrite.push(...fs.readdirSync(path.join(dir, 'server-bin')));
+      return abs;
+    });
+
+    const result = await ensureDaemonBinary(
+      linuxAmd64Client,
+      makeHost(dir, { daemonDownloadConsented: true }),
+    );
+
+    expect(result).toBe(abs);
+    expect(fs.readFileSync(abs)).toEqual(bytes);
+    // Executable, and no `.tmp` left behind.
+    expect(fs.statSync(abs).mode & 0o111).toBeTruthy();
+    expect(seenDuringWrite.filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
 });
