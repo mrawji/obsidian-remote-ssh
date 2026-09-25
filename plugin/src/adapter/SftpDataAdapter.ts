@@ -174,17 +174,6 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Swap the underlying transport while the adapter stays patched
-   * onto `app.vault.adapter`. Used by the reconnect path: an SSH drop
-   * tears down the old `RemoteFsClient`, but the adapter object
-   * itself is still wired into Obsidian, so we just rebind it to a
-   * fresh client (RPC tunnel or SFTP) without going through a
-   * restore/re-patch cycle that would force editors to re-render.
-   *
-   * Caches are preserved — entries are mtime-keyed, so any divergence
-   * is caught on the next read.
-   */
-  /**
    * Point the adapter at the remote as it now is.
    *
    * Takes the prefix as well as the client because a reconnect can change
@@ -928,33 +917,6 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Atomic-on-the-server write through SftpClient (tmp+rename). Ensures
-   * the parent directory exists, then refreshes the read cache with the
-   * just-written content using the freshly-read mtime.
-   *
-   * When the adapter has a recent ReadCache entry for this path, the
-   * cached mtime is sent as `expectedMtime` so the server rejects the
-   * write if another client wrote in between. On rejection the
-   * conflict-resolution stack runs:
-   *
-   *   1. If `isText` AND we have an ancestor snapshot AND a 3-way
-   *      callback, present `(ancestor, mine, theirs)` to the user.
-   *      Their decision either clobbers, replaces with theirs,
-   *      writes a hand-merged version, or cancels.
-   *   2. Else, fall back to the legacy `onWriteConflict` (overwrite
-   *      or cancel) — used by binary writes and by text writes that
-   *      have no ancestor (e.g. write-without-prior-read).
-   *   3. Else, rethrow the precondition error.
-   *
-   * `data` may be reassigned in the merged-decision branch so the
-   * post-write cache update reflects what actually landed on disk.
-   *
-   * `expectedMtimeOverride` lets the offline-queue replayer
-   * (E2-β.3) feed in the mtime captured at *enqueue* time rather
-   * than whatever the cache holds now (which is the synthetic
-   * mtime from the offline cache update).
-   */
-  /**
    * Mirror a successful `<configDir>/**` write onto the LOCAL shadow disk
    * (#342 / #429 — "plugin settings are not kept after restarting the vault").
    *
@@ -1035,6 +997,33 @@ export class SftpDataAdapter {
     }
   }
 
+  /**
+   * Atomic-on-the-server write through SftpClient (tmp+rename). Ensures
+   * the parent directory exists, then refreshes the read cache with the
+   * just-written content using the freshly-read mtime.
+   *
+   * When the adapter has a recent ReadCache entry for this path, the
+   * cached mtime is sent as `expectedMtime` so the server rejects the
+   * write if another client wrote in between. On rejection the
+   * conflict-resolution stack runs:
+   *
+   *   1. If `isText` AND we have an ancestor snapshot AND a 3-way
+   *      callback, present `(ancestor, mine, theirs)` to the user.
+   *      Their decision either clobbers, replaces with theirs,
+   *      writes a hand-merged version, or cancels.
+   *   2. Else, fall back to the legacy `onWriteConflict` (overwrite
+   *      or cancel) — used by binary writes and by text writes that
+   *      have no ancestor (e.g. write-without-prior-read).
+   *   3. Else, rethrow the precondition error.
+   *
+   * `data` may be reassigned in the merged-decision branch so the
+   * post-write cache update reflects what actually landed on disk.
+   *
+   * `expectedMtimeOverride` lets the offline-queue replayer
+   * (E2-β.3) feed in the mtime captured at *enqueue* time rather
+   * than whatever the cache holds now (which is the synthetic
+   * mtime from the offline cache update).
+   */
   private async writeBuffer(
     normalizedPath: string,
     data: Buffer,

@@ -64,19 +64,6 @@ export interface RemoteEntryWithRel extends RemoteEntry {
 }
 
 /**
- * Single-connection SFTP wrapper used by the data adapter and by
- * higher-level features (watch poller, resource bridge). Atomic writes
- * are implemented via tmp+rename. The OpenSSH posix-rename extension is
- * preferred when the server advertises it.
- */
-/**
- * Wire a keyboard-interactive handler onto an EventEmitter-shaped client.
- * Extracted from `SftpClient.connect` so the normalisation, forwarding,
- * and error-recovery logic can be unit-tested without a real ssh2 Client.
- *
- * @internal Exported for testing only.
- */
-/**
  * Attach the `error` and `close` handlers a live session needs, and carry
  * the reason from one to the other.
  *
@@ -135,6 +122,13 @@ export function wireConnectionLifecycle(
   });
 }
 
+/**
+ * Wire a keyboard-interactive handler onto an EventEmitter-shaped client.
+ * Extracted from `SftpClient.connect` so the normalisation, forwarding,
+ * and error-recovery logic can be unit-tested without a real ssh2 Client.
+ *
+ * @internal Exported for testing only.
+ */
 export function wireKeyboardInteractiveHandler(
   client: {
     on(
@@ -175,6 +169,12 @@ export function wireKeyboardInteractiveHandler(
   });
 }
 
+/**
+ * Single-connection SFTP wrapper used by the data adapter and by
+ * higher-level features (watch poller, resource bridge). Atomic writes
+ * are implemented via tmp+rename. The OpenSSH posix-rename extension is
+ * preferred when the server advertises it.
+ */
 export class SftpClient {
   private client: Client | null = null;
   private sftp: SFTPWrapper | null = null;
