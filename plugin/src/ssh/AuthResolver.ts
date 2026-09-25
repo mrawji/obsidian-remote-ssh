@@ -5,6 +5,7 @@ import type { SecretStore } from './SecretStore';
 import { logger } from '../util/logger';
 import { expandHome } from '../util/pathUtils';
 import { errorMessage } from "../util/errorMessage";
+import { certificateFilePath, loadDiskCertificate } from './DiskCertificate';
 
 /**
  * Which agent socket a profile authenticates through: its own override, else
@@ -72,6 +73,20 @@ export class AuthResolver {
         const passphrase = profile.passphraseRef
           ? this.getSecret(profile.passphraseRef)
           : undefined;
+        // OpenSSH loads a sibling `<key>-cert.pub` automatically; ssh2 does
+        // not. When one exists, present the certificate through the same path
+        // an agent-held certificate uses (#536), signing locally with this
+        // key. The bare key is offered ALONGSIDE it (ssh2 tries `publickey`
+        // then `agent`), mirroring OpenSSH: a rejected or expired cert then
+        // falls through to the plain key instead of failing the connection.
+        // No sibling → ordinary key auth, unchanged.
+        const certAgent = loadDiskCertificate(keyPath, privateKey, passphrase);
+        if (certAgent) {
+          logger.info(`Auth: using certificate ${certificateFilePath(keyPath)} (bare key ${keyPath} offered as fallback)`);
+          return passphrase
+            ? { agent: certAgent, privateKey, passphrase }
+            : { agent: certAgent, privateKey };
+        }
         logger.info(`Auth: using private key ${keyPath}`);
         return passphrase ? { privateKey, passphrase } : { privateKey };
       }

@@ -8,6 +8,8 @@ import type { HostKeyMismatchHandler, HostKeyStore } from './HostKeyStore';
 import { expandHome } from '../util/pathUtils';
 import { logger } from '../util/logger';
 import { errorMessage } from "../util/errorMessage";
+import { certificateFilePath, loadDiskCertificate } from './DiskCertificate';
+import { enableCertificateAuth } from './certificateAuth';
 
 /**
  * Optional knobs for `createJumpTunnel`. Most callers leave them at
@@ -59,6 +61,10 @@ export async function createJumpTunnel(
 ): Promise<Duplex> {
   const factory = options.clientFactory ?? (() => new Client());
   const jumpClient = factory();
+
+  // Certificate support for a CA-issued bastion key + `<key>-cert.pub` (#536),
+  // mirroring the target client. Inert unless an identity is a certificate.
+  enableCertificateAuth(jumpClient as unknown as Client);
 
   const authConfig = buildJumpAuthConfig(jump, authResolver);
   const config: ConnectConfig = {
@@ -220,6 +226,14 @@ function buildJumpAuthConfig(
         throw new Error(
           `Cannot read jump host private key at "${keyPath}": ${errorMessage(e)}`,
         );
+      }
+      // As with the target host: a sibling `<key>-cert.pub` is presented via
+      // the local signer, with the bare key offered alongside as fallback.
+      // (JumpHostConfig has no passphrase field yet — see the note above.)
+      const certAgent = loadDiskCertificate(keyPath, privateKey);
+      if (certAgent) {
+        logger.info(`Jump host auth: using certificate ${certificateFilePath(keyPath)} (bare key ${keyPath} offered as fallback)`);
+        return { agent: certAgent, privateKey };
       }
       logger.info(`Jump host auth: using private key ${keyPath}`);
       return { privateKey };
