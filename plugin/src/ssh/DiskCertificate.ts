@@ -72,6 +72,16 @@ export function loadDiskCertificate(
     if (!isUsableIdentity(type)) {
       return skip(`unsupported ${baseKeyType(type)} certificate (FIDO sk-* not implemented)`);
     }
+    // `isUsableIdentity` admits ssh-dss (the agent path can sign it, since the
+    // agent frames its own signature), but local DSA signing here would need
+    // the RFC 4253 §6.6 two-20-byte-integer reframing that `sshSignatureBody`
+    // does not do — so we would advertise a DSS cert and then sign it wrong.
+    // OpenSSH has disabled ssh-dss by default since 7.0, so rather than carry
+    // dead framing for it, skip it and let the bare key (or another method)
+    // proceed.
+    if (baseKeyType(type) === 'ssh-dss') {
+      return skip('ssh-dss certificates are not supported for on-disk signing (deprecated since OpenSSH 7.0)');
+    }
     const parsed = utils.parseKey(privateKey, passphrase);
     if (parsed instanceof Error) {
       return skip(`cannot parse private key "${privateKeyPath}": ${parsed.message}`);
@@ -202,6 +212,11 @@ export class DiskCertificateAgent extends BaseAgent<ParsedKey> {
  * SHA-512 — the base type is renamed to `rsa-sha2-512` for the wire, so the
  * signature has to actually be SHA-512 or the server's `sshkey_check_sigtype`
  * rejects it. ECDSA's digest is fixed by its curve.
+ *
+ * An unrecognised algorithm throws rather than defaulting to "no digest": the
+ * only caller (`sign`) wraps this and reports the error, so a type that slips
+ * past `loadDiskCertificate`'s filters fails loudly instead of silently
+ * producing an unverifiable signature.
  */
 function hashAlgorithm(base: string): string | undefined {
   switch (base) {
@@ -211,7 +226,7 @@ function hashAlgorithm(base: string): string | undefined {
     case 'ecdsa-sha2-nistp256': return 'sha256';
     case 'ecdsa-sha2-nistp384': return 'sha384';
     case 'ecdsa-sha2-nistp521': return 'sha512';
-    default: return undefined;
+    default: throw new Error(`no signing digest defined for algorithm "${base}"`);
   }
 }
 

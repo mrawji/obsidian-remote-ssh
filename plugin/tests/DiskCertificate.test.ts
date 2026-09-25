@@ -68,6 +68,26 @@ describe('loadDiskCertificate without a sibling certificate', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('falls back (returns null) on an ssh-dss certificate — no local DSA framing', () => {
+    // ssh-dss passes isUsableIdentity (the agent path can sign it) but this
+    // local signer does not do DSA's RFC 4253 §6.6 reframing, so it must be
+    // skipped rather than signed wrong. Build a blob whose leading SSH string
+    // is the DSS cert type; the body past it is irrelevant to this check.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orst-dss-'));
+    try {
+      const keyPath = path.join(dir, 'id_dsa');
+      fs.writeFileSync(keyPath, 'unused');
+      const algo = 'ssh-dss-cert-v01@openssh.com';
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(algo.length, 0);
+      const blob = Buffer.concat([len, Buffer.from(algo), Buffer.from('trailing-cert-bytes')]);
+      fs.writeFileSync(`${keyPath}-cert.pub`, `${algo} ${blob.toString('base64')} comment\n`);
+      expect(loadDiskCertificate(keyPath, Buffer.from('unused'))).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('sshSignatureBody', () => {

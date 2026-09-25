@@ -228,8 +228,15 @@ function buildJumpAuthConfig(
         );
       }
       // As with the target host: a sibling `<key>-cert.pub` is presented via
-      // the local signer, with the bare key offered alongside as fallback.
-      // (JumpHostConfig has no passphrase field yet — see the note above.)
+      // the local signer, and the bare key is offered alongside it. ssh2 tries
+      // the bare key first (`publickey`) and the certificate second (`agent`).
+      //
+      // Caveat, since `JumpHostConfig` carries no passphrase: with an ENCRYPTED
+      // bastion key `loadDiskCertificate` can't parse it, so the certificate is
+      // skipped with a warning — and the bare-key fallback can't decrypt it
+      // either, so neither succeeds. Not a regression (this path never had a
+      // passphrase), but a user with an encrypted jump key + cert will see the
+      // jump fail without an obvious reason; a passphrase field is future work.
       const certAgent = loadDiskCertificate(keyPath, privateKey);
       if (certAgent) {
         logger.info(`Jump host auth: using certificate ${certificateFilePath(keyPath)} (bare key ${keyPath} offered as fallback)`);
