@@ -4,24 +4,15 @@
  *
  *   node scripts/socks5-connect.mjs <host> <port> [socks-host:socks-port]
  *
- * The test process runs on the developer's machine (or the CI runner), which
- * is not a member of the throwaway tailnet that `docker-compose.tailnet.yml`
- * builds. The `ts-client` node in that tailnet publishes a SOCKS5 port on
- * `127.0.0.1:1055`; this script performs the SOCKS5 CONNECT and then pipes
- * stdin/stdout, which is exactly the contract OpenSSH's `ProxyCommand` — and
- * therefore `ProxyCommandTunnel` — expects.
+ * Performs the SOCKS5 CONNECT against `ts-client`'s published port, then
+ * pipes stdin/stdout — the contract OpenSSH's `ProxyCommand`, and so
+ * `ProxyCommandTunnel`, expects.
  *
- * Why not `nc -X 5 -x …`
- * ---------------------
- * Because `-X` is a netcat-openbsd/BSD extension. GNU netcat does not have
- * it, busybox nc does not have it, and Windows has no nc at all. The tailnet
- * environment is meant to run wherever the ordinary suite runs, so its one
- * external moving part is a Node script in the repo rather than whichever
- * netcat happens to be installed.
+ * Not `nc -X 5`: that flag is a BSD/openbsd-netcat extension, absent from
+ * GNU netcat, busybox and Windows.
  *
- * The hostname is sent to the proxy unresolved (SOCKS5 ATYP=3), so MagicDNS
- * names like `vault.tailnet.test` are resolved by `tailscaled` inside the
- * tailnet — which is what a real Tailscale user's resolver does too.
+ * The hostname goes to the proxy unresolved (ATYP=3) so `tailscaled`
+ * resolves MagicDNS names, as a real user's resolver would.
  */
 
 import * as net from 'node:net';
@@ -38,22 +29,16 @@ const [proxyHost, proxyPortArg] = (proxyArg ?? process.env.ORSSH_SOCKS5 ?? '127.
 const proxyPort = Number(proxyPortArg);
 
 /**
- * Fail loudly on stderr and with a non-zero status.
- *
- * `ProxyCommandTunnel` logs this process's stderr (`logger.warn`) and warns
- * on a non-zero exit, so both halves matter: exiting 0 after a failed
- * handshake is indistinguishable from a tunnel that closed normally, and
- * nothing downstream would say a word.
+ * Both halves matter: `ProxyCommandTunnel` logs this stderr and warns on a
+ * non-zero exit, and exiting 0 after a failed handshake is indistinguishable
+ * from a tunnel that closed normally.
  */
 function die(msg) {
   console.error(`socks5-connect: ${msg}`);
   process.exit(1);
 }
 
-/**
- * True once the tunnel is carrying traffic. Until then a closed socket is a
- * failure, not an end-of-tunnel — see the `close` handler at the bottom.
- */
+/** Until this is set, a closed socket is a failure, not an end-of-tunnel. */
 let piping = false;
 
 /** How far the handshake got, for the diagnostics in `read()`. */
@@ -76,11 +61,8 @@ function read(n) {
   return new Promise((resolve) => {
     const attempt = () => {
       const chunk = sock.read(n);
-      // Once the stream has ended, `read(n)` stops returning null and hands
-      // back whatever short remainder is buffered. Accepting it would index
-      // past the end of the reply and report something invented — a
-      // truncated CONNECT reply used to surface as "unknown address type
-      // undefined" rather than "the proxy hung up".
+      // After the stream ends, `read(n)` returns a SHORT buffer rather than
+      // null. Accepting it indexes past the reply and invents a reason.
       if (chunk && chunk.length === n) resolve(chunk);
       else if (chunk) die(`proxy sent ${chunk.length} of ${n} expected bytes, then closed`);
       else if (sock.readableEnded) die(`proxy closed the connection after ${bytesRead} bytes, mid-handshake`);
@@ -135,11 +117,8 @@ sock.on('connect', async () => {
   sock.pipe(process.stdout);
 });
 
-// Once the tunnel is carrying traffic, a close is the tunnel ending and
-// exiting 0 lets ssh2 see a clean EOF. Before that it is a failure: a peer
-// that accepts the connection and then hangs up sends no `error` event at
-// all, so without this the script exits 0 with an empty stdout and says
-// nothing — the exact silent-success this file's `die()` exists to avoid.
+// A peer that accepts and then hangs up emits no `error` at all, so without
+// the guard this exited 0 with empty stdout and said nothing.
 sock.on('close', () => {
   if (piping) process.exit(0);
   die('proxy closed the connection before the SOCKS5 handshake completed');
