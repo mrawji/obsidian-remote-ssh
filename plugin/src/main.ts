@@ -75,6 +75,7 @@ import {
   DaemonVerificationError,
   binaryFilename,
 } from './transport/DaemonDownloader';
+import { ensureDaemonBinary as ensureRemoteDaemonBinary } from './transport/ensureDaemonBinary';
 import { createHash } from 'crypto';
 import { TransferTracker } from "./util/TransferTracker";
 import { LargeTransferBar } from "./ui/LargeTransferBar";
@@ -82,7 +83,6 @@ import { OnboardingModal } from "./ui/OnboardingModal";
 import { telemetry, telemetryLogPath } from "./util/Telemetry";
 
 /** GitHub `owner/repo` the daemon binaries are released from. */
-const DAEMON_RELEASE_REPO = 'sotashimozono/obsidian-remote-ssh';
 
 /**
  * Everything this plugin keeps OUTSIDE any vault, on every OS:
@@ -1682,173 +1682,21 @@ export default class RemoteSshPlugin extends Plugin {
     return fs.existsSync(candidate) ? candidate : null;
   }
 
-  /**
-   * sha256 (hex) of a cached daemon binary, or null if it can't be read.
-   * Used by the connect fast-path to re-validate the cached bytes without a
-   * network round-trip. Reads the whole file (a daemon binary is a few MB) —
-   * cheap next to the SSH connect it gates.
-   */
-  private async sha256File(abs: string): Promise<string | null> {
-    try {
-      const buf = await fs.promises.readFile(abs);
-      return createHash('sha256').update(buf).digest('hex');
-    } catch {
-      return null;
-    }
-  }
+
 
   /**
-   * Acquire a daemon binary for the REMOTE's os/arch when one isn't staged
-   * locally. Community-store installs don't ship `server-bin/`, so we probe
-   * the remote with `uname`, download the matching binary from this plugin's
-   * GitHub release, and verify it against `daemon-manifest.json` (sha256)
-   * before caching it under `server-bin/`. Returns `null` (→ caller
-   * downgrades to SFTP) for an unsupported arch, a failed probe, a declined
-   * download, or a benign download failure. A sha256/integrity failure is
-   * NOT swallowed — it throws so the connect surfaces it loudly.
+   * Acquire a daemon binary for the remote's os/arch. The logic lives in
+   * `transport/ensureDaemonBinary` so it can be tested without building a
+   * plugin, and so its coverage is visible.
    */
-  private async ensureDaemonBinary(client: SftpClient): Promise<string | null> {
-    // Probe the remote os/arch. A FAILED probe (non-zero exit / SSH exec
-    // error) is logged distinctly from an UNSUPPORTED arch — both stay on
-    // SFTP, but conflating them hid real exec failures behind a misleading
-    // "unsupported arch" message (#406 review).
-    let target: Awaited<ReturnType<typeof detectRemoteTarget>>;
-    try {
-      target = await detectRemoteTarget(async (cmd) => {
-        const r = await client.exec(cmd);
-        if (r.exitCode !== 0) {
-          throw new Error(`'${cmd}' exited ${r.exitCode}: ${r.stderr.trim() || '(no stderr)'}`);
-        }
-        return r.stdout;
-      });
-    } catch (e) {
-      logger.warn(`ensureDaemonBinary: remote uname probe failed (${errorMessage(e)}); staying on SFTP`);
-      return null;
-    }
-    if (!target) {
-      logger.warn('ensureDaemonBinary: unsupported remote os/arch; staying on SFTP');
-      return null;
-    }
-
-    const pluginDir = this.pluginDir();
-    if (!pluginDir) return null;
-    const cacheDir = path.join(pluginDir, 'server-bin');
-
-    // R3: `server-bin` must be a REAL per-shadow dir. Older installs (and dev
-    // symlink installs) could leave it as a junction to ANOTHER vault's
-    // server-bin (installPlugin used to propagate it); if that target vault was
-    // later deleted, the junction dangles and mkdir throws a raw ENOENT — the
-    // connect then silently degrades to SFTP. Try a plain mkdir first (a valid
-    // dir/junction is fine); on failure, unlink a stale reparse point (never
-    // following into / deleting its target) and recreate a real dir. Only give
-    // up to SFTP if even that fails.
-    try {
-      fs.mkdirSync(cacheDir, { recursive: true });
-    } catch (firstErr) {
-      let repaired = false;
-      try {
-        // lstat succeeds for a dangling junction; unlink drops the link only.
-        if (fs.lstatSync(cacheDir).isSymbolicLink()) {
-          fs.unlinkSync(cacheDir);
-          fs.mkdirSync(cacheDir, { recursive: true });
-          repaired = true;
-        }
-      } catch { /* fall through to the SFTP path below */ }
-      if (!repaired) {
-        logger.error(
-          `ensureDaemonBinary: server-bin unusable (${errorMessage(firstErr)}); staying on SFTP. ` +
-          'If this persists, delete the shadow vault dir under ~/.obsidian-remote/vaults and reconnect.',
-        );
-        new Notice(
-          'Remote SSH: the daemon cache dir is broken — staying on SFTP. If this persists, ' +
-          'delete the vault dir under ~/.obsidian-remote/vaults and reconnect.',
-        );
-        return null;
-      }
-      logger.warn(`ensureDaemonBinary: repaired a stale server-bin link at ${cacheDir}`);
-    }
-
-    // Fast path: reuse the cached binary without a GitHub round-trip when it
-    // was provisioned for THIS plugin version AND its bytes still hash to the
-    // recorded sha. The sha re-check upholds the "never deploy an unverified
-    // binary" invariant even here — a file corrupted/truncated after its
-    // verified download is caught (network-free) and re-fetched below. A
-    // version mismatch, missing marker, or sha mismatch falls through to the
-    // manifest sha re-check / download.
-    const dest = path.join(cacheDir, binaryFilename(target));
-    if (
-      this.settings.daemonBinaryVersion === this.manifest.version &&
-      this.settings.daemonBinarySha &&
-      (await this.sha256File(dest)) === this.settings.daemonBinarySha
-    ) {
-      logger.info(`ensureDaemonBinary: cached daemon validated for ${this.manifest.version}; reusing`);
-      return dest;
-    }
-
-    // Consent gate (asked once; the decision — accept OR decline — is
-    // persisted so a decline doesn't re-prompt on every connect / restart).
-    const consented = await resolveDaemonConsent(
-      this.settings.daemonDownloadConsented === true,
-      () => this.confirmDaemonDownload(this.manifest.version),
-      async (c) => { this.settings.daemonDownloadConsented = c; await this.saveSettings(); },
-    );
-    if (!consented) {
-      logger.info('ensureDaemonBinary: user declined daemon download; staying on SFTP');
-      return null;
-    }
-
-    try {
-      const local = await downloadDaemonBinary(
-        {
-          fetchBinary: async (url) => new Uint8Array((await requestUrl({ url })).arrayBuffer),
-          fetchText: async (url) => (await requestUrl({ url })).text,
-          cacheDir,
-          readCached: async (abs) => {
-            try { return new Uint8Array(await fs.promises.readFile(abs)); }
-            catch { return null; }
-          },
-          writeExecutable: async (abs, bytes) => {
-            // Atomic: write a temp sibling, chmod, then rename. A crash
-            // mid-write can't then leave a torn binary that a later sha
-            // re-check would hand back unverified (#406 review).
-            await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-            const tmp = `${abs}.${process.pid}.tmp`;
-            await fs.promises.writeFile(tmp, bytes);
-            await fs.promises.chmod(tmp, 0o755);
-            await fs.promises.rename(tmp, abs);
-          },
-          repo: DAEMON_RELEASE_REPO,
-          version: this.manifest.version,
-        },
-        target,
-      );
-      // Record the version + sha this cached binary is validated for, so the
-      // next same-version connect takes the network-free fast path above.
-      // Non-fatal: the binary is verified on disk, so a marker-persist failure
-      // must NOT be reported as a download failure — we just re-verify on the
-      // next connect.
-      try {
-        this.settings.daemonBinaryVersion = this.manifest.version;
-        this.settings.daemonBinarySha = (await this.sha256File(local)) ?? undefined;
-        await this.saveSettings();
-      } catch (e) {
-        logger.warn(
-          `ensureDaemonBinary: daemon ready but failed to persist cache marker ` +
-          `(${errorMessage(e)}); will re-verify on the next connect`,
-        );
-      }
-      new Notice(`Remote SSH: daemon ready for ${target.os}/${target.arch}.`);
-      return local;
-    } catch (e) {
-      // A sha256 mismatch / malformed manifest (DaemonVerificationError) is a
-      // tamper/integrity signal — rethrow so the connect surfaces it loudly
-      // (ERROR state + classified Notice) instead of a quiet "Using SFTP".
-      // Only benign failures (network / 404) downgrade silently.
-      if (e instanceof DaemonVerificationError) throw e;
-      logger.error(`ensureDaemonBinary: download failed: ${errorMessage(e)}`);
-      new Notice(`Remote SSH: daemon download failed — ${errorMessage(e)}. Using SFTP.`);
-      return null;
-    }
+  private ensureDaemonBinary(client: SftpClient): Promise<string | null> {
+    return ensureRemoteDaemonBinary(client, {
+      pluginDir: () => this.pluginDir(),
+      pluginVersion: this.manifest.version,
+      settings: this.settings,
+      saveSettings: () => this.saveSettings(),
+      confirmDownload: (v) => this.confirmDaemonDownload(v),
+    });
   }
 
   /** One-time consent dialog for the daemon auto-download. */
