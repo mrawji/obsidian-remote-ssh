@@ -38,7 +38,7 @@ vi.mock('../src/shadow/CommunityPluginsSync', () => ({
   readEnabledPluginIds: () => ['remote-ssh'],
 }));
 
-import { syncConfigAfterConnect, type ConfigSyncPorts } from '../src/shadow/postConnectConfigSync';
+import { syncConfigAfterConnect, watcherPorts, type ConfigSyncPorts } from '../src/shadow/postConnectConfigSync';
 import type { SharedConfigWatcher } from '../src/shadow/SharedConfigWatcher';
 
 /** A watcher that only records what was done to it, and in what order. */
@@ -175,5 +175,51 @@ describe('syncConfigAfterConnect — every step is best-effort', () => {
   it('stays quiet when nothing errored', async () => {
     await syncConfigAfterConnect(ports());
     expect(notices).toEqual([]);
+  });
+});
+
+describe('watcherPorts — how the real watcher reaches disk and remote', () => {
+  it('reads a local config file', () => {
+    fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{"theme":"obsidian"}');
+
+    expect(watcherPorts(ports()).readLocal('app.json')).toBe('{"theme":"obsidian"}');
+  });
+
+  it('returns null for a file that is not there, rather than throwing', () => {
+    // A fresh vault legitimately has none of these yet; throwing here would
+    // take down the watcher on a perfectly normal vault.
+    expect(watcherPorts(ports()).readLocal('nothing-here.json')).toBeNull();
+  });
+
+  it('pushes through the adapter when it flushes', async () => {
+    await watcherPorts(ports()).flush();
+
+    expect(pushShared).toHaveBeenCalledTimes(1);
+  });
+
+  it('names the files that could not be pushed', async () => {
+    // Without this the user sees a settings change that silently never
+    // reaches the remote — #342 from the other direction.
+    pushShared.mockImplementation(record('pushShared', {
+      pushed: [], skipped: [], errored: ['hotkeys.json', 'app.json'],
+    }));
+
+    await watcherPorts(ports()).flush();
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('hotkeys.json');
+    expect(notices[0]).toContain('app.json');
+  });
+
+  it('says nothing when the push was clean', async () => {
+    await watcherPorts(ports()).flush();
+
+    expect(notices).toEqual([]);
+  });
+
+  it('hands back a handle that closes the fs watch', () => {
+    const handle = watcherPorts(ports()).watch(() => { /* not asserted here */ });
+
+    expect(() => handle.close()).not.toThrow();
   });
 });

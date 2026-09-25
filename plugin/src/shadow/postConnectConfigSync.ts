@@ -44,9 +44,17 @@ export interface ConfigSyncPorts {
   makeWatcher?(p: ConfigSyncPorts): SharedConfigWatcher;
 }
 
-/** The real watcher: fs.watch on the local config dir, pushing on a debounce. */
-function defaultWatcher(p: ConfigSyncPorts): SharedConfigWatcher {
-  return new SharedConfigWatcher({
+/**
+ * How the real watcher reaches the disk and the remote.
+ *
+ * Separate from constructing it so the three callbacks can be exercised: one
+ * of them is the only thing that tells a user their settings did not reach
+ * the remote, which is #342 in miniature.
+ *
+ * @internal Exported for testing.
+ */
+export function watcherPorts(p: ConfigSyncPorts): ConstructorParameters<typeof SharedConfigWatcher>[0] {
+  return {
     watch: (onChange) => {
       const w = fs.watch(
         p.localConfigDir, { persistent: false },
@@ -73,7 +81,11 @@ function defaultWatcher(p: ConfigSyncPorts): SharedConfigWatcher {
     debounceMs: 1500,
     setTimer: (cb, ms) => window.setTimeout(cb, ms),
     clearTimer: (h) => window.clearTimeout(h as number),
-  });
+  };
+}
+
+function defaultWatcher(p: ConfigSyncPorts): SharedConfigWatcher {
+  return new SharedConfigWatcher(watcherPorts(p));
 }
 
 /**
