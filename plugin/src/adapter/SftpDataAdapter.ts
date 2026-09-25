@@ -1,18 +1,11 @@
 import type { DataWriteOptions, ListedFiles, Stat } from 'obsidian';
 
-/**
- * Source extensions whose `getResourcePath` hits the daemon's
- * `fs.thumbnail` path instead of pulling the full original. Matches
- * the daemon's supported decoder set (jpg / png / gif via image.Decode);
- * webp / heic land later (cgo / external libs).
- */
+/** The daemon's decoder set. webp / heic need cgo, so they pull the original. */
 const THUMBNAIL_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif']);
 
 /**
- * Default longer-side cap for `getResourcePath` thumbnails. 1024 px
- * is sharp on Retina displays without sending camera-original sizes;
- * a 8 MB JPEG resizes to ~150 KB. Click-to-zoom flows that want the
- * original go through `readBinary`, which never adds the thumb hint.
+ * Sharp on Retina without camera-original sizes — an 8 MB JPEG lands at
+ * ~150 KB. Click-to-zoom goes through `readBinary`, which never hints a thumb.
  */
 const DEFAULT_THUMB_MAX_DIM = 1024;
 
@@ -69,71 +62,33 @@ export class SftpDataAdapter {
     private readCache: ReadCache,
     private dirCache: DirCache,
     private vaultName: string,
-    /**
-     * Optional per-client path remapping. When supplied, paths matching
-     * the mapper's "private" patterns (e.g. `.obsidian/workspace.json`)
-     * are redirected into a per-client subtree on the remote so two
-     * machines on the same vault don't clobber each other's UI state.
-     * Phase 4-J0.
-     */
+    /** Per-client path remapping; see {@link toRemote}. */
     private pathMapper: PathMapper | null = null,
-    /**
-     * Optional localhost HTTP bridge that serves binary content to the
-     * Obsidian webview. When supplied, `getResourcePath` returns a
-     * bridge URL so `<img>`, `<iframe>`, `<audio>` etc. can render
-     * remote-vault assets.
-     */
+    /** Serves binaries to the webview; see {@link getResourcePath}. */
     private resourceBridge: ResourceBridge | null = null,
     /**
-     * Optional conflict resolver. When a write fails with
-     * `PreconditionFailed` and a resolver is wired, it runs the
-     * 3-way merge or two-choice modal flow. When omitted (e.g.
-     * unit tests), conflicts surface as the underlying `RpcError`.
+     * Runs the merge or two-choice modal on `PreconditionFailed`. Without it,
+     * a conflict surfaces as the raw `RpcError`.
      */
     private conflictResolver: ConflictResolver | null = null,
     /**
-     * Optional snapshot store: every text read remembers its
-     * (content, mtime) here, and a subsequent `PreconditionFailed`
-     * write pulls the ancestor out so the 3-way merge UI has all
-     * three panes to show. Per-session, never persisted.
+     * Every text read remembers `(content, mtime)` here, so a later conflict
+     * has an ancestor to show as the third pane. Per-session, never persisted.
      */
     private ancestorTracker: AncestorTracker | null = null,
     /**
-     * Optional persistent queue. When supplied, write-side calls that
-     * land while `setReconnecting(true)` succeed synthetically (the
-     * editor sees the new content via the local read cache) and the
-     * op is appended to the queue. The replayer (E2-β.3) drains the
-     * queue when the session recovers. When omitted, writes during
-     * reconnect throw — the legacy behaviour.
+     * With it, a write during a reconnect succeeds synthetically — the editor
+     * sees its own content through the read cache — and is drained on
+     * recovery. Without it, such a write throws.
      */
     private offlineQueue: OfflineQueue | null = null,
     /**
-     * Absolute filesystem path of the shadow vault's local root. When
-     * patched onto `app.vault.adapter`, the `basePath` getter and
-     * `getBasePath()` method return this value, so plugins that read
-     * `adapter.basePath` (Templater's `tp.file.path`, Kanban's clipboard
-     * paste, Importer, Copilot — see `docs/en/user-guide/plugin-compatibility.md`)
-     * receive the shadow-vault root (so they don't crash on
-     * `undefined`). But the vault tree is virtual — served from the
-     * remote, not mirrored to disk — so raw Node `fs` here only touches
-     * the local shadow copy: reads miss remote notes, writes don't
-     * reach the remote. Only the vault API round-trips (#429).
-     *
-     * Defaults to `''` for tests that never exercise these members. The
-     * production wiring in `main.ts` always passes the real shadow
-     * vault root via `(adapter as FileSystemAdapter).getBasePath()`
-     * captured before the patch is applied.
-     *
-     * Survey: PR #165 / docs/en/user-guide/plugin-compatibility.md "basePath compat
-     * survey". Implementation: #170.
+     * The shadow vault's local root, surfaced by {@link basePath}. Production
+     * captures it from the real `FileSystemAdapter` before patching; `''` is
+     * for tests that never read it. Survey in PR #165, implementation #170.
      */
     private shadowBasePath: string = '',
-    /**
-     * Optional in-flight transfer tracker. When supplied, large
-     * (>1 MB) write/read payloads are registered with the tracker
-     * so the StatusBar can display a "transfer in progress" indicator
-     * (#127). When omitted (e.g. unit tests), no UI signaling occurs.
-     */
+    /** Registers payloads over 1 MB so the StatusBar can show progress (#127). */
     private transferTracker: TransferTracker | null = null,
     /**
      * Parks a read across a reconnect instead of failing it. Injectable so a
@@ -144,11 +99,13 @@ export class SftpDataAdapter {
   ) {}
 
   /**
-   * Mirror of `FileSystemAdapter.basePath`: the shadow-vault local
-   * root. The vault tree is virtual (not mirrored to disk), so raw
-   * `fs` against this path only touches the local shadow copy — writes
-   * don't reach the remote (#429); only the vault API round-trips.
-   * #170 returns a defined path so plugins don't crash.
+   * `FileSystemAdapter.basePath`, so plugins that join paths against it
+   * (Templater, Kanban, Importer, Copilot) get a real path instead of
+   * `undefined` (#170).
+   *
+   * The vault tree is virtual, so raw `fs` here reaches only the local shadow
+   * copy: reads miss remote notes and writes never leave the machine. Only
+   * the vault API round-trips (#429).
    */
   get basePath(): string {
     return this.shadowBasePath;
@@ -276,15 +233,12 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Post-success bookkeeping for a local mutation that actually hit
-   * the remote: (1) record the affected path(s) so the RPC echo of
-   * our own op is de-duped, then (2) reflect it into the writer's
-   * vault model. Order matters — the record is synchronous and must
-   * land before the daemon's later echo can arrive. Both steps are
-   * best-effort and never surface to the editor as a write failure.
+   * Record the paths, then reflect. The record is synchronous and must land
+   * before the daemon's echo arrives, or the echo fires a second trigger.
+   * Both steps are best-effort.
    *
-   * `echoPaths` is what the daemon's `fs.changed` frame will name
-   * (rename echoes both old + new, possibly as separate events).
+   * `echoPaths` is what `fs.changed` will name — a rename echoes old and new,
+   * possibly as separate events.
    */
   private applied(echoPaths: string[], run: (r: WriterReflector) => void): void {
     this.localOpRegistry?.record(echoPaths);
@@ -408,12 +362,9 @@ export class SftpDataAdapter {
   }
 
   /**
-   * URL the Obsidian webview should fetch to render this asset. If
-   * the ResourceBridge is wired, the URL hits its localhost server
-   * (which calls back into this adapter's `readBinary` for the bytes,
-   * with all the cache + path-mapping logic intact). Without a bridge
-   * we hand back an empty `data:` URL — the asset won't render, but
-   * the read path is the only one that actually needs the bridge.
+   * URL for the webview. The bridge's server calls back into `readBinary`, so
+   * caching and path mapping stay intact. Without one the asset does not
+   * render — only this method needs the bridge.
    */
   getResourcePath(normalizedPath: string): string {
     if (this.resourceBridge && this.resourceBridge.isRunning()) {
@@ -572,12 +523,10 @@ export class SftpDataAdapter {
       }
       this.invalidatePath(remote);
       this.ancestorTracker?.invalidate(normalizedPath);
-      // Reflect only when the delete actually hit the remote. While
-      // reconnecting the op is merely queued; mirroring the model now
-      // would drop the entry locally even though the file still
-      // exists remotely, and a failed replay would leave them
-      // permanently diverged (the QueueReplayer path does not
-      // re-reflect).
+      // Only when the delete actually hit the remote. While reconnecting it is
+      // merely queued, so reflecting now would drop the entry locally while
+      // the file still exists remotely — and a failed replay leaves them
+      // diverged for good, since the replayer does not re-reflect.
       if (!this.reconnecting) this.applied([normalizedPath], r => r.reflectRemove(normalizedPath));
     } finally {
       perfTracer.end(__t1, { op: 'remove', path: normalizedPath });
@@ -649,10 +598,8 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Move the path under `<vault>/.trash/`, mirroring Obsidian's local-trash
-   * behaviour but on the remote. Existing files at the target are
-   * overwritten; existing directories cause the rename to fail (that
-   * matches the desktop behaviour).
+   * Obsidian's local-trash behaviour, on the remote. A file at the target is
+   * overwritten; a directory makes the rename fail, as on the desktop.
    */
   async trashLocal(normalizedPath: string): Promise<void> {
     // Implemented as a rename under .trash/; the rename method
@@ -746,20 +693,14 @@ export class SftpDataAdapter {
   // ─── offline queue helpers (E2-β) ──────────────────────────────────────
 
   /**
-   * Append a text write to the offline queue and refresh local
-   * caches so the editor sees the just-written content. Throws the
-   * legacy `reconnecting` error when no queue is wired.
+   * Queue the write and refresh local caches so the editor sees its own
+   * content. Throws when no queue is wired.
    *
-   * The queued op carries `expectedMtime` (the cached mtime at
-   * enqueue time — i.e. the mtime the file had when the user started
-   * typing) so the replayer can route through the 3-way merge UI on
-   * conflict-during-replay.
+   * The op carries the mtime the file had when the user started typing, so a
+   * conflict during replay can still reach the merge UI.
    *
-   * The ancestor tracker is intentionally NOT refreshed here:
-   * keeping the original "what user read" snapshot is what makes the
-   * eventual conflict modal useful. Refreshing it would erase the
-   * pre-edit content and the user would see (mine, mine, theirs) —
-   * useless for a real merge decision.
+   * The ancestor tracker is deliberately NOT refreshed: it holds what the
+   * user actually read. Refreshing it would show them (mine, mine, theirs).
    */
   private async queueOrThrowText(normalizedPath: string, data: string): Promise<void> {
     if (!this.offlineQueue) throw reconnectingError();
@@ -802,13 +743,9 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Fetch (or revalidate) the file's contents.
-   *
-   * If the cache has an entry, stat the remote and reuse the cached buffer
-   * when mtimes agree. Otherwise read the file, then opportunistically
-   * stat it so the cache entry has a real mtime to compare against next
-   * time. The opportunistic stat after a fresh read is best-effort: a
-   * failure is logged but does not block the read result.
+   * Fetch or revalidate. A cached entry is reused when the remote stat agrees;
+   * otherwise the file is read and then stat'd so the next comparison has a
+   * real mtime. That trailing stat is best-effort and never blocks the read.
    */
   private async readBuffer(normalizedPath: string): Promise<Buffer> {
     const remote = this.toRemote(normalizedPath);
@@ -1038,25 +975,20 @@ export class SftpDataAdapter {
 
 
   /**
-   * Drop cache entries for a path the daemon just reported as
-   * changed via an `fs.changed` push. The argument is the daemon's
-   * vault-relative path (already past PathMapper for private files);
-   * the adapter joins it with `remoteBasePath` to recover the cache
-   * key it actually stored under.
+   * Drop caches for a path the daemon reported changed. The argument is
+   * already past PathMapper, so only `remoteBasePath` is joined back on to
+   * recover the key this adapter stored under.
    */
   invalidateRemotePath(remoteVaultPath: string): void {
     this.invalidatePath(this.joinRemote(remoteVaultPath));
   }
 
   /**
-   * Resolve a vault-relative path to the absolute path on the remote.
-   *
-   * If a PathMapper is attached, private vault paths are first
-   * redirected into the per-client subtree (`.obsidian/workspace.json`
-   * → `.obsidian/user/<id>/workspace.json`) so two machines on the
-   * same vault don't trample each other's UI state. The mapped result
-   * is then joined with `remoteBasePath` to form the full path the
-   * `RemoteFsClient` sees.
+   * Vault-relative to remote-absolute. Private paths are redirected into the
+   * per-client subtree first (`.obsidian/workspace.json` →
+   * `.obsidian/user/<id>/workspace.json`), so two machines on one vault do
+   * not trample each other's UI state; the result is joined onto
+   * `remoteBasePath`.
    */
   toRemote(normalizedPath: string): string {
     const mapped = this.pathMapper
@@ -1100,11 +1032,9 @@ function parentDirRemote(p: string): string {
 }
 
 /**
- * Stable error thrown by every adapter method while a reconnect is
- * in flight. Distinguishes the "remote is temporarily unavailable"
- * case from "file not found" / "permission denied" so callers (and
- * the Obsidian editor in particular) can surface a friendly notice
- * rather than a generic IO failure.
+ * One error for "temporarily unavailable", distinct from not-found and
+ * permission-denied, so the editor can say something useful instead of
+ * reporting a generic IO failure.
  */
 function reconnectingError(): Error {
   return new Error('Remote SSH: reconnecting — try again once the connection is restored');
