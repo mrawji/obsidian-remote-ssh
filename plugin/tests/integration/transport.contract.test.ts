@@ -5,7 +5,9 @@ import { AuthResolver } from '../../src/ssh/AuthResolver';
 import { SecretStore } from '../../src/ssh/SecretStore';
 import { HostKeyStore } from '../../src/ssh/HostKeyStore';
 import type { SshProfile } from '../../src/types';
-import { TEST_HOST, TEST_PORT, TEST_USER, TEST_PRIVATE_KEY } from '../../test-env/target';
+import {
+  TEST_HOST, TEST_PORT, TEST_USER, TEST_PRIVATE_KEY, TEST_PROXY_COMMAND, SSHD_CONTAINER,
+} from '../../test-env/target';
 import { describeTransportContract, type TransportHarness } from '../helpers/transportContract';
 
 /**
@@ -25,8 +27,6 @@ import { describeTransportContract, type TransportHarness } from '../helpers/tra
  * bastion, which tears every channel down and hides this entirely.
  */
 
-const SSHD_CONTAINER = 'obsidian-remote-ssh-test-sshd';
-
 const networkOf = (container: string): string =>
   execFileSync('docker', [
     'inspect', container,
@@ -39,20 +39,28 @@ const ECHO_LISTENER =
   + 'my $s=IO::Socket::INET->new(LocalPort=>9999,Listen=>5,ReuseAddr=>1) or die $!;'
   + 'while(my $c=$s->accept){ $c->autoflush(1); while(my $l=<$c>){ print $c $l; } }';
 
-const RUNNABLE = (() => {
-  try {
-    if (spawnSync('docker', ['version'], { stdio: 'ignore' }).error) return false;
-    return spawnSync('docker', ['inspect', SSHD_CONTAINER], { stdio: 'ignore' }).status === 0;
-  } catch { return false; }
-})();
+/**
+ * `JumpHostTunnel` dials the bastion directly, so this can only run where
+ * the sshd is directly reachable. In the tailnet environment it is behind a
+ * ProxyCommand, which this route has no way to use — the same reason
+ * `certificate-auth` sits out there.
+ */
+const SKIP_REASON = TEST_PROXY_COMMAND
+  ? 'the bastion is only reachable through a proxy here'
+  : undefined;
 
-if (!RUNNABLE) {
-  // Loud rather than silent: this file exists to hold the bastion route to
-  // the contract, and a quiet skip would read as coverage.
-  throw new Error(
-    'Transport contract (jump host) needs the docker sshd. '
-    + 'Run `npm run sshd:start` before `npm run test:integration`.',
-  );
+if (!SKIP_REASON) {
+  // Loud rather than silent where it SHOULD run: this file is what holds
+  // the bastion route to the contract.
+  const dockerUp = !spawnSync('docker', ['version'], { stdio: 'ignore' }).error;
+  const sshdUp = dockerUp
+    && spawnSync('docker', ['inspect', SSHD_CONTAINER], { stdio: 'ignore' }).status === 0;
+  if (!sshdUp) {
+    throw new Error(
+      `Transport contract (jump host) needs ${SSHD_CONTAINER}. `
+      + 'Run `npm run sshd:start` before `npm run test:integration`.',
+    );
+  }
 }
 
 function startPeer(name: string, network: string): void {
@@ -155,4 +163,4 @@ describeTransportContract('jump host', async (): Promise<TransportHarness> => {
       removePeer(name);
     },
   };
-});
+}, { skip: SKIP_REASON });

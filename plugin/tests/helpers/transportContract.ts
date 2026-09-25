@@ -53,8 +53,20 @@ function firstOf(stream: Duplex, events: string[], ms = 3_000): Promise<string> 
 export function describeTransportContract(
   name: string,
   makeHarness: () => Promise<TransportHarness>,
+  opts: {
+    /**
+     * Why this route cannot be exercised here. Visible in the test name
+     * rather than absent from the run: a contract suite that quietly does
+     * not run reads as coverage.
+     */
+    skip?: string;
+  } = {},
 ): void {
-  describe(`${name} — Transport contract`, () => {
+  const suite = opts.skip ? describe.skip : describe;
+  const title = opts.skip
+    ? `${name} — Transport contract (skipped: ${opts.skip})`
+    : `${name} — Transport contract`;
+  suite(title, () => {
     it('reaches close when the far end hangs up', async () => {
       // The one that cost 87 days: `end` alone leaves ssh2 believing the
       // session is live, because only `close` reaches its `Client`.
