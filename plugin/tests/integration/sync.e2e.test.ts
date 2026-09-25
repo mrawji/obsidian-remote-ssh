@@ -461,10 +461,10 @@ describe('Phase C E2E — sync reflect matrix', () => {
     // F19 (in-order delivery) by pre-populating the OfflineQueue and
     // running QueueReplayer against the connected writerAdapter.
     //
-    // The "disconnect" half of the spec (forcibly killing the SSH
-    // socket so SftpDataAdapter.write* enqueues internally) involves
-    // AdapterManager orchestration that's already covered by the
-    // unit-test suite for OfflineQueue + ReconnectManager. Here we
+    // The "disconnect" half of the spec — killing the SSH socket so
+    // SftpDataAdapter.write* enqueues internally — is driven through
+    // AdapterManager, and the unit suite covers OfflineQueue and
+    // ReconnectManager rather than that orchestration itself. Here we
     // focus on the integration assertion the unit suites can't make:
     // queued ops, drained in order, surface on the reader's
     // FakeFileExplorer with the same ordering the user typed.

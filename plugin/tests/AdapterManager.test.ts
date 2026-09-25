@@ -2,7 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import type { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
 import type { PathMapper } from '../src/path/PathMapper';
 import { AdapterManager, PATCHED_METHODS } from '../src/adapter/AdapterManager';
+import * as path from 'node:path';
+import { FileSystemAdapter } from 'obsidian';
 import type { App, PluginManifest } from 'obsidian';
+import { OfflineQueue } from '../src/offline/OfflineQueue';
 import type { ConnectionManager } from '../src/ConnectionManager';
 import type { FsChangeListener } from '../src/vault/FsChangeListener';
 import type { PendingEditsBar } from '../src/ui/PendingEditsBar';
@@ -411,6 +414,8 @@ describe('AdapterManager.patch()', () => {
   it('replaces the host adapter\'s methods and reports success', async () => {
     const { mgr, hostAdapter } = patchableManager();
     const before = hostAdapter.read;
+    const originals: Record<string, unknown> = {};
+    for (const m of PATCHED_METHODS) originals[m] = hostAdapter[m];
 
     expect(await mgr.patch()).toBe(true);
 
@@ -418,8 +423,16 @@ describe('AdapterManager.patch()', () => {
     expect(mgr.dataAdapter).not.toBeNull();
     expect(hostAdapter.read).not.toBe(before);
     // Not all of them are functions — `basePath` is a value, which is the
-    // whole point of #170: plugins read it and used to get `undefined`.
-    for (const m of PATCHED_METHODS) expect(hostAdapter[m]).toBeDefined();
+    // whole point of #170: plugins read it and used to get `undefined`. So
+    // every name must be present, and every one that WAS a function must now
+    // be a different function: `toBeDefined` alone would pass if the patcher
+    // wired two names to one handler, or left an original in place.
+    for (const m of PATCHED_METHODS) {
+      expect(hostAdapter[m], `${m} is installed`).toBeDefined();
+      if (typeof originals[m] === 'function') {
+        expect(hostAdapter[m], `${m} is the adapter's, not the host's`).not.toBe(originals[m]);
+      }
+    }
   });
 
   it('is idempotent — a second patch does not re-wrap an already-wrapped adapter', async () => {
@@ -450,5 +463,65 @@ describe('AdapterManager.patch()', () => {
     await mgr.patch();
 
     expect(subscribe).not.toHaveBeenCalled();
+  });
+});
+
+describe('AdapterManager.openOfflineQueue()', () => {
+  // Stubbed out by every other test in this file, including the `patch()`
+  // block added to close exactly this kind of gap — so the real body had
+  // never run. What it decides is WHERE the queue lives; get the join wrong
+  // and a user's pending writes are opened somewhere else entirely, with
+  // nothing failing to say so.
+
+  function managerOn(adapter: unknown, configDir = '.obsidian') {
+    return new AdapterManager(
+      { vault: { adapter, configDir } } as unknown as App,
+      { id: 'remote-ssh' } as unknown as PluginManifest,
+      { rpcConnection: null, activeRemoteBasePath: null } as unknown as ConnectionManager,
+      { subscribe: vi.fn(), unsubscribe: vi.fn() } as unknown as FsChangeListener,
+      { startPolling: vi.fn() } as unknown as PendingEditsBar,
+      () => ({}) as unknown as PluginSettings,
+      null,
+    );
+  }
+
+  it('opens the queue beside the plugin, under the vault it is serving', async () => {
+    const fsAdapter = new FileSystemAdapter();
+    (fsAdapter as unknown as { getBasePath: () => string }).getBasePath =
+      () => '/vaults/shadow';
+    const open = vi.spyOn(OfflineQueue, 'open')
+      .mockResolvedValue({} as unknown as OfflineQueue);
+
+    const mgr = managerOn(fsAdapter);
+    await priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr);
+
+    expect(open).toHaveBeenCalledWith(
+      path.join('/vaults/shadow', '.obsidian', 'plugins', 'remote-ssh', 'queue'),
+    );
+    open.mockRestore();
+  });
+
+  it('follows a customised config directory', async () => {
+    // `configDir` is a user setting; hardcoding `.obsidian` would strand the
+    // queue outside the vault for anyone who changed it.
+    const fsAdapter = new FileSystemAdapter();
+    (fsAdapter as unknown as { getBasePath: () => string }).getBasePath = () => '/v';
+    const open = vi.spyOn(OfflineQueue, 'open')
+      .mockResolvedValue({} as unknown as OfflineQueue);
+
+    const mgr = managerOn(fsAdapter, '.config-obsidian');
+    await priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr);
+
+    expect(open).toHaveBeenCalledWith(
+      path.join('/v', '.config-obsidian', 'plugins', 'remote-ssh', 'queue'),
+    );
+    open.mockRestore();
+  });
+
+  it('refuses a vault with no local disk behind it, rather than guessing a path', async () => {
+    const mgr = managerOn({ read: () => 'not a FileSystemAdapter' });
+
+    await expect(priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr))
+      .rejects.toThrow(/FileSystemAdapter/);
   });
 });
