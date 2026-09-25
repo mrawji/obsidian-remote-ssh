@@ -1,4 +1,4 @@
-import { ShadowVaultBootstrap } from './ShadowVaultBootstrap';
+import { SHARED_OBSIDIAN_CONFIG_FILES } from './SharedObsidianConfigSync';
 import { logger } from '../util/logger';
 import { errorMessage } from '../util/errorMessage';
 
@@ -44,7 +44,7 @@ export interface SharedConfigWatcherDeps {
  */
 export class SharedConfigWatcher {
   private static readonly SHARED = new Set<string>(
-    ShadowVaultBootstrap.SHARED_OBSIDIAN_CONFIG_FILES,
+    SHARED_OBSIDIAN_CONFIG_FILES,
   );
 
   private closer: { close(): void } | null = null;
