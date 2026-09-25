@@ -308,6 +308,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     expect(handle.rpc.onClose, 'the manager must subscribe').toHaveBeenCalledTimes(1);
     fire(new Error('daemon went away'));
     expect(onRpcClose).toHaveBeenCalledTimes(1);
+    // The owner turns this into what the user is told, so it has to arrive.
+    expect(onRpcClose.mock.calls[0][0]).toMatchObject({ message: 'daemon went away' });
   });
 
   it('tells its owner just the same when the daemon was reused', async () => {
@@ -364,6 +366,49 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
       await mgr.disconnectTransport();
       await vi.advanceTimersByTimeAsync(120_000);
       expect(call.mock.calls.length, 'a disconnected wire must not be probed').toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports the quiet death too, and says what it was', async () => {
+    // The heartbeat test above proves a probe goes out. Nothing proved what
+    // happens when the probes stop coming back: `onDead` reached the owner
+    // through a line no test executed, so the quiet failure — the machine
+    // that slept, the process the OOM killer took — was wired up on trust.
+    vi.useFakeTimers();
+    try {
+      const onRpcClose = vi.fn();
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockRejectedValue(new Error('no answer'));
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          msSinceLastMessage: () => 10 * 60_000, // long quiet
+          pendingCount: () => 0,                 // and idle
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose,
+      });
+      await mgr.startRpcSession(profile, 'work');
+
+      // Three misses at a 10s tick; 60s leaves room without depending on
+      // the exact schedule.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(onRpcClose, 'a daemon that stops answering is a lost connection')
+        .toHaveBeenCalledTimes(1);
+      expect(onRpcClose.mock.calls[0][0]).toMatchObject({
+        message: expect.stringContaining('stopped answering') as unknown as string,
+      });
     } finally {
       vi.useRealTimers();
     }
