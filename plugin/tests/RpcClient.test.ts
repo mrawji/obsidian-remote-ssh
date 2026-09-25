@@ -168,3 +168,73 @@ describe('RpcClient', () => {
     expect(cb).not.toHaveBeenCalled();
   });
 });
+
+// ─── the two signals the heartbeat decides on ────────────────────────────────
+//
+// `RpcHeartbeat` never probes while these say "busy" or "recently heard
+// from". Its own tests hand it lambdas, so until now nothing had run the
+// real implementations — and a wrong answer here either probes a healthy
+// session to death or never notices a dead one.
+
+describe('RpcClient — liveness signals', () => {
+  it('counts a call while it is in flight, and stops when it is answered', () => {
+    // A long read is quiet on the wire but NOT idle. This is what stops the
+    // heartbeat probing underneath a transfer that is working fine.
+    const { framed, client } = setup();
+    expect(client.pendingCount()).toBe(0);
+
+    const pending = client.call('fs.readBinary', { path: 'big.bin' });
+    expect(client.pendingCount()).toBe(1);
+
+    const req = JSON.parse(framed.sent[0].toString('utf8')) as { id: number };
+    framed.pushMessage({ jsonrpc: '2.0', id: req.id, result: { data: '' } });
+
+    return pending.then(() => {
+      expect(client.pendingCount()).toBe(0);
+    });
+  });
+
+  it('counts each outstanding call separately', () => {
+    const { client } = setup();
+    void client.call('fs.stat', { path: 'a.md' });
+    void client.call('fs.stat', { path: 'b.md' });
+
+    expect(client.pendingCount()).toBe(2);
+  });
+
+  it('measures silence from the last frame the daemon sent', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const { framed, client } = setup();
+
+      vi.setSystemTime(new Date('2026-01-01T00:00:30Z'));
+      expect(client.msSinceLastMessage()).toBe(30_000);
+
+      framed.pushMessage({ jsonrpc: '2.0', id: 1, result: {} });
+      expect(client.msSinceLastMessage()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats a frame it cannot correlate as proof of life anyway', () => {
+    // The clock is bumped before the envelope is even parsed, deliberately:
+    // a response to a call we have forgotten, or a malformed one, still means
+    // the daemon is there. Counting only matched replies would let a session
+    // that is talking be declared dead.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const { framed, client } = setup();
+      vi.setSystemTime(new Date('2026-01-01T00:01:00Z'));
+      expect(client.msSinceLastMessage()).toBe(60_000);
+
+      framed.pushMessage({ jsonrpc: '2.0', id: 987654, result: {} }); // no such call
+
+      expect(client.msSinceLastMessage()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
