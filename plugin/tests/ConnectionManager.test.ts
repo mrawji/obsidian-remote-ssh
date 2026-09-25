@@ -394,3 +394,148 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     expect(onRpcClose, 'our own disconnect is not a lost connection').not.toHaveBeenCalled();
   });
 });
+
+// ─── the reconnect lifecycle ─────────────────────────────────────────────────
+//
+// `startReconnect` and `cancelReconnect` are reached only from `main.ts`,
+// which is excluded from coverage — so measured across BOTH suites, neither
+// had ever run. `main.ts` calls `startReconnect` from two places and
+// `cancelReconnect` from three, which is exactly why its guards matter.
+
+describe('ConnectionManager — starting and cancelling a reconnect', () => {
+  const profile = { id: 'p', name: 'P', remotePath: '~/work' } as unknown as SshProfile;
+
+  function aliveClient() {
+    return {
+      getRemoteHome: vi.fn().mockResolvedValue('/home/souta'),
+      openUnixStream: vi.fn().mockResolvedValue({}),
+      isAlive: () => true,
+      connect: vi.fn(),
+    } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+  }
+
+  function reconnectable(withProfile = true) {
+    const mgr = new ConnectionManager(aliveClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose: vi.fn(),
+    });
+    if (withProfile) (mgr as unknown as { activeProfile: unknown }).activeProfile = profile;
+    return mgr;
+  }
+
+  function opts(over: Record<string, unknown> = {}) {
+    return {
+      maxRetries: 3,
+      setAdapterReconnecting: vi.fn(),
+      onState: vi.fn(),
+      hooks: {
+        rebind: vi.fn(),
+        prepareListenerForReconnect: vi.fn(),
+        resumeListenerAfterReconnect: vi.fn().mockResolvedValue(undefined),
+      },
+      ...over,
+    } as unknown as Parameters<ConnectionManager['startReconnect']>[0];
+  }
+
+  it('does not start without a profile to reconnect to', async () => {
+    const mgr = reconnectable(false);
+    const o = opts();
+
+    await mgr.startReconnect(o);
+
+    expect(o.setAdapterReconnecting).not.toHaveBeenCalled();
+  });
+
+  it('respects the user turning auto-reconnect off', async () => {
+    // reconnectMaxRetries <= 0 is the setting for "leave it to me".
+    const mgr = reconnectable();
+    const o = opts({ maxRetries: 0 });
+
+    await mgr.startReconnect(o);
+
+    expect(o.setAdapterReconnecting).not.toHaveBeenCalled();
+  });
+
+  it('tells the adapter it is reconnecting before the loop runs', async () => {
+    // This is what parks a read instead of failing it — without it, every
+    // in-flight read during a drop surfaces as an error to the user.
+    const mgr = reconnectable();
+    const o = opts({ maxRetries: 1 });
+
+    await mgr.startReconnect(o);
+
+    expect(o.setAdapterReconnecting).toHaveBeenCalledWith(true);
+  });
+
+  it('ignores a second start while a loop is already running', async () => {
+    // `main.ts` fires this from two places; two loops would race each other
+    // through the same transport.
+    const mgr = reconnectable();
+    let release!: () => void;
+    const hung = new Promise<void>((r) => { release = r; });
+    const o = opts({
+      hooks: {
+        rebind: vi.fn(),
+        prepareListenerForReconnect: () => hung,   // never settles until released
+        resumeListenerAfterReconnect: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const first = mgr.startReconnect(o);
+    await Promise.resolve();
+
+    await mgr.startReconnect(o);   // returns at once
+
+    expect(o.setAdapterReconnecting).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  it('reports liveness from the underlying client, not its own guesswork', () => {
+    // `main.ts` gates the Reconnect command on this; a stale local flag would
+    // either hide the command when it is needed or offer it when it is not.
+    const client = aliveClient() as unknown as { isAlive: () => boolean };
+    const mgr = new ConnectionManager(client as never, {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose: vi.fn(),
+    });
+    expect(mgr.isAlive()).toBe(true);
+
+    client.isAlive = () => false;
+    expect(mgr.isAlive()).toBe(false);
+  });
+
+  it('cancelling when nothing is running is harmless', () => {
+    // `main.ts` calls this on every disconnect, reconnect and unload.
+    const mgr = reconnectable();
+
+    expect(() => mgr.cancelReconnect()).not.toThrow();
+  });
+
+  it('cancelling clears the loop so the next one can start', async () => {
+    const mgr = reconnectable();
+    let release!: () => void;
+    const hung = new Promise<void>((r) => { release = r; });
+    const o = opts({
+      hooks: {
+        rebind: vi.fn(),
+        prepareListenerForReconnect: () => hung,
+        resumeListenerAfterReconnect: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const first = mgr.startReconnect(o);
+    void first.catch(() => { /* the cancelled loop's fate is not this test's */ });
+    await Promise.resolve();
+
+    mgr.cancelReconnect();
+
+    // Deliberately not awaiting the cancelled loop: the claim is that
+    // cancelling CLEARS the registration, so the next start is not blocked
+    // by it — not that the in-flight attempt unwinds promptly.
+    const second = opts({ maxRetries: 1 });
+    await mgr.startReconnect(second);
+    expect(second.setAdapterReconnecting).toHaveBeenCalledWith(true);
+    release();
+  });
+});
