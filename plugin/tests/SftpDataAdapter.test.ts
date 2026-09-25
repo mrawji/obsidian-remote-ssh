@@ -1754,3 +1754,24 @@ describe('SftpDataAdapter — config write-through to the local shadow disk (#34
     await expect(fs.stat(victim)).rejects.toThrow();
   });
 });
+
+describe('SftpDataAdapter.fetchBinaryForBridge', () => {
+  // Reachable from AdapterManager, but nothing had ever executed it: the
+  // bridge is never driven end to end in the suites. Its docblock makes a
+  // claim worth holding — a view, not a copy. This serves every <img> in
+  // the vault, so a copy here doubles memory per asset.
+  it('hands the bridge a view over the bytes it read, not a copy', async () => {
+    const fake = makeFakeClient();
+    const adapter = new SftpDataAdapter(
+      fake.client, '/srv/vault', new ReadCache(), new DirCache(), 'v',
+    );
+    const ab = new ArrayBuffer(4);
+    new Uint8Array(ab).set([0x89, 0x50, 0x4e, 0x47]); // PNG magic
+    (adapter as unknown as Record<string, unknown>).readBinary = () => Promise.resolve(ab);
+
+    const out = await adapter.fetchBinaryForBridge('notes/diagram.png');
+
+    expect(Array.from(out)).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect(out.buffer).toBe(ab);
+  });
+});
