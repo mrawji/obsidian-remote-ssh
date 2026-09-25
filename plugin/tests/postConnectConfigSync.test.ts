@@ -39,7 +39,8 @@ vi.mock('../src/shadow/CommunityPluginsSync', () => ({
 }));
 
 import {
-  syncConfigAfterConnect, watcherPorts, watchedName, watchListener, type ConfigSyncPorts,
+  syncConfigAfterConnect, watcherPorts, watchedName, watchListener, openConfigWatch,
+  type ConfigSyncPorts,
 } from '../src/shadow/postConnectConfigSync';
 import type { SharedConfigWatcher } from '../src/shadow/SharedConfigWatcher';
 
@@ -285,5 +286,48 @@ describe('watchedName — what fs.watch reported', () => {
     listen('change', undefined as unknown as null);
 
     expect(seen).toEqual(['app.json', 'app.json', null]);
+  });
+});
+
+describe('openConfigWatch', () => {
+  /** Stands in for `fs.watch` so no native handle is opened. */
+  function fakeOpen() {
+    const close = vi.fn();
+    const calls: Array<{ dir: string; listener: (e: string, f: unknown) => void }> = [];
+    const open = ((dir: string, _opts: unknown, listener: (e: string, f: unknown) => void) => {
+      calls.push({ dir, listener });
+      return { close };
+    }) as unknown as typeof import('node:fs').watch;
+    return { open, calls, close };
+  }
+
+  it('watches the local config dir', () => {
+    const { open, calls } = fakeOpen();
+
+    openConfigWatch('/shadow/.obsidian', () => { /* unused */ }, open);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].dir).toBe('/shadow/.obsidian');
+  });
+
+  it('closes the watcher it opened', () => {
+    // `SharedConfigWatcher.stop()` calls through this. A closer that did
+    // nothing would leak one OS watch handle per connect.
+    const { open, close } = fakeOpen();
+
+    openConfigWatch('/shadow/.obsidian', () => { /* unused */ }, open).close();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers normalised names to the caller', () => {
+    const { open, calls } = fakeOpen();
+    const seen: Array<string | null> = [];
+
+    openConfigWatch('/shadow/.obsidian', (n) => seen.push(n), open);
+    calls[0].listener('change', 'app.json');
+    calls[0].listener('rename', undefined);
+
+    expect(seen).toEqual(['app.json', null]);
   });
 });

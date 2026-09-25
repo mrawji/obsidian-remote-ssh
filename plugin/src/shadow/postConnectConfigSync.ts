@@ -81,6 +81,28 @@ export function watchListener(
 }
 
 /**
+ * Open the OS watch on the local config dir, and hand back something that
+ * closes it.
+ *
+ * `open` defaults to the real `fs.watch`; a test passes its own so this can
+ * be checked without a native handle. That matters twice over — opening one
+ * in the unit suite killed the Windows worker outright, and the invariant
+ * worth holding is that the returned closer really does close the watcher.
+ * `SharedConfigWatcher.stop()` relies on it, and a closer that did nothing
+ * would leak a watch handle on every connect.
+ *
+ * @internal `open` is exported for testing.
+ */
+export function openConfigWatch(
+  dir: string,
+  onChange: (name: string | null) => void,
+  open: typeof fs.watch = fs.watch,
+): { close(): void } {
+  const w = open(dir, { persistent: false }, watchListener(onChange));
+  return { close: () => w.close() };
+}
+
+/**
  * How the real watcher reaches the disk and the remote.
  *
  * Separate from constructing it so the three callbacks can be exercised: one
@@ -91,10 +113,7 @@ export function watchListener(
  */
 export function watcherPorts(p: ConfigSyncPorts): ConstructorParameters<typeof SharedConfigWatcher>[0] {
   return {
-    watch: (onChange) => {
-      const w = fs.watch(p.localConfigDir, { persistent: false }, watchListener(onChange));
-      return { close: () => w.close() };
-    },
+    watch: (onChange) => openConfigWatch(p.localConfigDir, onChange),
     readLocal: (b) => {
       try { return fs.readFileSync(path.join(p.localConfigDir, b), 'utf-8'); }
       catch { return null; }
