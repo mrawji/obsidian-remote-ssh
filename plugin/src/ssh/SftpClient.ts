@@ -77,6 +77,65 @@ export interface RemoteEntryWithRel extends RemoteEntry {
  *
  * @internal Exported for testing only.
  */
+/**
+ * Attach the `error` and `close` handlers a live session needs, and carry
+ * the reason from one to the other.
+ *
+ * Exported for the same reason `wireKeyboardInteractiveHandler` is: it lives
+ * inside `connect()`, which needs a real server, so the only way to hold it
+ * to anything is to lift it out. The behaviour here was shipped untested and
+ * it showed — every post-handshake failure used to be discarded, because the
+ * `error` handler's whole job was to reject the connect promise and
+ * rejecting a settled promise is a silent no-op.
+ *
+ * `onError` still rejects that promise (harmless after it settles); what
+ * matters is that the error is also remembered, so the `close` that follows
+ * can say what happened instead of logging one contentless line.
+ */
+export function wireConnectionLifecycle(
+  client: {
+    on(event: 'error', listener: (err: unknown) => void): unknown;
+    on(event: 'close', listener: () => void): unknown;
+  },
+  opts: {
+    /** For the log line only. */
+    host: string;
+    /** Called for every `error`, including ones after the connect settled. */
+    onError: (err: Error) => void;
+    /** Whether this client is still the one the owner is using. */
+    isCurrent: () => boolean;
+    /** Drop the owner's references to this client. */
+    onTeardown: () => void;
+    /** Whether the owner asked for this disconnect. */
+    wasIntentional: () => boolean;
+    notify: (info: { unexpected: boolean; reason?: Error }) => void;
+  },
+): void {
+  // ssh2 keeps using `error` for the whole session — keepalive timeouts,
+  // ECONNRESET, protocol failures — long after the connect promise it was
+  // written for has settled. Whatever it last said is the only account of
+  // why the session ended.
+  let lastError: Error | null = null;
+
+  client.on('error', (err: unknown) => {
+    lastError = err instanceof Error ? err : new Error(String(err));
+    opts.onError(lastError);
+  });
+
+  client.on('close', () => {
+    const wasAlive = opts.isCurrent();
+    opts.onTeardown();
+    if (!wasAlive) return;
+
+    const reason: Error | undefined = lastError ?? undefined;
+    logger.warn(
+      `SftpClient: connection closed (${opts.host})` +
+      (reason ? `: ${errorMessage(reason)}` : ''),
+    );
+    opts.notify({ unexpected: !opts.wasIntentional(), reason });
+  });
+}
+
 export function wireKeyboardInteractiveHandler(
   client: {
     on(
@@ -229,35 +288,25 @@ export class SftpClient {
         resolve();
       });
 
-      // Kept because `reject` below stops mattering the moment the connect
-      // promise settles, and ssh2 keeps using this event for the rest of the
-      // session — keepalive timeouts, ECONNRESET, protocol errors. Whatever
-      // it last said is the only account of why the session ended.
-      let lastError: Error | null = null;
-
-      client.on('error', err => {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        window.clearTimeout(timer);
-        reject(lastError);
-      });
-
-      client.on('close', () => {
-        const wasAlive = this.client === client;
-        this.client = null;
-        this.sftp = null;
-        this.remoteHome = null;
-        if (wasAlive) {
-          const reason: Error | undefined = lastError ?? undefined;
-          logger.warn(
-            `SftpClient: connection closed (${profile.host})` +
-            (reason ? `: ${errorMessage(reason)}` : ''),
-          );
-          const unexpected = !this.intentionalDisconnect;
+      wireConnectionLifecycle(client, {
+        host: profile.host,
+        onError: (err) => {
+          window.clearTimeout(timer);
+          reject(err);
+        },
+        isCurrent: () => this.client === client,
+        onTeardown: () => {
+          this.client = null;
+          this.sftp = null;
+          this.remoteHome = null;
+        },
+        wasIntentional: () => this.intentionalDisconnect,
+        notify: (info) => {
           for (const cb of [...this.closeListeners]) {
-            try { cb({ unexpected, reason }); }
+            try { cb(info); }
             catch (e) { logger.warn(`onClose listener threw: ${errorMessage(e)}`); }
           }
-        }
+        },
       });
 
       // keyboard-interactive (TOTP / SecurID / Duo Push / PAM PIN).
