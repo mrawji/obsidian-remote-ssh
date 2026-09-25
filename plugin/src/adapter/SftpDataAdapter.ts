@@ -23,6 +23,7 @@ function isThumbnailEligible(vaultPath: string): boolean {
 }
 import * as fs from 'fs';
 import * as nodePath from 'path';
+import type { RemoteBinding } from '../ConnectionManager';
 import type { RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
@@ -183,9 +184,22 @@ export class SftpDataAdapter {
    * Caches are preserved — entries are mtime-keyed, so any divergence
    * is caught on the next read.
    */
-  swapClient(newClient: RemoteFsClient): void {
-    this.client = newClient;
-    this.conflictResolver?.swapClient(newClient);
+  /**
+   * Point the adapter at the remote as it now is.
+   *
+   * Takes the prefix as well as the client because a reconnect can change
+   * transport — `ConnectionManager.reconnectAttempt` downgrades to SFTP when
+   * the daemon turns out to be unavailable — and the two are one decision.
+   *
+   * This used to take only the client. A downgrade then left the adapter
+   * joining paths with the RPC session's empty prefix, so every read and
+   * write addressed the remote home instead of the vault inside it; the
+   * reverse, SFTP→RPC, doubled the prefix.
+   */
+  rebind(binding: RemoteBinding): void {
+    this.client = binding.client;
+    this.remoteBasePath = binding.remoteBase;
+    this.conflictResolver?.swapClient(binding.client);
   }
 
   /** True between the start of a reconnect loop and its terminal state. */

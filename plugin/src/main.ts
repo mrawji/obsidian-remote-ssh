@@ -471,7 +471,7 @@ export default class RemoteSshPlugin extends Plugin {
     this.conn.daemonDeployer = null;
     await this.conn.startRpcSession(profile, basePath);
     // Rebind adapter to the fresh RPC client
-    this.adapterMgr.dataAdapter?.swapClient(this.conn.buildFsClient());
+    this.adapterMgr.dataAdapter?.rebind(this.conn.buildBinding());
   }
 
   async saveSettings() {
@@ -807,7 +807,7 @@ export default class RemoteSshPlugin extends Plugin {
       setAdapterReconnecting: (on) => this.adapterMgr.dataAdapter?.setReconnecting(on),
       onState: (s) => this.onReconnectStateChange(s),
       hooks: {
-        swapClient: (c) => this.adapterMgr.dataAdapter?.swapClient(c),
+        rebind: (b) => this.adapterMgr.dataAdapter?.rebind(b),
         prepareListenerForReconnect: () => this.fsChangeListener.prepareForReconnect(),
         resumeListenerAfterReconnect: async (rpc) => {
           const da = this.adapterMgr.dataAdapter;
