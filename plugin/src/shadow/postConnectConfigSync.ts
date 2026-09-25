@@ -45,6 +45,64 @@ export interface ConfigSyncPorts {
 }
 
 /**
+ * What `fs.watch` reported, as a basename or "something changed, unknown what".
+ *
+ * The platform does not always give a filename — Windows and some network
+ * filesystems report the event without one — and `SharedConfigWatcher` treats
+ * null as "consider every shared file". Passing `undefined` straight through
+ * would instead look like a basename of "undefined" and match nothing.
+ *
+ * Its own function so it can be checked on every platform: a unit suite has
+ * no business opening a native watch handle, and this is the only part of
+ * that callback with a decision in it.
+ *
+ * @internal Exported for testing.
+ */
+export function watchedName(filename: string | Buffer | null | undefined): string | null {
+  return filename ? String(filename) : null;
+}
+
+/**
+ * Adapts `fs.watch`'s `(eventType, filename)` to the watcher's `(name | null)`.
+ *
+ * The event type is deliberately dropped: `rename` and `change` both mean
+ * "look at this file again", and `SharedConfigWatcher` decides what to do by
+ * comparing content, not by trusting the kind of event.
+ *
+ * A named function rather than an inline closure so it can be checked without
+ * opening a native watch handle — which is what took the Windows worker down.
+ *
+ * @internal Exported for testing.
+ */
+export function watchListener(
+  onChange: (name: string | null) => void,
+): (eventType: string, filename: string | Buffer | null) => void {
+  return (_eventType, filename) => onChange(watchedName(filename));
+}
+
+/**
+ * Open the OS watch on the local config dir, and hand back something that
+ * closes it.
+ *
+ * `open` defaults to the real `fs.watch`; a test passes its own so this can
+ * be checked without a native handle. That matters twice over — opening one
+ * in the unit suite killed the Windows worker outright, and the invariant
+ * worth holding is that the returned closer really does close the watcher.
+ * `SharedConfigWatcher.stop()` relies on it, and a closer that did nothing
+ * would leak a watch handle on every connect.
+ *
+ * @internal `open` is exported for testing.
+ */
+export function openConfigWatch(
+  dir: string,
+  onChange: (name: string | null) => void,
+  open: typeof fs.watch = fs.watch,
+): { close(): void } {
+  const w = open(dir, { persistent: false }, watchListener(onChange));
+  return { close: () => w.close() };
+}
+
+/**
  * How the real watcher reaches the disk and the remote.
  *
  * Separate from constructing it so the three callbacks can be exercised: one
@@ -55,13 +113,7 @@ export interface ConfigSyncPorts {
  */
 export function watcherPorts(p: ConfigSyncPorts): ConstructorParameters<typeof SharedConfigWatcher>[0] {
   return {
-    watch: (onChange) => {
-      const w = fs.watch(
-        p.localConfigDir, { persistent: false },
-        (_evt, filename) => onChange(filename ? String(filename) : null),
-      );
-      return { close: () => w.close() };
-    },
+    watch: (onChange) => openConfigWatch(p.localConfigDir, onChange),
     readLocal: (b) => {
       try { return fs.readFileSync(path.join(p.localConfigDir, b), 'utf-8'); }
       catch { return null; }
