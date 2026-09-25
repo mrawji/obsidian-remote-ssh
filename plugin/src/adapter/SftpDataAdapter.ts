@@ -45,31 +45,21 @@ import { errorMessage } from "../util/errorMessage";
 export type { ThreeWayPanes, TextConflictDecision } from '../conflict/ConflictResolver';
 
 /**
- * Implementation of Obsidian's `DataAdapter` over a `RemoteFsClient`.
+ * Obsidian's `DataAdapter`, over a `RemoteFsClient`.
  *
- * The client can be either the direct-SFTP path (`SftpRemoteFsClient`
- * wrapping the existing `SftpClient`) or the α path
- * (`RpcRemoteFsClient` talking to `obsidian-remote-server`). The
- * adapter itself stays transport-agnostic.
+ * The client is either the direct-SFTP path (`SftpRemoteFsClient` around
+ * `SftpClient`) or the daemon (`RpcRemoteFsClient` talking to
+ * `obsidian-remote-server`); the adapter itself stays transport-agnostic.
  *
- * The class is constructed in Phase 4-E, patched onto
- * `app.vault.adapter` in Phase 4-F, and grew its write surface
- * (write/writeBinary/append/process/mkdir/remove/rmdir/rename/copy/
- * trashSystem/trashLocal) in Phase 4-G. Phase 5-D.2 flips the client
- * dependency from the concrete `SftpClient` to the narrow
- * `RemoteFsClient` interface.
+ * Every vault-relative path goes through `PathMapper` — which redirects
+ * per-client files into their own subtree — and is then joined onto
+ * `remoteBasePath`. See {@link toRemote}.
  *
- * `getResourcePath` returns a `http://127.0.0.1:<port>/r/<token>?p=…`
- * URL served by an optional `ResourceBridge` (Phase 5-F). When no
- * bridge is wired the method falls back to a `data:` URL with no
- * payload, which Obsidian will fail to render — that's acceptable
- * because resource serving is a feature of the patched adapter, not
- * a hard requirement of the interface.
- *
- * Path translation is currently a straight join of `remoteBasePath`
- * and the vault-relative `normalizedPath`. The per-client user-cache
- * rewrite (Phase 4-J0 / `PathMapper`) will be inserted at this
- * boundary later.
+ * `getResourcePath` returns a `http://127.0.0.1:<port>/r/<token>?p=…` URL
+ * served by an optional `ResourceBridge`. With no bridge it falls back to
+ * an empty `data:` URL that Obsidian cannot render, which is acceptable:
+ * serving binaries is a feature of the patched adapter, not part of the
+ * interface it implements.
  */
 export class SftpDataAdapter {
   constructor(
@@ -210,13 +200,12 @@ export class SftpDataAdapter {
    * Toggle the "reconnecting" gate. While set:
    *  - read / readBinary serve a cached value at once; on a miss they wait
    *    for the session (bounded — see ReconnectWait) and only then throw
-   *  - list / stat / exists throw immediately (no cache fallback)
-   *  - any write-side method throws with a clear "reconnecting" notice
+   *  - list / stat / exists throw immediately, with no cache fallback
+   *  - every write-side method throws a clear "reconnecting" notice
    *
-   * The reconnect manager flips this on at loop start and off at
-   * recovered / failed / cancelled. Existing in-flight calls hit
-   * the dead transport and reject naturally — only *new* calls are
-   * affected by the gate.
+   * Flipped on at the reconnect loop's start and off at recovered / failed /
+   * cancelled. Only NEW calls are gated; calls already in flight hit the dead
+   * transport and reject on their own.
    */
   setReconnecting(on: boolean): void {
     this.reconnecting = on;
@@ -232,19 +221,16 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Writer-side vault-model reflector (#341). When wired, every
-   * mutation that actually lands on the remote is mirrored into the
-   * writer's own `vault.fileMap` + `vault.trigger(...)` bus so File
-   * Explorer, MetadataCache and open editor tabs follow a title-bar
-   * rename (etc.) instead of staying bound to the stale `TFile`.
+   * Writer-side vault-model reflector (#341). When wired, every mutation
+   * that lands on the remote is mirrored into this window's own
+   * `vault.fileMap` and `vault.trigger(...)` bus, so File Explorer,
+   * MetadataCache and open tabs follow a rename instead of staying bound to
+   * a stale `TFile`.
    *
-   * Null by default and wired via `setWriterReflector` rather than a
-   * constructor arg: the adapter is constructed before
-   * `AdapterManager` knows which transport is active, and the
-   * reflector is only meaningful for the SFTP transport (RPC recovers
-   * via the `FsChangeListener` daemon echo, so wiring both would
-   * double-fire). When null, every reflect call is a no-op — the
-   * legacy behaviour, so non-shadow callers are unaffected.
+   * Wired on BOTH transports by `AdapterManager.wireLiveUpdates`. What stops
+   * the daemon's echo of our own write firing a second time is not the
+   * transport but {@link localOpRegistry}. Null until wired, and every
+   * reflect is then a no-op.
    */
   private writerReflector: WriterReflector | null = null;
 
@@ -266,19 +252,15 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Run a writer-side reflect, swallowing + logging any throw. By the
-   * time this runs the remote op has already succeeded; a reflector
-   * fault (or a vault listener that throws — Obsidian wraps each
-   * `Events.trigger` handler in its own try/catch, but a fault inside
-   * `VaultModelBuilder` itself would still land here) must not surface
-   * to the editor as a write failure and provoke a spurious retry /
-   * duplicate remote write. Centralising the guard also keeps the
-   * call sites to one line.
+   * Run a writer-side reflect, swallowing and logging any throw.
    *
-   * The log includes the error's class name so a systematic bug
-   * (`TypeError` from a model-builder defect) is distinguishable in
-   * the log stream from a transient listener fault — the two need
-   * very different triage.
+   * The remote op has already succeeded by the time this runs, so a fault in
+   * the reflector must not reach the editor as a write failure — that would
+   * provoke a retry and a duplicate remote write.
+   *
+   * The log carries the error's class name: a `TypeError` from a
+   * model-builder defect and a transient listener fault need very different
+   * triage, and they are indistinguishable without it.
    */
   private reflect(run: (r: WriterReflector) => void): void {
     const r = this.writerReflector;
@@ -916,30 +898,22 @@ export class SftpDataAdapter {
    * Mirror a successful `<configDir>/**` write onto the LOCAL shadow disk
    * (#342 / #429 — "plugin settings are not kept after restarting the vault").
    *
-   * Why this is load-bearing, and why a pull-on-connect cannot replace it:
-   * Obsidian loads community plugins during startup, and each plugin's
-   * `onload()` calls `Plugin.loadData()` — which reads
-   * `<configDir>/plugins/<id>/data.json` — BEFORE remote-ssh has connected
-   * over SSH and patched the adapter. That read therefore always hits the
-   * real `FileSystemAdapter`, i.e. the local shadow disk. We cannot get in
-   * front of it: the SSH connect is async and happens at layout-ready.
+   * A pull on connect cannot replace this. Obsidian loads community plugins
+   * during startup and each `onload()` calls `Plugin.loadData()`, reading
+   * `<configDir>/plugins/<id>/data.json` BEFORE remote-ssh has connected and
+   * patched the adapter — so that read always hits the real
+   * `FileSystemAdapter`, i.e. local disk. The connect is async, at
+   * layout-ready; there is no getting in front of it.
    *
-   * So the local disk must ALREADY be correct at startup. Previously nothing
-   * ever wrote it: `saveData()` went through the patched adapter straight to
-   * the remote and the local copy stayed empty, so every restart booted the
-   * plugin on DEFAULTS — which the plugin then saved back, destroying the
-   * real settings on the remote too.
+   * Nothing used to write local disk at all: `saveData()` went through the
+   * patched adapter straight to the remote, the local copy stayed empty,
+   * every restart booted the plugin on DEFAULTS — and the plugin then saved
+   * those back, destroying the real settings on the remote too.
    *
-   * Write-through fixes that at the source: local disk is a warm cache of the
-   * remote, so whichever way the shadow window is launched (Connect from the
-   * source window, or reopening the vault directly) the startup read sees the
-   * settings this device last saved. The remote per-device copy stays the
-   * source of truth and the cross-session backup.
-   *
-   * Scope is deliberately `<configDir>/**` only — the vault's NOTE tree stays
-   * virtual (served from the remote, never mirrored to disk); mirroring it
-   * would defeat the whole shadow-vault design. Best-effort: a failure here
-   * must never fail the write that already landed on the remote.
+   * So local disk is kept as a warm cache and the remote per-device copy
+   * stays the source of truth. `<configDir>/**` only: the note tree stays
+   * virtual, and mirroring it would defeat the shadow vault entirely.
+   * Best-effort — a failure here must not fail the write that already landed.
    */
   private writeThroughConfig(normalizedPath: string, data: Buffer): void {
     if (!this.shadowBasePath || !this.pathMapper) return;
@@ -994,14 +968,11 @@ export class SftpDataAdapter {
   }
 
   /**
-   * Atomic-on-the-server write through SftpClient (tmp+rename). Ensures
-   * the parent directory exists, then refreshes the read cache with the
-   * just-written content using the freshly-read mtime.
+   * Atomic-on-the-server write (tmp+rename): ensure the parent exists, write,
+   * then refresh the read cache with the freshly-read mtime.
    *
-   * When the adapter has a recent ReadCache entry for this path, the
-   * cached mtime is sent as `expectedMtime` so the server rejects the
-   * write if another client wrote in between. On rejection the
-   * conflict-resolution stack runs:
+   * A recent ReadCache entry supplies `expectedMtime`, so the server rejects
+   * the write if another client got there first. On rejection:
    *
    *   1. If `isText` AND we have an ancestor snapshot AND a 3-way
    *      callback, present `(ancestor, mine, theirs)` to the user.
@@ -1012,13 +983,12 @@ export class SftpDataAdapter {
    *      have no ancestor (e.g. write-without-prior-read).
    *   3. Else, rethrow the precondition error.
    *
-   * `data` may be reassigned in the merged-decision branch so the
-   * post-write cache update reflects what actually landed on disk.
+   * `data` is reassigned in the merge branch so the cache update afterwards
+   * reflects what actually landed.
    *
-   * `expectedMtimeOverride` lets the offline-queue replayer
-   * (E2-β.3) feed in the mtime captured at *enqueue* time rather
-   * than whatever the cache holds now (which is the synthetic
-   * mtime from the offline cache update).
+   * `expectedMtimeOverride` is for the offline-queue replayer: it feeds the
+   * mtime captured at ENQUEUE time, not whatever the cache holds now — which
+   * by then is the synthetic mtime the offline write put there.
    */
   private async writeBuffer(
     normalizedPath: string,
