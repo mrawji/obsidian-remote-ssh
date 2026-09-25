@@ -55,11 +55,8 @@ export interface DeployOptions {
   remoteLogPath?: string;
 
   /**
-   * If `true` (default), an existing daemon process is killed before
-   * the new one is started. Set to `false` to leave a previously
-   * running instance untouched (useful when multiple Obsidian sessions
-   * share one host and you don't want to interrupt another vault's
-   * connection).
+   * Default `true`. `false` leaves a running instance alone, for a host
+   * shared by several Obsidian sessions.
    */
   killExisting?: boolean;
 
@@ -85,14 +82,12 @@ const DEFAULTS = {
 } as const;
 
 /**
- * ServerDeployer ships the obsidian-remote-server binary to the remote
- * host, makes it executable, replaces any previously-running instance,
- * and waits for the new one to come up by watching for the token file.
+ * Ships the daemon binary to the remote, makes it executable, replaces any
+ * running instance, and waits for the token file to appear.
  *
- * The class is stateless aside from its `ssh` dependency: every call
- * to `deploy()` is a complete replace-and-restart. That's deliberately
- * simple — the daemon is small, idempotent in its setup, and starting
- * it costs less than fifty ms once the binary is on disk.
+ * Stateless apart from `ssh`: every `deploy()` is a full replace-and-restart.
+ * The daemon is small and idempotent, and starting it costs under 50 ms once
+ * the binary is on disk.
  */
 export class ServerDeployer {
   /**
@@ -202,21 +197,14 @@ export class ServerDeployer {
   // ─── internals ───────────────────────────────────────────────────────────
 
   /**
-   * Phase D-δ / F23: verify the bytes the remote sees match the
-   * bytes we uploaded.
+   * Verify the bytes the remote sees are the bytes we uploaded.
    *
-   * Computes sha256 over the local binary (Node `crypto.createHash`)
-   * and `sha256sum` on the remote; throws with a descriptive
-   * "binary verification failed" if they differ. Doesn't try to
-   * recover (delete + re-upload) — a mismatch is either a transient
-   * fault that retry will catch, or a tampered host whose recovery
-   * decision belongs to the operator, not to the auto-deployer.
+   * No attempt to recover by re-uploading: a mismatch is either transient,
+   * and retry catches it, or a tampered host — and that decision belongs to
+   * the operator, not the auto-deployer.
    *
-   * The remote `sha256sum` invocation is the standard GNU coreutils
-   * tool; it's present on every Linux distro the daemon binary
-   * targets. If it isn't available, the surrounding error message
-   * makes that diagnosable instead of silently disabling the
-   * verification.
+   * `sha256sum` is GNU coreutils, present on every distro the binary targets.
+   * If it is missing the error says so rather than quietly skipping the check.
    */
   private async verifyRemoteSha256(localPath: string, remoteAbsPath: string): Promise<void> {
     const expected = await computeFileSha256(localPath);
@@ -267,22 +255,17 @@ export class ServerDeployer {
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Build the regex `pkill -f` should match for a deployed daemon.
+ * The regex `pkill -f` should match for a deployed daemon.
  *
- * The daemon's argv contains the binary path verbatim. Across versions
- * that path may be relative (`.obsidian-remote/server`) or absolute
- * (`$HOME/.obsidian-remote/server`); we want a single pattern that
- * matches both so an upgrade can clean up its predecessor.
+ * argv carries the binary path verbatim, and across versions that path may be
+ * relative or absolute — one pattern has to match both so an upgrade can
+ * clean up its predecessor. Stripping `$HOME/` off the absolute form leaves
+ * the segment present in both.
  *
- * Strategy: take the absolute path and strip the `$HOME/` prefix,
- * yielding the segment that's guaranteed to appear in BOTH shapes.
- * Escape regex metacharacters so a literal `.obsidian-remote` doesn't
- * accidentally match `xobsidian-remote`. Append a trailing space so we
- * don't false-match on path prefixes (`.obsidian-remote/server-old`).
+ * Metacharacters are escaped so `.obsidian-remote` cannot match
+ * `xobsidian-remote`, and a trailing space keeps `server-old` out.
  *
- * For paths that don't live under `$HOME` (custom absolute), there's
- * no relative form to worry about — the absolute path itself becomes
- * the pattern.
+ * A path outside `$HOME` has no relative form, so it is its own pattern.
  */
 export function buildKillPattern(absoluteBinaryPath: string, remoteHome: string): string {
   const home = remoteHome.endsWith('/') ? remoteHome.slice(0, -1) : remoteHome;
@@ -297,14 +280,9 @@ function escapeRegex(s: string): string {
 }
 
 /**
- * Absolutise a remote path against the resolved `$HOME` of the remote.
- *
- * - Already-absolute paths (`/...`) pass through unchanged.
- * - `~` and `~/...` are expanded against `$HOME`.
- * - Bare relative paths are anchored at `$HOME`.
- *
- * Exported so it can be unit-tested without standing up a fake SSH
- * client.
+ * Absolutise against the remote's `$HOME`: `/...` passes through, `~` and
+ * bare relative paths anchor at home. Exported so it is testable without an
+ * SSH client.
  */
 export function resolveRemotePath(p: string, remoteHome: string): string {
   const home = remoteHome.endsWith('/') ? remoteHome.slice(0, -1) : remoteHome;
@@ -341,13 +319,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => { window.setTimeout(resolve, ms); });
 }
 
-/**
- * Compute sha256 of a local file as a lowercase hex digest.
- * Streams via fs.createReadStream so we don't load multi-MB binaries
- * into memory just to hash them.
- *
- * Exported for unit-testability — call sites use it via the deployer.
- */
+/** Streamed, so a multi-MB binary is not loaded into memory just to hash it. */
 export function computeFileSha256(localPath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
