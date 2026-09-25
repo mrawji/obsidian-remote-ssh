@@ -63,6 +63,24 @@ export function watchedName(filename: string | Buffer | null | undefined): strin
 }
 
 /**
+ * Adapts `fs.watch`'s `(eventType, filename)` to the watcher's `(name | null)`.
+ *
+ * The event type is deliberately dropped: `rename` and `change` both mean
+ * "look at this file again", and `SharedConfigWatcher` decides what to do by
+ * comparing content, not by trusting the kind of event.
+ *
+ * A named function rather than an inline closure so it can be checked without
+ * opening a native watch handle — which is what took the Windows worker down.
+ *
+ * @internal Exported for testing.
+ */
+export function watchListener(
+  onChange: (name: string | null) => void,
+): (eventType: string, filename: string | Buffer | null) => void {
+  return (_eventType, filename) => onChange(watchedName(filename));
+}
+
+/**
  * How the real watcher reaches the disk and the remote.
  *
  * Separate from constructing it so the three callbacks can be exercised: one
@@ -74,10 +92,7 @@ export function watchedName(filename: string | Buffer | null | undefined): strin
 export function watcherPorts(p: ConfigSyncPorts): ConstructorParameters<typeof SharedConfigWatcher>[0] {
   return {
     watch: (onChange) => {
-      const w = fs.watch(
-        p.localConfigDir, { persistent: false },
-        (_evt, filename) => onChange(watchedName(filename)),
-      );
+      const w = fs.watch(p.localConfigDir, { persistent: false }, watchListener(onChange));
       return { close: () => w.close() };
     },
     readLocal: (b) => {

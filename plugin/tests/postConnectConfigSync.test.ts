@@ -39,7 +39,7 @@ vi.mock('../src/shadow/CommunityPluginsSync', () => ({
 }));
 
 import {
-  syncConfigAfterConnect, watcherPorts, watchedName, type ConfigSyncPorts,
+  syncConfigAfterConnect, watcherPorts, watchedName, watchListener, type ConfigSyncPorts,
 } from '../src/shadow/postConnectConfigSync';
 import type { SharedConfigWatcher } from '../src/shadow/SharedConfigWatcher';
 
@@ -272,5 +272,18 @@ describe('watchedName — what fs.watch reported', () => {
 
   it('accepts the Buffer form the API can hand back', () => {
     expect(watchedName(Buffer.from('hotkeys.json'))).toBe('hotkeys.json');
+  });
+
+  it('ignores which kind of event fs.watch reported', () => {
+    // `rename` and `change` both mean "look at this file again";
+    // SharedConfigWatcher decides by comparing content, not by the kind.
+    const seen: Array<string | null> = [];
+    const listen = watchListener((n) => seen.push(n));
+
+    listen('rename', 'app.json');
+    listen('change', 'app.json');
+    listen('change', undefined as unknown as null);
+
+    expect(seen).toEqual(['app.json', 'app.json', null]);
   });
 });
