@@ -1211,22 +1211,6 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * POC for the shadow-vault architecture (see
-   * docs/en/architecture/shadow-vault.md, Phase 1): walk the patched
-   * adapter, then hand the resulting entry list to `VaultModelBuilder`
-   * which materialises TFile/TFolder objects in `app.vault.fileMap`
-   * and fires `vault.trigger('create', file)` for each new file. File
-   * Explorer should redraw with the remote tree.
-   *
-   * Stat is intentionally skipped per file in this POC — every entry
-   * lands with zero ctime/mtime/size. Shadow-vault Phase 4 will
-   * decide whether to batch-stat at walk time or stat lazily.
-   *
-   * Run from a vault that's already connected to a profile via the
-   * existing in-place patch flow (Tier 1-A); the command is hidden
-   * unless `this.conn.client?.isAlive()`.
-   */
-  /**
    * Walk the patched adapter and run `VaultModelBuilder` so File
    * Explorer renders the remote tree. Public so both the debug
    * command and the Phase 4 auto-connect flow share one path.
