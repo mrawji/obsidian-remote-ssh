@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ShadowVaultBootstrap, type ShadowVaultLayout } from '../../../src/shadow/ShadowVaultBootstrap';
+import { pullSharedObsidianConfig } from '../../../src/shadow/SharedObsidianConfigSync';
 import type { SshProfile } from '../../../src/types';
 import type { TestClient } from './makeAdapter';
 
@@ -95,7 +96,7 @@ export async function assertConfigRoundTrip(
   // the test exercises the real round-trip path. Closing this gap is
   // the #342 fix.
   const result = await bootstrap.bootstrap(profile, allProfiles);
-  await ShadowVaultBootstrap.pullSharedObsidianConfig(
+  await pullSharedObsidianConfig(
     remoteClient.adapter,
     remoteConfigDir,
     result.layout.configDir,

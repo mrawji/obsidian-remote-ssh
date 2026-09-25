@@ -38,8 +38,23 @@ import type { RemoteEntry } from './vault/VaultModelBuilder';
 import { pathVisibility } from './vault/BulkWalker';
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
-import { ShadowVaultBootstrap, sanitiseStateKey } from './shadow/ShadowVaultBootstrap';
-import type { SharedConfigReader, BootstrapResult } from './shadow/ShadowVaultBootstrap';
+import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
+import { sanitiseStateKey } from './shadow/vaultNaming';
+import type { BootstrapResult } from './shadow/ShadowVaultBootstrap';
+import {
+  pullSharedObsidianConfig,
+  pushSharedObsidianConfig,
+  SHARED_OBSIDIAN_CONFIG_FILES,
+} from './shadow/SharedObsidianConfigSync';
+import type { SharedConfigReader } from './shadow/SharedObsidianConfigSync';
+import {
+  communityPluginsBasePath,
+  pullCommunityPlugins,
+  pushCommunityPlugins,
+  pullPluginBinaries,
+  pushPluginBinaries,
+  readEnabledPluginIds,
+} from './shadow/CommunityPluginsSync';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
 import { ShadowVaultManager } from './shadow/ShadowVaultManager';
 import { WindowSpawner } from './shadow/WindowSpawner';
@@ -641,7 +656,7 @@ export default class RemoteSshPlugin extends Plugin {
       );
       const remoteConfigDir = this.app.vault.configDir;
       try {
-        const cfg = await ShadowVaultBootstrap.pullSharedObsidianConfig(
+        const cfg = await pullSharedObsidianConfig(
           da, remoteConfigDir, localConfigDir,
         );
         if (cfg.errored.length > 0) {
@@ -676,12 +691,12 @@ export default class RemoteSshPlugin extends Plugin {
       // old monotonic union into a real 3-way merge, so a local uninstall
       // propagates instead of being resurrected by the next pull. The
       // pull only reads it; the push commits it once both sides agree.
-      const cpBasePath = ShadowVaultBootstrap.communityPluginsBasePath(
+      const cpBasePath = communityPluginsBasePath(
         shadowStateRoot(), profile.id,
       );
       try {
-        await ShadowVaultBootstrap.pullCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
-        await ShadowVaultBootstrap.pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
+        await pullCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
+        await pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
       } catch (e) {
         logger.warn(
           `runAutoConnect(${tag}): community-plugins round-trip failed: ${errorMessage(e)}`,
@@ -712,9 +727,9 @@ export default class RemoteSshPlugin extends Plugin {
       // can pull. A pulled binary loads on the next vault open (Obsidian
       // scans the plugins dir at startup).
       try {
-        const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
-        await ShadowVaultBootstrap.pullPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
-        await ShadowVaultBootstrap.pushPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
+        const enabledIds = readEnabledPluginIds(localConfigDir);
+        await pullPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
+        await pushPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
       } catch (e) {
         logger.warn(`runAutoConnect(${tag}): plugin-binary round-trip failed: ${errorMessage(e)}`);
       }
@@ -737,7 +752,7 @@ export default class RemoteSshPlugin extends Plugin {
           catch { return null; }
         },
         flush: async () => {
-          const r = await ShadowVaultBootstrap.pushSharedObsidianConfig(
+          const r = await pushSharedObsidianConfig(
             da, remoteConfigDir, localConfigDir,
           );
           if (r.errored.length > 0) {
@@ -755,7 +770,7 @@ export default class RemoteSshPlugin extends Plugin {
       // Seed the just-pulled bytes as the synced baseline so the
       // pull's own writes (and Obsidian re-saving an identical file
       // on open) don't immediately echo back to the remote.
-      for (const base of ShadowVaultBootstrap.SHARED_OBSIDIAN_CONFIG_FILES) {
+      for (const base of SHARED_OBSIDIAN_CONFIG_FILES) {
         try {
           watcher.markSynced(
             base, fs.readFileSync(path.join(localConfigDir, base), 'utf-8'),
@@ -1498,7 +1513,7 @@ export default class RemoteSshPlugin extends Plugin {
     // the expected post-disconnect noise.
     const pull = (async () => {
       await client.connect(profile);
-      await ShadowVaultBootstrap.pullSharedObsidianConfig(reader, remoteConfigDir, localConfigDir);
+      await pullSharedObsidianConfig(reader, remoteConfigDir, localConfigDir);
       // Same base as the shadow window's own round-trip will use (same
       // device, same profile), so a removal another machine made is
       // applied here too and the window boots on the converged list.
@@ -1507,12 +1522,12 @@ export default class RemoteSshPlugin extends Plugin {
       // make the real connect's push mistake this device's local
       // additions for remote removals, and re-running the merge over the
       // same base is idempotent: no removal is ever double-applied.
-      await ShadowVaultBootstrap.pullCommunityPlugins(
+      await pullCommunityPlugins(
         reader, remoteConfigDir, localConfigDir,
-        ShadowVaultBootstrap.communityPluginsBasePath(shadowStateRoot(), profile.id),
+        communityPluginsBasePath(shadowStateRoot(), profile.id),
       );
-      const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
-      await ShadowVaultBootstrap.pullPluginBinaries(reader, remoteConfigDir, localConfigDir, enabledIds);
+      const enabledIds = readEnabledPluginIds(localConfigDir);
+      await pullPluginBinaries(reader, remoteConfigDir, localConfigDir, enabledIds);
     })();
     pull.catch(() => { /* post-timeout teardown error — handled via the race */ });
     try {
