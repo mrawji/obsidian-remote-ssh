@@ -223,22 +223,22 @@ jobs:
   # The same specs, against a vault reachable only across a private tailnet
   # (`docker-compose.tailnet.yml`). The integration suite already runs that
   # way on every PR; this is the other half — a real Obsidian window, whose
-  # every read and write leaves through a `ProxyCommand`.
+  # every read and write leaves through a `ProxyCommand`. Worth ~5 minutes
+  # before stable ships, which is why it gates promotion into `main` rather
+  # than every PR.
   #
-  # Manual only, for now, and deliberately one shard.
+  # One shard: the point is to exercise the wiring, not to re-cover the suite.
+  # `core` drives connect, read, write and reconnect, which is every path the
+  # proxy sits under. Widening it is a later, cheaper call.
   #
-  # The E2E helpers were wired for this environment in #576 but had never
-  # been executed: `probeTailnet` in `e2e/helpers/sshd.ts`, the `sock:` branch
-  # in `remote-verifier.ts`, and the seeded profile's `proxyCommand` are all
-  # code that typechecks and has never run. Gating a required check on code
-  # in that state is how you get a red `next` for a harness bug. So: prove it
-  # green by hand first, then decide whether it earns a schedule.
-  #
-  # One shard because the point is to exercise the wiring, not to re-cover
-  # the suite — `core` drives connect, read, write and reconnect, which is
-  # every path the proxy sits under. Widening it is a later, cheaper call.
+  # Proven by hand before being wired here (run 36112856077: 21 passed,
+  # 2 skipped, 4.4 min). It had failed all three times it ran before that,
+  # always in the daemon build and never reaching a spec: `go build` cannot
+  # stamp a revision from a bind-mounted tree owned by another uid. Docker
+  # Desktop hides that, so a laptop called it ready.
   e2e-tailnet:
-    if: github.event_name == 'workflow_dispatch'
+    # `base_ref` is set only on pull_request, so this is "a PR into main".
+    if: github.event_name == 'workflow_dispatch' || github.base_ref == 'main'
     name: E2E (tailnet, containerised)
     runs-on: ubuntu-latest
     steps:

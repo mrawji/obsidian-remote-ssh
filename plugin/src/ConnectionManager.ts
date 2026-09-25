@@ -50,10 +50,6 @@ export interface ConnectionDeps {
 export class DaemonUnavailableError extends Error {}
 
 /**
- * Hooks the reconnect attempt calls after re-establishing the transport
- * so the plugin can rebind the adapter and fs-change listener.
- */
-/**
  * The remote, as the adapter has to see it: which client to talk through,
  * and what to join vault-relative paths with. One value because a reconnect
  * can change both at once — see {@link ConnectionManager.buildBinding}.
@@ -63,6 +59,10 @@ export interface RemoteBinding {
   remoteBase: string;
 }
 
+/**
+ * Hooks the reconnect attempt calls after re-establishing the transport
+ * so the plugin can rebind the adapter and fs-change listener.
+ */
 export interface ReconnectAdapterHooks {
   rebind(binding: RemoteBinding): void;
   prepareListenerForReconnect(): void;
@@ -366,7 +366,6 @@ export class ConnectionManager {
 
   // ─── helpers ──────────────────────────────────────────────────────
 
-  /** Build an appropriate RemoteFsClient for the current transport. */
   /**
    * Everything about the remote that a reconnect can change, in one value.
    *

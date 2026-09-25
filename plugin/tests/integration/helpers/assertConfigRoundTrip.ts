@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ShadowVaultBootstrap, type ShadowVaultLayout } from '../../../src/shadow/ShadowVaultBootstrap';
+import { pullSharedObsidianConfig } from '../../../src/shadow/SharedObsidianConfigSync';
 import type { SshProfile } from '../../../src/types';
 import type { TestClient } from './makeAdapter';
 
@@ -18,7 +19,7 @@ import type { TestClient } from './makeAdapter';
  * whose remote already carries `<configDir>/app.json` (etc.), the
  * local file must equal the remote.
  *
- * The remote-pull step is `ShadowVaultBootstrap.pullSharedObsidianConfig`
+ * The remote-pull step is `pullSharedObsidianConfig`
  * (#342 fix): `bootstrap()` itself is still purely-local, so this
  * helper runs the pull right after it — the same sequence the
  * production connect flow uses (`runAutoConnect` → pull → populate).
@@ -95,7 +96,7 @@ export async function assertConfigRoundTrip(
   // the test exercises the real round-trip path. Closing this gap is
   // the #342 fix.
   const result = await bootstrap.bootstrap(profile, allProfiles);
-  await ShadowVaultBootstrap.pullSharedObsidianConfig(
+  await pullSharedObsidianConfig(
     remoteClient.adapter,
     remoteConfigDir,
     result.layout.configDir,
