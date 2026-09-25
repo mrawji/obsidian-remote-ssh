@@ -122,7 +122,11 @@ export class AdapterManager {
     // RPC tunnel is up, route everything through the daemon; otherwise
     // fall back to the direct-SFTP wrapper. The adapter itself is
     // unaware of the choice — both clients implement RemoteFsClient.
-    const fsClient = this.conn.buildFsClient();
+    // One value decides both halves — which client, and what prefix its
+    // paths need — because a reconnect can change them together. See
+    // ConnectionManager.buildBinding().
+    const binding = this.conn.buildBinding();
+    const fsClient = binding.client;
     const transportLabel = this.conn.rpcConnection ? 'RPC' : 'SFTP';
     // Per-client path remapping: client-private files like
     // .obsidian/workspace.json get redirected into a per-client subtree
@@ -173,7 +177,7 @@ export class AdapterManager {
     // (or — when a stale doubled mirror exists — quietly listing it).
     // The SFTP transport has no such root-knowing server; it does need
     // the prefix to anchor calls at the vault.
-    const adapterRemoteBase = this.conn.rpcConnection ? '' : this.conn.activeRemoteBasePath;
+    const adapterRemoteBase = binding.remoteBase;
     // Per-session ancestor snapshot store. Powers the 3-way merge UI;
     // cleared on disconnect with the rest of the patched-adapter state.
     this.ancestorTracker = new AncestorTracker();
@@ -418,7 +422,14 @@ export class AdapterManager {
     if (!conn) return null;
     if (!conn.info.capabilities.includes('fs.thumbnail')) return null;
     return async (vaultPath, maxDim) => {
-      const result = await conn.rpc.call('fs.thumbnail', { path: vaultPath, maxDim });
+      // Read the connection at call time, not at wiring time. `patch()` runs
+      // once per connect; a reconnect replaces `rpcConnection` without
+      // re-running it, so a captured handle is dead from the first reconnect
+      // onwards. The bridge catches the failure and falls back to fetching
+      // the whole file, so this degrades silently and permanently rather
+      // than breaking — which is why it went unnoticed.
+      const live = this.conn.rpcConnection ?? conn;
+      const result = await live.rpc.call('fs.thumbnail', { path: vaultPath, maxDim });
       const buf = Buffer.from(result.contentBase64, 'base64');
       return {
         bytes:  new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
@@ -446,7 +457,9 @@ export class AdapterManager {
       // PreconditionFailed (-32020) when the remote mtime no longer
       // matches; ResourceBridge catches that and re-issues with
       // `expectedMtime: undefined`. #171.
-      const result = await conn.rpc.call('fs.readBinaryRange', {
+      // Live, not captured — see the note in the thumbnail fetcher above.
+      const live = this.conn.rpcConnection ?? conn;
+      const result = await live.rpc.call('fs.readBinaryRange', {
         path: vaultPath,
         offset,
         length,

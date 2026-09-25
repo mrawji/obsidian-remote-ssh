@@ -53,8 +53,18 @@ export class DaemonUnavailableError extends Error {}
  * Hooks the reconnect attempt calls after re-establishing the transport
  * so the plugin can rebind the adapter and fs-change listener.
  */
+/**
+ * The remote, as the adapter has to see it: which client to talk through,
+ * and what to join vault-relative paths with. One value because a reconnect
+ * can change both at once — see {@link ConnectionManager.buildBinding}.
+ */
+export interface RemoteBinding {
+  client: RemoteFsClient;
+  remoteBase: string;
+}
+
 export interface ReconnectAdapterHooks {
-  swapClient(newClient: RemoteFsClient): void;
+  rebind(binding: RemoteBinding): void;
   prepareListenerForReconnect(): void;
   resumeListenerAfterReconnect(rpcConn: RpcConnectionHandle): Promise<void>;
 }
@@ -337,7 +347,10 @@ export class ConnectionManager {
       }
     }
 
-    hooks.swapClient(this.buildFsClient());
+    // Both halves, because this pass may have changed transport: the
+    // downgrade a few lines up leaves `rpcConnection` null and switches the
+    // adapter to SFTP, which needs the vault prefix the RPC session did not.
+    hooks.rebind(this.buildBinding());
 
     hooks.prepareListenerForReconnect();
     if (this.rpcConnection) {
@@ -354,10 +367,27 @@ export class ConnectionManager {
   // ─── helpers ──────────────────────────────────────────────────────
 
   /** Build an appropriate RemoteFsClient for the current transport. */
-  buildFsClient(): RemoteFsClient {
+  /**
+   * Everything about the remote that a reconnect can change, in one value.
+   *
+   * The client and the path prefix are not independent — they are two halves
+   * of one decision, because the daemon already knows the vault root from
+   * its `--vault-root` flag and wants paths relative to it, while SFTP has
+   * no such server and needs the prefix to anchor at the vault.
+   *
+   * They used to be computed in different places: the client here, the
+   * prefix in `AdapterManager.patch()`. A reconnect swapped the client and
+   * left the prefix from the previous transport — and a reconnect CAN change
+   * transport, by downgrading to SFTP when the daemon turns out to be
+   * unavailable. RPC→SFTP then dropped the vault prefix from every path
+   * (writes landing beside the vault rather than in it); SFTP→RPC doubled
+   * it. Returning both together is what makes that combination
+   * unrepresentable.
+   */
+  buildBinding(): RemoteBinding {
     return this.rpcConnection
-      ? new RpcRemoteFsClient(this.rpcConnection.rpc)
-      : new SftpRemoteFsClient(this.client);
+      ? { client: new RpcRemoteFsClient(this.rpcConnection.rpc), remoteBase: '' }
+      : { client: new SftpRemoteFsClient(this.client), remoteBase: this.activeRemoteBasePath ?? '' };
   }
 
   isAlive(): boolean {

@@ -650,7 +650,7 @@ describe('SftpDataAdapter (read-side)', () => {
     });
   });
 
-  describe('swapClient', () => {
+  describe('rebind', () => {
     it('routes subsequent reads through the new client', async () => {
       const oldClient = makeFakeClient({
         files: { '/v/note.md': { data: Buffer.from('OLD'), mtime: 1 } },
@@ -661,7 +661,7 @@ describe('SftpDataAdapter (read-side)', () => {
       const adapter = new SftpDataAdapter(oldClient.client, '/v', readCache, dirCache, 'v');
       // Sanity: the adapter sees the old client's data first.
       expect(await adapter.read('note.md')).toBe('OLD');
-      adapter.swapClient(newClient.client);
+      adapter.rebind({ client: newClient.client, remoteBase: '/v' });
       // After swap, mtime mismatch invalidates the cache and the
       // newer client's data flows through.
       expect(await adapter.read('note.md')).toBe('NEW');
@@ -676,7 +676,7 @@ describe('SftpDataAdapter (read-side)', () => {
       });
       const adapter = new SftpDataAdapter(oldClient.client, '/v', readCache, dirCache, 'v');
       await adapter.read('note.md'); // primes cache
-      adapter.swapClient(newClient.client);
+      adapter.rebind({ client: newClient.client, remoteBase: '/v' });
       // Same mtime → cache hit, the new client only sees a stat call.
       const out = await adapter.read('note.md');
       expect(out).toBe('SAME');

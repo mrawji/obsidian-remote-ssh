@@ -230,7 +230,7 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
     // reconnectAttempt reads activeProfile; seed an RPC one directly.
     (mgr as unknown as { activeProfile: SshProfile }).activeProfile = { ...profile, transport: 'rpc' } as SshProfile;
     const hooks = {
-      swapClient: vi.fn(),
+      rebind: vi.fn(),
       prepareListenerForReconnect: vi.fn(),
       resumeListenerAfterReconnect: vi.fn(),
     };
@@ -246,7 +246,7 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
 
     expect(ensureDaemonBinary).toHaveBeenCalledTimes(1);
     expect(mgr.rpcConnection).toBeNull();              // stayed on SFTP
-    expect(hooks.swapClient).toHaveBeenCalledTimes(1); // rebound to the SFTP fs client
+    expect(hooks.rebind).toHaveBeenCalledTimes(1); // rebound to the SFTP fs client AND its prefix
   });
 });
 
