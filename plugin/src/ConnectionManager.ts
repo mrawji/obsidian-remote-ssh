@@ -36,8 +36,10 @@ export interface ConnectionDeps {
    * no notice and no log line, while every later file operation failed one
    * at a time with "stream is closed" and the status bar still said
    * connected.
+   *
+   * @param reason why the wire died, when the layer that noticed could tell.
    */
-  onRpcClose: () => void;
+  onRpcClose: (reason?: Error) => void;
 }
 
 /**
@@ -79,11 +81,24 @@ export interface ReconnectAdapterHooks {
 export class ConnectionManager {
   activeProfile: SshProfile | null = null;
   activeRemoteBasePath: string | null = null;
-  rpcConnection: RpcConnectionHandle | null = null;
+
+  private _rpcConnection: RpcConnectionHandle | null = null;
 
   /**
-   * Set while we are the ones closing the RPC wire, so the close handler
-   * above can tell "we hung up" from "it died". Mirrors `SftpClient`'s
+   * Read-only on purpose. Closing the wire has to go through this class, so
+   * the close handler can tell a deliberate teardown from a death.
+   *
+   * `restartDaemon` used to close it directly from the plugin, where the
+   * `closingRpcIntentionally` flag is out of reach. The result was a toast
+   * saying the connection had been lost for a button the user had just
+   * pressed, and a reconnect racing the restart — two `ServerDeployer.deploy`
+   * passes, each with `killExisting`, against the same socket and token.
+   */
+  get rpcConnection(): RpcConnectionHandle | null { return this._rpcConnection; }
+
+  /**
+   * Set while we are the ones closing the RPC wire, so the close handler in
+   * {@link watchRpcWire} can tell "we hung up" from "it died". Mirrors `SftpClient`'s
    * `intentionalDisconnect`; without it, every manual disconnect and every
    * reconnect pass would kick off a reconnect of its own.
    */
@@ -159,7 +174,7 @@ export class ConnectionManager {
       // matches a real root, so it redeploys, which is correct).
       const haveRoot = reused.info.vaultRoot ?? '';
       if (sameRemotePath(haveRoot, absVaultRoot)) {
-        this.rpcConnection = reused;
+        this._rpcConnection = reused;
         this.watchRpcWire();
         logger.info(
           `startRpcSession: reusing existing daemon for ${absVaultRoot} ` +
@@ -197,10 +212,11 @@ export class ConnectionManager {
     logger.info(`startRpcSession: daemon up; token len=${deploy.token.length}`);
 
     const stream = await this.client.openUnixStream(deploy.remoteSocketPath);
-    this.rpcConnection = await establishRpcConnection({ stream, token: deploy.token });
+    const conn = await establishRpcConnection({ stream, token: deploy.token });
+    this._rpcConnection = conn;
     logger.info(
-      `startRpcSession: handshake complete; daemon ${this.rpcConnection.info.version} ` +
-      `(protocol v${this.rpcConnection.info.protocolVersion})`,
+      `startRpcSession: handshake complete; daemon ${conn.info.version} ` +
+      `(protocol v${conn.info.protocolVersion})`,
     );
 
     this.watchRpcWire();
@@ -226,7 +242,7 @@ export class ConnectionManager {
       if (this.closingRpcIntentionally) return;
       logger.warn(`RPC wire closed unexpectedly${err ? `: ${errorMessage(err)}` : ''}`);
       this.stopHeartbeat();
-      this.deps.onRpcClose();
+      this.deps.onRpcClose(err);
     });
 
     // A closed wire is the loud case. The quiet one is a daemon that is
@@ -236,13 +252,13 @@ export class ConnectionManager {
     // made into it simply never returns.
     this.stopHeartbeat();
     this.heartbeat = new RpcHeartbeat({
-      probe: () => conn.rpc.call('server.info', {}),
+      probe: (signal) => conn.rpc.call('server.info', {}, signal),
       msSinceLastMessage: () => conn.rpc.msSinceLastMessage(),
       pendingCount: () => conn.rpc.pendingCount(),
       onDead: (reason) => {
         if (this.closingRpcIntentionally) return;
         logger.warn(`RPC heartbeat: ${reason.message}`);
-        this.deps.onRpcClose();
+        this.deps.onRpcClose(reason);
       },
     });
     this.heartbeat.start();
@@ -253,16 +269,55 @@ export class ConnectionManager {
     this.heartbeat = null;
   }
 
+  /**
+   * Drop the wire without the close handler reading it as a death.
+   *
+   * Every deliberate teardown goes through here or through
+   * {@link teardownRpcSession}; the flag is what separates the two cases, and
+   * it is private so that cannot be got wrong from outside.
+   */
+  private closeRpcIntentionally(): void {
+    if (!this._rpcConnection) return;
+    this.stopHeartbeat();
+    this.closingRpcIntentionally = true;
+    try { this._rpcConnection.close(); }
+    catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
+    finally { this.closingRpcIntentionally = false; }
+    this._rpcConnection = null;
+  }
+
+  /**
+   * Stop the daemon and drop the wire, for a caller that means to bring both
+   * straight back up.
+   *
+   * The flag spans stopping the daemon as well as closing the wire, because
+   * killing the far end drops the connection from over there and that close
+   * arrives on its own schedule. Closing our side first would also work, but
+   * only because `RpcClient` ignores a second close — leaning on that is how
+   * this went wrong to begin with.
+   */
+  async teardownRpcSession(): Promise<void> {
+    this.closingRpcIntentionally = true;
+    try {
+      this.stopHeartbeat();
+      if (this.daemonDeployer && this.client.isAlive()) {
+        try { await this.daemonDeployer.stop(); }
+        catch (e) { logger.warn(`daemon stop: ${errorMessage(e)}`); }
+      }
+      if (this._rpcConnection) {
+        try { this._rpcConnection.close(); }
+        catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
+        this._rpcConnection = null;
+      }
+      this.daemonDeployer = null;
+    } finally {
+      this.closingRpcIntentionally = false;
+    }
+  }
+
   /** Close RPC tunnel, stop daemon, disconnect SSH. */
   async disconnectTransport(): Promise<void> {
-    if (this.rpcConnection) {
-      this.stopHeartbeat();
-      this.closingRpcIntentionally = true;
-      try { this.rpcConnection.close(); }
-      catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
-      finally { this.closingRpcIntentionally = false; }
-      this.rpcConnection = null;
-    }
+    this.closeRpcIntentionally();
     if (this.daemonDeployer && this.client.isAlive()) {
       try { await this.daemonDeployer.stop(); }
       catch (e) { logger.warn(`daemon stop: ${errorMessage(e)}`); }
@@ -321,13 +376,7 @@ export class ConnectionManager {
     }
 
     const transport = profile.transport ?? 'sftp';
-    if (this.rpcConnection) {
-      this.stopHeartbeat();
-      this.closingRpcIntentionally = true;
-      try { this.rpcConnection.close(); } catch { /* already dead */ }
-      finally { this.closingRpcIntentionally = false; }
-      this.rpcConnection = null;
-    }
+    this.closeRpcIntentionally();
     if (transport === 'rpc') {
       const effectivePath = this.activeRemoteBasePath ?? normalizeRemotePath(profile.remotePath);
       try {
@@ -337,8 +386,8 @@ export class ConnectionManager {
         // a permanent daemon-unavailable condition (unsupported arch /
         // declined / download failed) must NOT be retried by
         // ReconnectManager. Continue with rpcConnection still null so
-        // buildFsClient() yields an SFTP client. Any other error propagates
-        // to the reconnect retry loop as before.
+        // {@link buildBinding} yields the SFTP client AND the vault prefix
+        // that transport needs. Any other error propagates to the retry loop.
         if (e instanceof DaemonUnavailableError) {
           logger.warn(`reconnectAttempt: daemon unavailable, continuing on SFTP: ${e.message}`);
         } else {

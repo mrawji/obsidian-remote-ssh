@@ -2,7 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import type { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
 import type { PathMapper } from '../src/path/PathMapper';
 import { AdapterManager, PATCHED_METHODS } from '../src/adapter/AdapterManager';
+import * as path from 'node:path';
+import { FileSystemAdapter } from 'obsidian';
 import type { App, PluginManifest } from 'obsidian';
+import { OfflineQueue } from '../src/offline/OfflineQueue';
 import type { ConnectionManager } from '../src/ConnectionManager';
 import type { FsChangeListener } from '../src/vault/FsChangeListener';
 import type { PendingEditsBar } from '../src/ui/PendingEditsBar';
@@ -15,18 +18,28 @@ import type { PluginSettings } from '../src/types';
  * mocks only need the methods that are called on a fresh (un-patched)
  * instance: FsChangeListener.unsubscribe() and ConnectionManager.rpcConnection.
  */
-function makeManager(opts: { transferTracker?: { clear: () => void } } = {}) {
+function makeManager(
+  opts: { transferTracker?: { clear: () => void }; rpcConnection?: unknown } = {},
+) {
   const unsubscribeSpy = vi.fn();
+  // Held as its own object so a test can swap `rpcConnection` afterwards —
+  // which is what a reconnect does, and `patch()` does not run again.
+  const conn = { rpcConnection: opts.rpcConnection ?? null, activeRemoteBasePath: null };
   const mgr = new AdapterManager(
     {} as App,
     { id: 'remote-ssh' } as unknown as PluginManifest,
-    { rpcConnection: null, activeRemoteBasePath: null } as unknown as ConnectionManager,
+    conn as unknown as ConnectionManager,
     { subscribe: vi.fn(), unsubscribe: unsubscribeSpy } as unknown as FsChangeListener,
     { startPolling: vi.fn() } as unknown as PendingEditsBar,
     () => ({}) as unknown as PluginSettings,
     opts.transferTracker ?? null,
   );
-  return { mgr, unsubscribeSpy };
+  return { mgr, unsubscribeSpy, conn };
+}
+
+/** A daemon handle advertising `capabilities`, with a spy for its calls. */
+function rpcHandle(capabilities: string[], call = vi.fn()) {
+  return { info: { capabilities }, rpc: { call } };
 }
 
 // ─── PATCHED_METHODS ─────────────────────────────────────────────────────────
@@ -162,10 +175,12 @@ describe('AdapterManager.restore()', () => {
 
 // ─── the pieces patch() is built from ────────────────────────────────────────
 //
-// `patch()` itself needs a real vault, a live transport and a bound port, so
-// nothing had ever executed it — the helper above says as much. These three
-// steps were lifted out of it precisely so they could be reached, in the same
-// way `wireKeyboardInteractiveHandler` was lifted out of `SftpClient.connect`.
+// Nothing had ever executed `patch()`. These three steps were lifted out of
+// it so they could be reached one at a time, in the same way
+// `wireKeyboardInteractiveHandler` was lifted out of `SftpClient.connect`.
+// `patch()` is driven directly further down as well, with the bridge and the
+// queue stubbed — which is what made it reachable at all, and is why the
+// steps still earn separate cases: each one's failure mode is its own.
 
 /** Reach a private method without widening the class's surface. */
 function priv<T>(mgr: unknown, name: string): T {
@@ -313,8 +328,9 @@ describe('AdapterManager.startResourceBridge()', () => {
   });
 
   it('hands the bridge a fetcher wired to this manager', async () => {
-    // The bridge serves Obsidian's <img> requests; if that callback does not
-    // reach the patched adapter, every remote image renders broken.
+    // Only that the callback lands on this manager's method: it replaces the
+    // method to see that. What the method itself does is a separate case
+    // below, because for a while nothing drove it at all.
     const { mgr } = makeManager();
     const fetchSpy = vi.fn(async () => new Uint8Array([1]));
     (mgr as unknown as Record<string, unknown>).fetchBinaryForBridge = fetchSpy;
@@ -327,13 +343,14 @@ describe('AdapterManager.startResourceBridge()', () => {
     expect(fetchSpy).toHaveBeenCalledWith('notes/diagram.png');
   });
 
-  it('enables the daemon fast paths only when the daemon offers them', async () => {
+  it('enables the daemon fast paths when the daemon offers them', async () => {
     // Served from the daemon's resize path instead of pulling the full
-    // original on every <img> — but only when it advertises the method.
-    const { mgr } = makeManager();
-    const internals = mgr as unknown as Record<string, unknown>;
-    internals.makeThumbnailFetcherIfSupported = () => (() => Promise.resolve(new Uint8Array()));
-    internals.makeBinaryRangeFetcherIfSupported = () => (() => Promise.resolve(new Uint8Array()));
+    // original on every <img>. This used to stub both factories out, so the
+    // "only when it advertises the method" half was the stub talking; the
+    // real capability check now decides.
+    const { mgr } = makeManager({
+      rpcConnection: rpcHandle(['fs.thumbnail', 'fs.readBinaryRange']),
+    });
     const passed: unknown[] = [];
     const bridge = { start: async (...a: unknown[]) => { passed.push(...a); } };
 
@@ -342,6 +359,19 @@ describe('AdapterManager.startResourceBridge()', () => {
 
     expect(got).toBe(bridge);
     expect(passed.filter((x) => typeof x === 'function')).toHaveLength(3);
+  });
+
+  it('and offers only the plain fetcher when it does not', async () => {
+    const { mgr } = makeManager({ rpcConnection: rpcHandle([]) });
+    const passed: unknown[] = [];
+    const bridge = { start: async (...a: unknown[]) => { passed.push(...a); } };
+
+    await priv<(b: unknown) => Promise<unknown>>(mgr, 'startResourceBridge').call(mgr, bridge);
+
+    expect(
+      passed.filter((x) => typeof x === 'function'),
+      'a daemon without the methods must not be asked for them',
+    ).toHaveLength(1);
   });
 
   it('gives up the bridge, not the session, when it cannot bind', async () => {
@@ -359,9 +389,10 @@ describe('AdapterManager.startResourceBridge()', () => {
 
 // ─── patch() itself ──────────────────────────────────────────────────────────
 //
-// Never executed by anything: not the unit suite, and — measured — not the
-// integration suite either. Only the E2E run drives it, and that uploads no
-// coverage. It is the step that puts this plugin in front of the vault.
+// Had never been executed by anything: not the unit suite, and — measured —
+// not the integration suite either. Only the E2E run drove it, and that
+// uploads no coverage. It is the step that puts this plugin in front of the
+// vault, which is why these cases exist.
 
 describe('AdapterManager.patch()', () => {
   function patchableManager() {
@@ -411,6 +442,8 @@ describe('AdapterManager.patch()', () => {
   it('replaces the host adapter\'s methods and reports success', async () => {
     const { mgr, hostAdapter } = patchableManager();
     const before = hostAdapter.read;
+    const originals: Record<string, unknown> = {};
+    for (const m of PATCHED_METHODS) originals[m] = hostAdapter[m];
 
     expect(await mgr.patch()).toBe(true);
 
@@ -418,8 +451,16 @@ describe('AdapterManager.patch()', () => {
     expect(mgr.dataAdapter).not.toBeNull();
     expect(hostAdapter.read).not.toBe(before);
     // Not all of them are functions — `basePath` is a value, which is the
-    // whole point of #170: plugins read it and used to get `undefined`.
-    for (const m of PATCHED_METHODS) expect(hostAdapter[m]).toBeDefined();
+    // whole point of #170: plugins read it and used to get `undefined`. So
+    // every name must be present, and every one that WAS a function must now
+    // be a different function: `toBeDefined` alone would pass if the patcher
+    // wired two names to one handler, or left an original in place.
+    for (const m of PATCHED_METHODS) {
+      expect(hostAdapter[m], `${m} is installed`).toBeDefined();
+      if (typeof originals[m] === 'function') {
+        expect(hostAdapter[m], `${m} is the adapter's, not the host's`).not.toBe(originals[m]);
+      }
+    }
   });
 
   it('is idempotent — a second patch does not re-wrap an already-wrapped adapter', async () => {
@@ -450,5 +491,162 @@ describe('AdapterManager.patch()', () => {
     await mgr.patch();
 
     expect(subscribe).not.toHaveBeenCalled();
+  });
+});
+
+describe('AdapterManager.openOfflineQueue()', () => {
+  // Stubbed out by every other test in this file, including the `patch()`
+  // block added to close exactly this kind of gap — so the real body had
+  // never run. What it decides is WHERE the queue lives; get the join wrong
+  // and a user's pending writes are opened somewhere else entirely, with
+  // nothing failing to say so.
+
+  function managerOn(adapter: unknown, configDir = '.obsidian') {
+    return new AdapterManager(
+      { vault: { adapter, configDir } } as unknown as App,
+      { id: 'remote-ssh' } as unknown as PluginManifest,
+      { rpcConnection: null, activeRemoteBasePath: null } as unknown as ConnectionManager,
+      { subscribe: vi.fn(), unsubscribe: vi.fn() } as unknown as FsChangeListener,
+      { startPolling: vi.fn() } as unknown as PendingEditsBar,
+      () => ({}) as unknown as PluginSettings,
+      null,
+    );
+  }
+
+  it('opens the queue beside the plugin, under the vault it is serving', async () => {
+    const fsAdapter = new FileSystemAdapter();
+    (fsAdapter as unknown as { getBasePath: () => string }).getBasePath =
+      () => '/vaults/shadow';
+    const open = vi.spyOn(OfflineQueue, 'open')
+      .mockResolvedValue({} as unknown as OfflineQueue);
+
+    const mgr = managerOn(fsAdapter);
+    await priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr);
+
+    expect(open).toHaveBeenCalledWith(
+      path.join('/vaults/shadow', '.obsidian', 'plugins', 'remote-ssh', 'queue'),
+    );
+    open.mockRestore();
+  });
+
+  it('follows a customised config directory', async () => {
+    // `configDir` is a user setting; hardcoding `.obsidian` would strand the
+    // queue outside the vault for anyone who changed it.
+    const fsAdapter = new FileSystemAdapter();
+    (fsAdapter as unknown as { getBasePath: () => string }).getBasePath = () => '/v';
+    const open = vi.spyOn(OfflineQueue, 'open')
+      .mockResolvedValue({} as unknown as OfflineQueue);
+
+    const mgr = managerOn(fsAdapter, '.config-obsidian');
+    await priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr);
+
+    expect(open).toHaveBeenCalledWith(
+      path.join('/v', '.config-obsidian', 'plugins', 'remote-ssh', 'queue'),
+    );
+    open.mockRestore();
+  });
+
+  it('refuses a vault with no local disk behind it, rather than guessing a path', async () => {
+    const mgr = managerOn({ read: () => 'not a FileSystemAdapter' });
+
+    await expect(priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr))
+      .rejects.toThrow(/FileSystemAdapter/);
+  });
+});
+
+describe('AdapterManager.fetchBinaryForBridge()', () => {
+  // Every image, PDF and audio file in the vault is served through here. The
+  // one test that named the behaviour replaced this method with a spy, so
+  // nothing executed it — returning an empty array instead would have made
+  // every attachment render blank with the suite still green.
+
+  it('refuses before the adapter is patched', async () => {
+    const { mgr } = makeManager();
+
+    await expect(
+      priv<(p: string) => Promise<unknown>>(mgr, 'fetchBinaryForBridge').call(mgr, 'a.png'),
+    ).rejects.toThrow(/not patched/);
+  });
+
+  it('goes through the patched adapter, for its cache and path mapping', async () => {
+    const { mgr } = makeManager();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchBinaryForBridge = vi.fn().mockResolvedValue(bytes);
+    (mgr as unknown as { _dataAdapter: unknown })._dataAdapter = { fetchBinaryForBridge };
+
+    const got = await priv<(p: string) => Promise<Uint8Array>>(mgr, 'fetchBinaryForBridge')
+      .call(mgr, 'notes/diagram.png');
+
+    expect(fetchBinaryForBridge).toHaveBeenCalledWith('notes/diagram.png');
+    expect(got, 'the bytes have to come back unchanged').toBe(bytes);
+  });
+});
+
+describe('AdapterManager — the daemon fast paths read the live connection', () => {
+  // `patch()` runs once per connect, so these closures outlive the handle
+  // they were built with. A reconnect replaces `rpcConnection` underneath
+  // them, and the bridge catches a failed fast path and pulls the whole
+  // original instead — so a captured handle degrades silently and
+  // permanently: an 8 MB JPEG per <img> where ~150 KB would do, with nothing
+  // failing to say so. Both closures were at zero executions.
+
+  it('asks whichever daemon is live now for a thumbnail', async () => {
+    const stale = rpcHandle(['fs.thumbnail']);
+    const { mgr, conn } = makeManager({ rpcConnection: stale });
+    const fetch = priv<() => ((p: string, d: number) => Promise<unknown>) | null>(
+      mgr, 'makeThumbnailFetcherIfSupported',
+    ).call(mgr)!;
+
+    const fresh = rpcHandle(['fs.thumbnail'], vi.fn().mockResolvedValue({
+      contentBase64: Buffer.from([7, 8]).toString('base64'),
+      format: 'png',
+    }));
+    conn.rpcConnection = fresh;   // the reconnect
+
+    const got = await fetch('notes/d.png', 64);
+
+    expect(stale.rpc.call, 'the handle it was built with is dead').not.toHaveBeenCalled();
+    expect(fresh.rpc.call).toHaveBeenCalledWith('fs.thumbnail', { path: 'notes/d.png', maxDim: 64 });
+    expect(got).toEqual({ bytes: new Uint8Array([7, 8]), format: 'png' });
+  });
+
+  it('asks whichever daemon is live now for a range', async () => {
+    const stale = rpcHandle(['fs.readBinaryRange']);
+    const { mgr, conn } = makeManager({ rpcConnection: stale });
+    const fetch = priv<() => ((p: string, o: number, l: number) => Promise<unknown>) | null>(
+      mgr, 'makeBinaryRangeFetcherIfSupported',
+    ).call(mgr)!;
+
+    const fresh = rpcHandle(['fs.readBinaryRange'], vi.fn().mockResolvedValue({
+      contentBase64: Buffer.from([1, 2, 3]).toString('base64'),
+      mtime: 42,
+      size: 3,
+    }));
+    conn.rpcConnection = fresh;
+
+    const got = await fetch('big.bin', 0, 3);
+
+    expect(stale.rpc.call).not.toHaveBeenCalled();
+    expect(fresh.rpc.call).toHaveBeenCalledWith(
+      'fs.readBinaryRange', { path: 'big.bin', offset: 0, length: 3 },
+    );
+    expect(got).toEqual({ bytes: new Uint8Array([1, 2, 3]), mtime: 42, totalSize: 3 });
+  });
+
+  it('falls back to the handle it was built with when there is no live one', async () => {
+    // Between a drop and a successful reconnect `rpcConnection` is null, and
+    // an in-flight <img> request still has to be answered.
+    const built = rpcHandle(['fs.thumbnail'], vi.fn().mockResolvedValue({
+      contentBase64: '', format: 'jpeg',
+    }));
+    const { mgr, conn } = makeManager({ rpcConnection: built });
+    const fetch = priv<() => ((p: string, d: number) => Promise<unknown>) | null>(
+      mgr, 'makeThumbnailFetcherIfSupported',
+    ).call(mgr)!;
+
+    conn.rpcConnection = null;
+    await fetch('a.png', 32);
+
+    expect(built.rpc.call).toHaveBeenCalled();
   });
 });

@@ -39,8 +39,11 @@ function manager(opts: { rpc: boolean; base: string | null }) {
     },
   );
   mgr.activeRemoteBasePath = opts.base;
-  mgr.rpcConnection = opts.rpc
-    ? ({ rpc: {}, info: { capabilities: [] } } as never)
+  // `rpcConnection` is read-only from outside — closing it has to go through
+  // the manager. Reaching the backing field is the test's business, not a
+  // reason to reopen it.
+  (mgr as unknown as { _rpcConnection: unknown })._rpcConnection = opts.rpc
+    ? { rpc: {}, info: { capabilities: [] } }
     : null;
   return mgr;
 }

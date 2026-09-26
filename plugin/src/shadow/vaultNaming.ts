@@ -37,7 +37,17 @@ export function sanitiseStateKey(profileId: string): string {
  * length-capped; never `.`/`..`/empty.
  */
 function sanitiseVaultName(name: string): string {
-  const cleaned = (name ?? '')
+  return sanitiseSegment(name);
+}
+
+/**
+ * Charset strip, collapse, cap — and never `.`, `..` or empty.
+ *
+ * Both halves of the shadow dir name want exactly this; they differ only in
+ * what they feed it.
+ */
+function sanitiseSegment(raw: string): string {
+  const cleaned = (raw ?? '')
     .replace(/[^a-zA-Z0-9._ -]/g, '_')
     .replace(/_{2,}/g, '_')
     .trim()
@@ -61,14 +71,7 @@ function sanitisePathTail(remotePath: string): string {
   // A bare `~` (vault rooted at the remote home dir) has no meaningful
   // folder tail — catch it before the charset strip below turns it into `_`.
   if (tail === '~') return 'vault';
-  const cleaned = tail
-    .replace(/[^a-zA-Z0-9._ -]/g, '_')
-    .replace(/_{2,}/g, '_')
-    .trim()
-    .slice(0, 40)
-    .trim();
-  if (!cleaned || cleaned === '.' || cleaned === '..') return 'vault';
-  return cleaned;
+  return sanitiseSegment(tail);
 }
 
 /**

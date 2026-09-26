@@ -1,4 +1,4 @@
-import { Plugin, Notice, Modal, FileSystemAdapter, TFile, TFolder, requestUrl } from 'obsidian';
+import { Plugin, Notice, Modal, FileSystemAdapter, TFile, TFolder } from 'obsidian';
 import type { PluginSettings, SshProfile } from './types';
 import { SyncState } from './types';
 import { DEFAULT_SETTINGS, DEFAULT_WALK_IGNORE_DIRS } from './constants';
@@ -41,18 +41,12 @@ import { ObsidianRegistry } from './shadow/ObsidianRegistry';
 import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
 import { sanitiseStateKey } from './shadow/vaultNaming';
 import type { BootstrapResult } from './shadow/ShadowVaultBootstrap';
-import {
-  pullSharedObsidianConfig,
-  pushSharedObsidianConfig,
-  SHARED_OBSIDIAN_CONFIG_FILES,
-} from './shadow/SharedObsidianConfigSync';
+import { pullSharedObsidianConfig } from './shadow/SharedObsidianConfigSync';
 import type { SharedConfigReader } from './shadow/SharedObsidianConfigSync';
 import {
   communityPluginsBasePath,
   pullCommunityPlugins,
-  pushCommunityPlugins,
   pullPluginBinaries,
-  pushPluginBinaries,
   readEnabledPluginIds,
 } from './shadow/CommunityPluginsSync';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
@@ -69,21 +63,14 @@ import { withTimeout } from './util/withTimeout';
 import * as path from 'path';
 import { errorMessage } from "./util/errorMessage";
 import { ConnectionManager, DaemonUnavailableError } from "./ConnectionManager";
-import {
-  detectRemoteTarget,
-  ensureDaemonBinary as downloadDaemonBinary,
-  resolveDaemonConsent,
-  DaemonVerificationError,
-  binaryFilename,
-} from './transport/DaemonDownloader';
+import { decideReconnect } from './transport/reconnectDecision';
+import { buildReconnectHooks } from './transport/reconnectHooks';
+import { DaemonVerificationError } from './transport/DaemonDownloader';
 import { ensureDaemonBinary as ensureRemoteDaemonBinary } from './transport/ensureDaemonBinary';
-import { createHash } from 'crypto';
 import { TransferTracker } from "./util/TransferTracker";
 import { LargeTransferBar } from "./ui/LargeTransferBar";
 import { OnboardingModal } from "./ui/OnboardingModal";
 import { telemetry, telemetryLogPath } from "./util/Telemetry";
-
-/** GitHub `owner/repo` the daemon binaries are released from. */
 
 /**
  * Everything this plugin keeps OUTSIDE any vault, on every OS:
@@ -184,23 +171,17 @@ export default class RemoteSshPlugin extends Plugin {
       (prompts) => new KbdInteractiveModal(this.app, prompts).prompt(),
       (info) => new HostKeyMismatchModal(this.app, info).prompt(),
     );
-    client.onClose(({ unexpected }) => {
-      if (unexpected) {
-        new Notice('Remote SSH: connection lost — reconnecting…');
-        void this.startReconnect();
-      }
+    client.onClose(({ unexpected, reason }) => {
+      if (unexpected) void this.startReconnect(reason);
     });
     this.conn = new ConnectionManager(client, {
       locateDaemonBinary: () => this.locateDaemonBinary(),
       ensureDaemonBinary: (c) => this.ensureDaemonBinary(c),
-      // The daemon dying is a lost connection too, even though SSH is fine.
-      // It goes to the same place an SSH drop does — `startReconnect` is
-      // idempotent, so when both die together (the usual case) the second
-      // call is a no-op rather than a second loop.
-      onRpcClose: () => {
-        new Notice('Remote SSH: remote daemon stopped — reconnecting…');
-        void this.startReconnect();
-      },
+      // The daemon dying is a lost connection too, even though SSH may be
+      // fine. Both go to the same place, and `startReconnect` announces —
+      // on the RPC transport an SSH drop kills the tunnel with it, so both
+      // paths fire for one failure and the user must still see one notice.
+      onRpcClose: (reason) => { void this.startReconnect(reason); },
     });
     this.conn.activeRemoteBasePath = null;
 
@@ -259,6 +240,34 @@ export default class RemoteSshPlugin extends Plugin {
       this.app.vault.on('rename', (file) => renameFollower.handleRename(file)),
     );
 
+    this.registerCommands();
+
+    // Inside `onLayoutReady` so Obsidian has finished initialising the vault
+    // before anything touches plugins or the adapter. See `runShadowStartup`.
+    this.app.workspace.onLayoutReady(() => {
+      if (this.settings.autoConnectProfileId) {
+        void this.runShadowStartup();
+        return;
+      }
+      // F17 — first-launch onboarding. Opens the wizard when the user
+      // has no profiles yet AND hasn't dismissed onboarding before.
+      // Skipped on shadow vaults (auto-connect path above).
+      if (this.settings.profiles.length === 0 && !this.settings.onboardingCompleted) {
+        this.showOnboarding();
+      }
+    });
+  }
+
+  /**
+   * The command palette surface, and the terminal view the last one opens.
+   *
+   * Lifted out of `onload` whole: it was 86 lines of the 202, and the only
+   * stretch a reader has to scroll past to find the wiring. Order-independent
+   * with respect to everything around it, which the rest of `onload` is not —
+   * the construction above it is sequenced on purpose and the comments there
+   * say why, so it stays where those constraints are visible.
+   */
+  private registerCommands(): void {
     this.addCommand({
       id: 'connect',
       name: 'Connect to remote vault',
@@ -344,21 +353,6 @@ export default class RemoteSshPlugin extends Plugin {
         if (ready) void this.openRemoteTerminal();
         return true;
       },
-    });
-
-    // Inside `onLayoutReady` so Obsidian has finished initialising the vault
-    // before anything touches plugins or the adapter. See `runShadowStartup`.
-    this.app.workspace.onLayoutReady(() => {
-      if (this.settings.autoConnectProfileId) {
-        void this.runShadowStartup();
-        return;
-      }
-      // F17 — first-launch onboarding. Opens the wizard when the user
-      // has no profiles yet AND hasn't dismissed onboarding before.
-      // Skipped on shadow vaults (auto-connect path above).
-      if (this.settings.profiles.length === 0 && !this.settings.onboardingCompleted) {
-        this.showOnboarding();
-      }
     });
   }
 
@@ -466,14 +460,10 @@ export default class RemoteSshPlugin extends Plugin {
     const profile = this.conn.activeProfile;
     const basePath = this.conn.activeRemoteBasePath;
     if (!profile || !basePath) throw new Error('No active profile');
-    if (this.conn.daemonDeployer && this.conn.isAlive()) {
-      try { await this.conn.daemonDeployer.stop(); } catch { /* best effort */ }
-    }
-    if (this.conn.rpcConnection) {
-      try { this.conn.rpcConnection.close(); } catch { /* already dead */ }
-      this.conn.rpcConnection = null;
-    }
-    this.conn.daemonDeployer = null;
+    // Through the manager, not around it: closing the wire from here left the
+    // "we hung up" flag unset, so the restart announced itself as a lost
+    // connection and started a reconnect that raced it.
+    await this.conn.teardownRpcSession();
     await this.conn.startRpcSession(profile, basePath);
     // Rebind adapter to the fresh RPC client
     this.adapterMgr.dataAdapter?.rebind(this.conn.buildBinding());
@@ -669,37 +659,39 @@ export default class RemoteSshPlugin extends Plugin {
     new Notice('Remote SSH: reconnect cancelled');
   }
 
-  private async startReconnect(): Promise<void> {
-    if (!this.conn.activeProfile) {
+  private async startReconnect(cause?: Error): Promise<void> {
+    const decision = decideReconnect({
+      hasActiveProfile: this.conn.activeProfile !== null,
+      alreadyReconnecting: this.state === SyncState.RECONNECTING,
+      maxRetries: this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries,
+      cause,
+    });
+    if (decision.kind === 'no-profile') {
       logger.warn('startReconnect: no active profile to reconnect with');
       this.setState(SyncState.ERROR);
       return;
     }
-    const maxRetries = this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries;
-    if (maxRetries <= 0) {
+    if (decision.kind === 'already-reconnecting') {
+      logger.info(decision.log);
+      return;
+    }
+    if (decision.kind === 'disabled') {
       logger.info('startReconnect: auto-reconnect disabled (reconnectMaxRetries <= 0)');
+      new Notice(decision.notice);
       this.adapterMgr.restore();
       this.setState(SyncState.ERROR);
       return;
     }
+    new Notice(decision.notice);
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
-      maxRetries,
+      maxRetries: decision.maxRetries,
       setAdapterReconnecting: (on) => this.adapterMgr.dataAdapter?.setReconnecting(on),
       onState: (s) => this.onReconnectStateChange(s),
-      hooks: {
-        rebind: (b) => this.adapterMgr.dataAdapter?.rebind(b),
-        prepareListenerForReconnect: () => this.fsChangeListener.prepareForReconnect(),
-        resumeListenerAfterReconnect: async (rpc) => {
-          const da = this.adapterMgr.dataAdapter;
-          if (da) {
-            await this.fsChangeListener.resumeAfterReconnect({
-              rpcConnection: rpc,
-              dataAdapter: da,
-            });
-          }
-        },
-      },
+      hooks: buildReconnectHooks({
+        dataAdapter: () => this.adapterMgr.dataAdapter,
+        fsChangeListener: this.fsChangeListener,
+      }),
     });
   }
 
@@ -800,7 +792,7 @@ export default class RemoteSshPlugin extends Plugin {
    * in-flight command survive a focus change.
    *
    * `setActiveLeaf`, not `revealLeaf`: the latter needs Obsidian 1.7.2 and
-   * the manifest declares 1.4.0. Same observable effect.
+   * the manifest declares 1.5.0. Same observable effect.
    */
   async openRemoteTerminal(): Promise<void> {
     if (this.openingTerminal) return;

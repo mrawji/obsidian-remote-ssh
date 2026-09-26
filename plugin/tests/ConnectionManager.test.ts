@@ -308,6 +308,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     expect(handle.rpc.onClose, 'the manager must subscribe').toHaveBeenCalledTimes(1);
     fire(new Error('daemon went away'));
     expect(onRpcClose).toHaveBeenCalledTimes(1);
+    // The owner turns this into what the user is told, so it has to arrive.
+    expect(onRpcClose.mock.calls[0][0]).toMatchObject({ message: 'daemon went away' });
   });
 
   it('tells its owner just the same when the daemon was reused', async () => {
@@ -358,7 +360,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
       await mgr.startRpcSession(profile, 'work');
 
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(call, 'nothing would ever ask otherwise').toHaveBeenCalledWith('server.info', {});
+      expect(call, 'nothing would ever ask otherwise')
+        .toHaveBeenCalledWith('server.info', {}, expect.any(AbortSignal));
 
       const before = call.mock.calls.length;
       await mgr.disconnectTransport();
@@ -367,6 +370,103 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('reports the quiet death too, and says what it was', async () => {
+    // Narrow on purpose: that `onDead` reaches the owner carrying its reason.
+    // `pendingCount` is stubbed here, and a stub of it is what hid the bug
+    // that made `onDead` unreachable at all — the detection itself is pinned
+    // against a real RpcClient in tests/RpcHeartbeat.test.ts, not here.
+    vi.useFakeTimers();
+    try {
+      const onRpcClose = vi.fn();
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockRejectedValue(new Error('no answer'));
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          msSinceLastMessage: () => 10 * 60_000, // long quiet
+          pendingCount: () => 0,                 // and idle
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose,
+      });
+      await mgr.startRpcSession(profile, 'work');
+
+      // Three misses at a 10s tick; 60s leaves room without depending on
+      // the exact schedule.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(onRpcClose, 'a daemon that stops answering is a lost connection')
+        .toHaveBeenCalledTimes(1);
+      expect(onRpcClose.mock.calls[0][0]).toMatchObject({
+        message: expect.stringContaining('stopped answering') as unknown as string,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('restarting the daemon is not a lost connection', async () => {
+    // The restart button closed the wire from the plugin, where the
+    // "we hung up" flag is out of reach, so the user got a toast saying the
+    // connection had dropped for something they had just asked for — and a
+    // reconnect loop racing the restart, two deploys deep.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    handle.close = vi.fn(() => { fire(undefined); });   // a real close is synchronous
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.teardownRpcSession();
+
+    expect(handle.close, 'the wire still has to go down').toHaveBeenCalled();
+    expect(onRpcClose, 'we asked for this; nothing was lost').not.toHaveBeenCalled();
+    expect(mgr.rpcConnection, 'and the dead handle must not be left behind').toBeNull();
+  });
+
+  it('stays quiet when killing the daemon drops the wire from the far end', async () => {
+    // Why the flag spans the whole teardown rather than just our own close:
+    // stopping the daemon takes the far end away, and that close arrives on
+    // its own schedule — before we have closed anything ourselves.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const client = {
+      getRemoteHome: vi.fn().mockResolvedValue(HOME),
+      openUnixStream: vi.fn().mockResolvedValue({}),
+      isAlive: vi.fn().mockReturnValue(true),
+    } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+    const mgr = new ConnectionManager(client, {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+
+    const stop = vi.fn(async () => { fire(new Error('daemon exited')); });
+    mgr.daemonDeployer = { stop } as never;
+    await mgr.teardownRpcSession();
+
+    expect(stop, 'the daemon has to be stopped for this to mean anything')
+      .toHaveBeenCalled();
+    expect(onRpcClose, 'we killed it; that is not a death').not.toHaveBeenCalled();
   });
 
   it('stays quiet when WE are the ones hanging up', async () => {
@@ -399,8 +499,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
 //
 // `startReconnect` and `cancelReconnect` are reached only from `main.ts`,
 // which is excluded from coverage — so measured across BOTH suites, neither
-// had ever run. `main.ts` calls `startReconnect` from two places and
-// `cancelReconnect` from three, which is exactly why its guards matter.
+// had ever run — `main.ts` calls one of them from one place and the other
+// from two, so nothing here was reached by driving the plugin either.
 
 describe('ConnectionManager — starting and cancelling a reconnect', () => {
   const profile = { id: 'p', name: 'P', remotePath: '~/work' } as unknown as SshProfile;

@@ -1,37 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { EventEmitter } from 'events';
 import { RpcClient } from '../src/transport/RpcClient';
 import { RpcError } from '../src/transport/RpcError';
-
-/**
- * A FramedDuplex stand-in just rich enough for RpcClient: it exposes
- * the same events (`message`, `close`, `error`) and captures anything
- * written via `writeMessage` so tests can assert the wire shape.
- */
-class FakeFramed extends EventEmitter {
-  public sent: Buffer[] = [];
-  public closed = false;
-  writeMessage(body: Buffer): boolean {
-    if (this.closed) throw new Error('closed');
-    this.sent.push(body);
-    return true;
-  }
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.emit('close');
-  }
-
-  /** Drive a response back to the client; for tests only. */
-  pushMessage(envelope: unknown): void {
-    this.emit('message', Buffer.from(JSON.stringify(envelope), 'utf8'));
-  }
-}
+import { FakeFramed } from './helpers/fakeFramed';
 
 function setup() {
   const framed = new FakeFramed();
-  const client = new RpcClient(framed as unknown as import('../src/transport/framing').FramedDuplex);
-  return { framed, client };
+  return { framed, client: new RpcClient(framed.asFramed()) };
 }
 
 describe('RpcClient', () => {
