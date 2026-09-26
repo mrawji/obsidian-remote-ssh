@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { RpcClient } from '../src/transport/RpcClient';
-import { RpcError } from '../src/transport/RpcError';
+import { RpcError, RpcAbandonedError } from '../src/transport/RpcError';
 import { FakeFramed } from './helpers/fakeFramed';
 
 function setup() {
@@ -210,5 +210,46 @@ describe('RpcClient — liveness signals', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('RpcClient — abandoning a call', () => {
+  it('reports it as abandonment, not as a fault of the daemon', async () => {
+    // It used to reject with ErrorCode.InternalError, which errorTaxonomy
+    // renders as "Daemon internal error", points the user at the server log,
+    // and reports to telemetry as a server fault — for a call the plugin
+    // itself cancelled. Nothing in the types stopped that, because it was a
+    // well-formed RpcError carrying a daemon code.
+    const { client } = setup();
+    const abandon = new AbortController();
+
+    const call = client.call('server.info', {}, abandon.signal);
+    abandon.abort();
+    const err = await call.catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RpcAbandonedError);
+    expect(err, 'an RpcError here gets classified as the daemon misbehaving')
+      .not.toBeInstanceOf(RpcError);
+  });
+
+  it('stops listening to the signal once the call has settled', async () => {
+    // `{ once: true }` removes the listener only if it fires. A caller sharing
+    // one controller across an operation's calls would otherwise accumulate a
+    // listener, and the `reject` it closes over, for the signal's lifetime —
+    // and the optional-signal signature invites exactly that.
+    const { framed, client } = setup();
+    const addEventListener = vi.fn();
+    const removeEventListener = vi.fn();
+    const signal = {
+      aborted: false, addEventListener, removeEventListener,
+    } as unknown as AbortSignal;
+
+    const call = client.call('server.info', {}, signal);
+    framed.pushMessage({ jsonrpc: '2.0', id: 1, result: { ok: true } });
+    await call;
+
+    expect(addEventListener).toHaveBeenCalledTimes(1);
+    expect(removeEventListener, 'the listener has to go when the call does')
+      .toHaveBeenCalledTimes(1);
   });
 });

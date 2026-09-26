@@ -344,7 +344,6 @@ function versionGt(a: number[], b: number[]): boolean {
   return false;
 }
 
-/** Atomic (tmp + rename) write of arbitrary file content. */
 /** Parse a community-plugins.json body into a string-id array, or null if malformed. */
 function parsePluginIdList(content: string): string[] | null {
   try {

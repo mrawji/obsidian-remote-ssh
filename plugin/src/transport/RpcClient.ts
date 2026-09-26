@@ -1,5 +1,5 @@
 import { FramedDuplex } from './framing';
-import { RpcError } from './RpcError';
+import { RpcError, RpcAbandonedError } from './RpcError';
 import type {
   MethodName,
   Params,
@@ -18,6 +18,8 @@ interface PendingCall {
   /** For judging whether a call is still plausibly in progress. */
   sentAt: number;
   requestBytes: number;
+  /** Cleanup to run however the call ends; see the abort listener. */
+  onSettle: Array<() => void>;
 }
 
 /**
@@ -80,21 +82,29 @@ export class RpcClient {
         method,
         sentAt: Date.now(),
         requestBytes: body.length,
+        onSettle: [],
       });
       if (signal) {
         // `delete` returning false means the call already settled, so a late
         // abort is a no-op rather than a second rejection.
         const abandon = (): void => {
-          if (!this.pending.delete(id)) return;
-          reject(new RpcError(-32603, `RpcClient: ${method} abandoned by caller`));
+          if (!this.take(id)) return;
+          reject(new RpcAbandonedError(method));
         };
         if (signal.aborted) { abandon(); return; }
         signal.addEventListener('abort', abandon, { once: true });
+        // Removed on settle, not only on abort: `{ once: true }` alone leaves
+        // the listener — and the `reject` it closes over — attached for the
+        // signal's lifetime, and this signature invites one long-lived
+        // controller shared across every call of an operation.
+        this.pending.get(id)?.onSettle.push(
+          () => signal.removeEventListener('abort', abandon),
+        );
       }
       try {
         this.framed.writeMessage(body);
       } catch (e) {
-        this.pending.delete(id);
+        this.take(id);
         reject(e instanceof Error ? e : new Error(String(e)));
       }
     });
@@ -146,6 +156,23 @@ export class RpcClient {
    * liveness probe therefore has to know whether the line is actually free
    * before reading silence as trouble.
    */
+  /**
+   * Take a call out of the map and run whatever it registered for cleanup.
+   *
+   * Every settle path goes through here so the abort listener is actually
+   * removed. Returns the entry, or null if something had already claimed it —
+   * which is how a late abort becomes a no-op instead of a second rejection.
+   */
+  private take(id: number): PendingCall | null {
+    const entry = this.pending.get(id);
+    if (!entry) return null;
+    this.pending.delete(id);
+    for (const cb of entry.onSettle) {
+      try { cb(); } catch { /* cleanup must not mask the result */ }
+    }
+    return entry;
+  }
+
   pendingCount(): number {
     return this.pending.size;
   }
@@ -205,9 +232,8 @@ export class RpcClient {
 
     // Response (matches a call we sent).
     if (typeof msg.id === 'number') {
-      const pending = this.pending.get(msg.id);
+      const pending = this.take(msg.id);
       if (!pending) return;
-      this.pending.delete(msg.id);
       if ('error' in msg && msg.error) {
         pending.reject(new RpcError(msg.error.code, msg.error.message, msg.error.data));
         return;
@@ -231,10 +257,9 @@ export class RpcClient {
     if (this.closed) return;
     this.closed = true;
     const reason = err ?? new RpcError(-32603, 'RpcClient: stream closed before reply');
-    for (const p of this.pending.values()) {
-      p.reject(reason);
+    for (const id of [...this.pending.keys()]) {
+      this.take(id)?.reject(reason);
     }
-    this.pending.clear();
     for (const cb of [...this.closeHandlers]) {
       try { cb(err); } catch { /* ignore */ }
     }
