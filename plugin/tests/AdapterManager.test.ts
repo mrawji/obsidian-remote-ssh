@@ -348,9 +348,11 @@ describe('AdapterManager.startResourceBridge()', () => {
     // original on every <img>. This used to stub both factories out, so the
     // "only when it advertises the method" half was the stub talking; the
     // real capability check now decides.
-    const { mgr } = makeManager({
-      rpcConnection: rpcHandle(['fs.thumbnail', 'fs.readBinaryRange']),
-    });
+    const handle = rpcHandle(
+      ['fs.thumbnail', 'fs.readBinaryRange'],
+      vi.fn().mockResolvedValue({ contentBase64: '', format: 'png', mtime: 1, size: 0 }),
+    );
+    const { mgr } = makeManager({ rpcConnection: handle });
     const passed: unknown[] = [];
     const bridge = { start: async (...a: unknown[]) => { passed.push(...a); } };
 
@@ -359,6 +361,23 @@ describe('AdapterManager.startResourceBridge()', () => {
 
     expect(got).toBe(bridge);
     expect(passed.filter((x) => typeof x === 'function')).toHaveLength(3);
+
+    // Which one is which, not just how many. Counting them let the two
+    // optional arguments be swapped: the bridge would then call the range
+    // fetcher as `fetchThumbnail(path, maxDim)`, both fast paths would throw,
+    // and the bridge catches that and pulls the whole original — silently, for
+    // every image and every media seek, forever.
+    const [, thumbnail, range] = passed as [
+      unknown,
+      (p: string, maxDim: number) => Promise<unknown>,
+      (p: string, offset: number, length: number) => Promise<unknown>,
+    ];
+    await thumbnail('a.png', 64);
+    expect(handle.rpc.call, 'the second argument is the thumbnail fetcher')
+      .toHaveBeenCalledWith('fs.thumbnail', { path: 'a.png', maxDim: 64 });
+    await range('b.bin', 0, 4);
+    expect(handle.rpc.call, 'and the third is the range fetcher')
+      .toHaveBeenCalledWith('fs.readBinaryRange', { path: 'b.bin', offset: 0, length: 4 });
   });
 
   it('and offers only the plain fetcher when it does not', async () => {
@@ -613,7 +632,7 @@ describe('AdapterManager — the daemon fast paths read the live connection', ()
   it('asks whichever daemon is live now for a range', async () => {
     const stale = rpcHandle(['fs.readBinaryRange']);
     const { mgr, conn } = makeManager({ rpcConnection: stale });
-    const fetch = priv<() => ((p: string, o: number, l: number) => Promise<unknown>) | null>(
+    const fetch = priv<() => ((p: string, o: number, l: number, m?: number) => Promise<unknown>) | null>(
       mgr, 'makeBinaryRangeFetcherIfSupported',
     ).call(mgr)!;
 
@@ -631,6 +650,15 @@ describe('AdapterManager — the daemon fast paths read the live connection', ()
       'fs.readBinaryRange', { path: 'big.bin', offset: 0, length: 3 },
     );
     expect(got).toEqual({ bytes: new Uint8Array([1, 2, 3]), mtime: 42, totalSize: 3 });
+
+    // And the generation pin, when the bridge has one. Dropping it from the
+    // params passed every test: the daemon would never raise
+    // PreconditionFailed, and a file edited during a media seek would serve
+    // bytes spliced from two generations (#171).
+    await fetch('big.bin', 0, 3, 1234);
+    expect(fresh.rpc.call).toHaveBeenCalledWith(
+      'fs.readBinaryRange', { path: 'big.bin', offset: 0, length: 3, expectedMtime: 1234 },
+    );
   });
 
   it('falls back to the handle it was built with when there is no live one', async () => {

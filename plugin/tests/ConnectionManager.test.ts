@@ -508,6 +508,55 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     expect(onRpcClose, 'we killed it; that is not a death').not.toHaveBeenCalled();
   });
 
+  it('stops watching, and lets the deployer go', async () => {
+    // Deleting either `stopHeartbeat()` or `daemonDeployer = null` from the
+    // teardown passed the whole suite. The heartbeat is the one that bites: if
+    // `startRpcSession` then throws — a missing binary, a failed handshake,
+    // neither unlikely right after a restart — the orphan keeps probing a
+    // closed client, every probe rejects, and it reports the session lost.
+    vi.useFakeTimers();
+    try {
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockResolvedValue({ ok: true });
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          msSinceLastMessage: () => 10 * 60_000,
+          pendingCount: () => 0,
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const client = {
+        getRemoteHome: vi.fn().mockResolvedValue(HOME),
+        openUnixStream: vi.fn().mockResolvedValue({}),
+        isAlive: vi.fn().mockReturnValue(true),
+      } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+      const mgr = new ConnectionManager(client, {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose: vi.fn(),
+      });
+      await mgr.startRpcSession(profile, 'work');
+      mgr.daemonDeployer = { stop: vi.fn().mockResolvedValue(undefined) } as never;
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      const before = call.mock.calls.length;
+      expect(before, 'it has to be probing for this to mean anything').toBeGreaterThan(0);
+
+      await mgr.teardownRpcSession();
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(call.mock.calls.length, 'a torn-down session must not be probed').toBe(before);
+      expect(mgr.daemonDeployer, 'and the deployer must not outlive the teardown').toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('ignores a close that arrives after we let the wire go', async () => {
     // The case a boolean flag could not cover. Killing the daemon drops the
     // wire from the far end, and that close lands on its own schedule —
