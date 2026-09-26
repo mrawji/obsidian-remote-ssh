@@ -273,6 +273,20 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
   }
 
   /** Captures the handler the manager subscribes with, so we can fire it. */
+  /**
+   * The progress surface the heartbeat reads: silent and idle by default, so a
+   * probe is due. Bytes and call age rather than a pending count — a count
+   * could not tell a big transfer from a save that would never return.
+   */
+  function liveness(over: Record<string, unknown> = {}) {
+    return {
+      msSinceLastByte: () => 10 * 60_000,
+      outboundBacklogBytes: () => 0,
+      oldestPending: () => null,
+      ...over,
+    };
+  }
+
   function handleWithCapturedCloseHandler() {
     let fire: ((err?: Error) => void) | undefined;
     const handle = {
@@ -345,8 +359,7 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
       const rpc = {
         ...handle.rpc,
         call,
-        msSinceLastMessage: () => 10 * 60_000, // long quiet
-        pendingCount: () => 0,                 // and idle
+        ...liveness(),   // long quiet, nothing in flight
       };
       const conn = { ...handle, rpc };
       tryReuse.mockResolvedValue(null);
@@ -373,24 +386,24 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
   });
 
   it('asks the client how busy it is, rather than assuming', async () => {
-    // Hard-coding `pendingCount: () => 0` in the manager's wiring passes every
-    // other test in this file — which is the same stub that let an inert
-    // heartbeat ship a release. A real call in flight has to suppress the
-    // probe: the daemon serves one request at a time, so a probe sent mid
-    // transfer queues behind it and then times out on our own account,
-    // tearing down a session that is working.
+    // The manager used to build the heartbeat's view of the connection out of
+    // separate callbacks, and hard-coding one of them to "idle" passed every
+    // other test in this file — the same stub that let an inert heartbeat ship
+    // a release. It now hands over the client itself, so this asserts the
+    // client is what gets asked: a call still within its grace has to suppress
+    // the probe, because the daemon serves one request at a time and a probe
+    // sent mid-transfer queues behind it and times out on our own account.
     vi.useFakeTimers();
     try {
       const { handle } = handleWithCapturedCloseHandler();
       const call = vi.fn().mockResolvedValue({ ok: true });
-      const pendingCount = vi.fn().mockReturnValue(1);   // a big read in flight
+      const oldestPending = vi.fn().mockReturnValue({ ageMs: 1_000, requestBytes: 4_000_000 });
       const conn = {
         ...handle,
         rpc: {
           ...handle.rpc,
           call,
-          msSinceLastMessage: () => 10 * 60_000,   // quiet, so only the count saves us
-          pendingCount,
+          ...liveness({ oldestPending }),   // quiet, but a young big write in flight
         },
       };
       tryReuse.mockResolvedValue(null);
@@ -404,8 +417,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
       await mgr.startRpcSession(profile, 'work');
       await vi.advanceTimersByTimeAsync(60_000);
 
-      expect(pendingCount, 'the manager has to ask the client').toHaveBeenCalled();
-      expect(call, 'a busy line is a live line; do not probe it').not.toHaveBeenCalled();
+      expect(oldestPending, 'the manager has to ask the client').toHaveBeenCalled();
+      expect(call, 'work in progress is not silence; do not probe it').not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -413,7 +426,7 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
 
   it('reports the quiet death too, and says what it was', async () => {
     // Narrow on purpose: that `onDead` reaches the owner carrying its reason.
-    // `pendingCount` is stubbed here, and a stub of it is what hid the bug
+    // The progress surface is stubbed here, and stubbing it is what hid the bug
     // that made `onDead` unreachable at all — the detection itself is pinned
     // against a real RpcClient in tests/RpcHeartbeat.test.ts, not here.
     vi.useFakeTimers();
@@ -426,8 +439,7 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
         rpc: {
           ...handle.rpc,
           call,
-          msSinceLastMessage: () => 10 * 60_000, // long quiet
-          pendingCount: () => 0,                 // and idle
+          ...liveness(),   // long quiet, nothing in flight
         },
       };
       tryReuse.mockResolvedValue(null);
@@ -523,8 +535,7 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
         rpc: {
           ...handle.rpc,
           call,
-          msSinceLastMessage: () => 10 * 60_000,
-          pendingCount: () => 0,
+          ...liveness(),
         },
       };
       tryReuse.mockResolvedValue(null);

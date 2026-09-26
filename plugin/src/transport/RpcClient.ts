@@ -15,6 +15,9 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   method: string;
+  /** For judging whether a call is still plausibly in progress. */
+  sentAt: number;
+  requestBytes: number;
 }
 
 /**
@@ -75,6 +78,8 @@ export class RpcClient {
         resolve: resolve as (v: unknown) => void,
         reject,
         method,
+        sentAt: Date.now(),
+        requestBytes: body.length,
       });
       if (signal) {
         // `delete` returning false means the call already settled, so a late
@@ -143,6 +148,34 @@ export class RpcClient {
    */
   pendingCount(): number {
     return this.pending.size;
+  }
+
+  /**
+   * The call that has been waiting longest, or null when the line is clear.
+   *
+   * The heartbeat needs the age and the request size, not just a count: a
+   * count alone cannot distinguish a big write still being served from a save
+   * that will never return, and treating both as proof of life is what made a
+   * wedged daemon undetectable.
+   */
+  oldestPending(): { ageMs: number; requestBytes: number } | null {
+    let oldest: PendingCall | null = null;
+    for (const p of this.pending.values()) {
+      if (oldest === null || p.sentAt < oldest.sentAt) oldest = p;
+    }
+    return oldest === null
+      ? null
+      : { ageMs: Date.now() - oldest.sentAt, requestBytes: oldest.requestBytes };
+  }
+
+  /** @see FramedDuplex.msSinceLastByte */
+  msSinceLastByte(): number {
+    return this.framed.msSinceLastByte();
+  }
+
+  /** @see FramedDuplex.outboundBacklogBytes */
+  outboundBacklogBytes(): number {
+    return this.framed.outboundBacklogBytes();
   }
 
   /**

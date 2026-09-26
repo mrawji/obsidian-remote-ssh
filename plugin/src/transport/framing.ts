@@ -19,6 +19,8 @@ import type { Duplex } from 'stream';
 export class FramedDuplex extends EventEmitter {
   /** Accumulates inbound bytes until enough have arrived to emit a message. */
   private buffer: Buffer = Buffer.alloc(0);
+  /** When a byte last arrived, whether or not it finished a frame. */
+  private lastByteAt = Date.now();
   /** Once headers are parsed, holds the declared body length until we have that many bytes. */
   private pendingBodyLength: number | null = null;
   private readonly maxMessageBytes: number;
@@ -73,9 +75,32 @@ export class FramedDuplex extends EventEmitter {
     this.emit('close');
   }
 
+  /**
+   * How long since any inbound byte.
+   *
+   * Bytes, not messages. A large `fs.readBinary` is ONE message that arrives
+   * over many chunks, so message-level silence cannot tell a big transfer from
+   * a daemon that has stopped answering. Byte-level silence can.
+   */
+  msSinceLastByte(): number {
+    return Date.now() - this.lastByteAt;
+  }
+
+  /**
+   * Bytes handed to the socket that it has not flushed yet.
+   *
+   * The other half of the same question: while this is shrinking we are still
+   * uploading, which is progress even though the daemon is silent by design
+   * for the whole of a large write.
+   */
+  outboundBacklogBytes(): number {
+    return (this.stream as { writableLength?: number }).writableLength ?? 0;
+  }
+
   // ─── parser ──────────────────────────────────────────────────────────────
 
   private onData(chunk: Buffer): void {
+    this.lastByteAt = Date.now();
     this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
     // Drain as many complete frames as we can; each iteration either peels one
     // frame off the front of `buffer` or stops waiting for more bytes.

@@ -256,9 +256,10 @@ export class ConnectionManager {
     // made into it simply never returns.
     this.stopHeartbeat();
     this.heartbeat = new RpcHeartbeat({
-      probe: (signal) => conn.rpc.call('server.info', {}, signal),
-      msSinceLastMessage: () => conn.rpc.msSinceLastMessage(),
-      pendingCount: () => conn.rpc.pendingCount(),
+      // The client itself, not a handful of callbacks onto it: wiring them
+      // separately is how a stubbed `pendingCount` came to describe a client
+      // that could not exist.
+      rpc: conn.rpc,
       onDead: (reason) => {
         // Same reasoning as the close handler above.
         if (this._rpcConnection !== conn) return;
