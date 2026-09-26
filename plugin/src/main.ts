@@ -240,6 +240,34 @@ export default class RemoteSshPlugin extends Plugin {
       this.app.vault.on('rename', (file) => renameFollower.handleRename(file)),
     );
 
+    this.registerCommands();
+
+    // Inside `onLayoutReady` so Obsidian has finished initialising the vault
+    // before anything touches plugins or the adapter. See `runShadowStartup`.
+    this.app.workspace.onLayoutReady(() => {
+      if (this.settings.autoConnectProfileId) {
+        void this.runShadowStartup();
+        return;
+      }
+      // F17 — first-launch onboarding. Opens the wizard when the user
+      // has no profiles yet AND hasn't dismissed onboarding before.
+      // Skipped on shadow vaults (auto-connect path above).
+      if (this.settings.profiles.length === 0 && !this.settings.onboardingCompleted) {
+        this.showOnboarding();
+      }
+    });
+  }
+
+  /**
+   * The command palette surface, and the terminal view the last one opens.
+   *
+   * Lifted out of `onload` whole: it was 86 lines of the 202, and the only
+   * stretch a reader has to scroll past to find the wiring. Order-independent
+   * with respect to everything around it, which the rest of `onload` is not —
+   * the construction above it is sequenced on purpose and the comments there
+   * say why, so it stays where those constraints are visible.
+   */
+  private registerCommands(): void {
     this.addCommand({
       id: 'connect',
       name: 'Connect to remote vault',
@@ -325,21 +353,6 @@ export default class RemoteSshPlugin extends Plugin {
         if (ready) void this.openRemoteTerminal();
         return true;
       },
-    });
-
-    // Inside `onLayoutReady` so Obsidian has finished initialising the vault
-    // before anything touches plugins or the adapter. See `runShadowStartup`.
-    this.app.workspace.onLayoutReady(() => {
-      if (this.settings.autoConnectProfileId) {
-        void this.runShadowStartup();
-        return;
-      }
-      // F17 — first-launch onboarding. Opens the wizard when the user
-      // has no profiles yet AND hasn't dismissed onboarding before.
-      // Skipped on shadow vaults (auto-connect path above).
-      if (this.settings.profiles.length === 0 && !this.settings.onboardingCompleted) {
-        this.showOnboarding();
-      }
     });
   }
 
