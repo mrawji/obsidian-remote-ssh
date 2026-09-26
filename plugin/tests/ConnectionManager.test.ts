@@ -372,6 +372,45 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     }
   });
 
+  it('asks the client how busy it is, rather than assuming', async () => {
+    // Hard-coding `pendingCount: () => 0` in the manager's wiring passes every
+    // other test in this file — which is the same stub that let an inert
+    // heartbeat ship a release. A real call in flight has to suppress the
+    // probe: the daemon serves one request at a time, so a probe sent mid
+    // transfer queues behind it and then times out on our own account,
+    // tearing down a session that is working.
+    vi.useFakeTimers();
+    try {
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockResolvedValue({ ok: true });
+      const pendingCount = vi.fn().mockReturnValue(1);   // a big read in flight
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          msSinceLastMessage: () => 10 * 60_000,   // quiet, so only the count saves us
+          pendingCount,
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose: vi.fn(),
+      });
+      await mgr.startRpcSession(profile, 'work');
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(pendingCount, 'the manager has to ask the client').toHaveBeenCalled();
+      expect(call, 'a busy line is a live line; do not probe it').not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports the quiet death too, and says what it was', async () => {
     // Narrow on purpose: that `onDead` reaches the owner carrying its reason.
     // `pendingCount` is stubbed here, and a stub of it is what hid the bug

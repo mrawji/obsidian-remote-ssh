@@ -14,12 +14,27 @@ import { FakeFramed } from './helpers/fakeFramed';
  * Timers are injected, so nothing here waits on real time.
  */
 
-/** A hand-cranked scheduler: nothing fires until `run()` is called. */
+/**
+ * A hand-cranked scheduler: nothing fires until `run()` is called.
+ *
+ * `delays` records every `ms` asked for, in order. It used not to — the
+ * parameter was not even declared — so `probeTimeoutMs` and `tickMs` were
+ * constructor inputs no test could observe, and either could be set to 0 with
+ * the whole suite green. That matters more since a timed-out probe is
+ * *cancelled* rather than merely abandoned: a probe timeout of 0 would take
+ * every probe away before a daemon on a slow link could answer, and declare
+ * the session dead within a minute.
+ */
 function fakeTimers() {
   let next = 1;
   const queued = new Map<number, () => void>();
+  const delays: number[] = [];
   return {
-    setTimer: (fn: () => void) => { const id = next++; queued.set(id, fn); return id; },
+    delays,
+    setTimer: (fn: () => void, ms: number) => {
+      delays.push(ms);
+      const id = next++; queued.set(id, fn); return id;
+    },
     clearTimer: (h: unknown) => { queued.delete(h as number); },
     /** Fire everything currently queued, then let microtasks settle. */
     async run(times = 1) {
@@ -149,6 +164,19 @@ describe('RpcHeartbeat', () => {
 
     expect(probe).not.toHaveBeenCalled();
     expect(timers.size).toBe(0);
+  });
+
+  it('schedules on the intervals it documents', async () => {
+    // Nothing pinned these. Both delays could be 0 — a probe every turn of
+    // the event loop, each abandoned before it could be answered — and 1514
+    // tests passed.
+    const { hb, timers } = make({ probe: () => new Promise(() => { /* hangs */ }) });
+
+    hb.start();
+    expect(timers.delays, 'the tick comes first').toEqual([10_000]);
+
+    await timers.run();   // the tick fires, sends a probe, and arms its deadline
+    expect(timers.delays, 'then the probe deadline').toEqual([10_000, 15_000]);
   });
 
   it('says nothing once it has been retired mid-probe', async () => {
