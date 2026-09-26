@@ -65,10 +65,29 @@ export interface RemoteBinding {
  * Hooks the reconnect attempt calls after re-establishing the transport
  * so the plugin can rebind the adapter and fs-change listener.
  */
+/**
+ * The live session as everyone outside this class may see it: everything the
+ * daemon can be asked, and no way to hang up.
+ *
+ * Making the field read-only stopped it being *replaced*, which was the bug —
+ * but the handle it returns still had a public `close()`, and so did the client
+ * inside it, so `conn.rpcConnection?.close()` and `?.rpc.close()` both still
+ * compiled. Closing the wire has to go through the manager, because that is
+ * what lets the close handler tell a teardown from a death; omitting `close`
+ * from the declared type is what actually enforces it.
+ */
+export interface RpcSessionView {
+  readonly info: RpcConnectionHandle['info'];
+  readonly rpc: RpcCallSurface;
+}
+
+/** Everything an RpcClient offers except the ability to close it. */
+export type RpcCallSurface = Omit<RpcConnectionHandle['rpc'], 'close'>;
+
 export interface ReconnectAdapterHooks {
   rebind(binding: RemoteBinding): void;
   prepareListenerForReconnect(): void;
-  resumeListenerAfterReconnect(rpcConn: RpcConnectionHandle): Promise<void>;
+  resumeListenerAfterReconnect(rpcConn: RpcSessionView): Promise<void>;
 }
 
 /**
@@ -95,7 +114,7 @@ export class ConnectionManager {
    * `ServerDeployer.deploy` passes, each with `killExisting`, against the
    * same socket and token.
    */
-  get rpcConnection(): RpcConnectionHandle | null { return this._rpcConnection; }
+  get rpcConnection(): RpcSessionView | null { return this._rpcConnection; }
 
   /** Watches for a daemon that stops answering without the wire dropping. */
   private heartbeat: RpcHeartbeat | null = null;
