@@ -2,10 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { decideReconnect } from '../src/transport/reconnectDecision';
 
 /**
- * These two behaviours shipped untested, in `main.ts`, which has no harness
- * and is excluded from coverage: the suite passed with the dedup guard
- * deleted and with the reason stripped back out of the message. They are
- * what the user sees when a session dies, so they are pinned here.
+ * These two behaviours shipped untested, in `main.ts`: the suite passed with
+ * the dedup guard deleted and with the reason stripped back out of the
+ * message. They are what the user sees when a session dies.
+ *
+ * What is pinned HERE is only the decision itself. Whether `main.ts` asks the
+ * question and acts on the answer is a separate matter, and one this file
+ * cannot see — `tests/startReconnect.wiring.test.ts` covers that, because
+ * without it every one of those wirings could still be broken with this suite
+ * green.
  */
 
 const base = { hasActiveProfile: true, alreadyReconnecting: false, maxRetries: 3 };

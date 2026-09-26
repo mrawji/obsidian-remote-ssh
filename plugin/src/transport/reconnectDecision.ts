@@ -1,12 +1,17 @@
 /**
  * What to do about a session that just went down.
  *
- * Pulled out of `main.ts` because nothing could test it there: the plugin
- * class has no test harness and `vitest.coverage.ts` excludes the file, so
- * both halves of the fix this encodes — one notice per disconnect, and saying
- * what died rather than that something did — could be reverted with the whole
- * suite still green. The decision is the part worth pinning; the Notice and
- * the state transition are Obsidian's business.
+ * Pulled out of `main.ts` so the decision can be stated once and read back.
+ * Both halves of the fix it encodes — one notice per disconnect, and saying
+ * what died rather than that something did — had shipped with nothing
+ * exercising them, because `vitest.coverage.ts` excludes `main.ts` and so the
+ * gap went unmeasured.
+ *
+ * Unmeasured, not unreachable: the plugin class constructs fine under the
+ * obsidian mock, and `tests/startReconnect.wiring.test.ts` drives this from
+ * there. Extracting the decision does not by itself pin anything — the caller
+ * still has to ask, and asking wrongly is what that suite covers. The Notice
+ * and the state transition stay Obsidian's business.
  */
 export type ReconnectDecision =
   /** Nothing to reconnect to. The caller reports an error state. */
