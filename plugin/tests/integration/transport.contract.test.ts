@@ -80,6 +80,25 @@ function pause(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/**
+ * Wait until the peer actually accepts a connection.
+ *
+ * This was a flat 1.5s sleep on the assumption that starting the container is
+ * the slow half. That holds on an idle laptop and not on a loaded CI runner,
+ * where it buys an intermittent ECONNREFUSED that looks like a transport bug.
+ * perl is the container's entrypoint, so it is there to ask with.
+ */
+function awaitPeer(name: string): void {
+  const probe = 'use IO::Socket::INET; exit(IO::Socket::INET->new("localhost:9999") ? 0 : 1)';
+  for (let i = 0; i < 50; i++) {
+    if (spawnSync('docker', ['exec', name, 'perl', '-e', probe], { stdio: 'ignore' }).status === 0) {
+      return;
+    }
+    pause(200);
+  }
+  throw new Error(`peer ${name} never accepted a connection`);
+}
+
 function jumpProfile(peer: string): SshProfile {
   return {
     id: 'transport-contract',
@@ -110,7 +129,7 @@ describeTransportContract('jump host', async (): Promise<TransportHarness> => {
   const network = networkOf(SSHD_CONTAINER);
   removePeer(name);
   startPeer(name, network);
-  pause(1500);   // perl binds at once; starting the container is the slow half
+  awaitPeer(name);
 
   const inner = jumpHostTransport(jumpProfile(name), {
     authResolver: new AuthResolver(new SecretStore()),

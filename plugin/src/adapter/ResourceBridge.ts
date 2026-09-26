@@ -70,8 +70,9 @@ interface MtimeCacheEntry {
  * regenerated on each `start()`, so a leaked URL from a past session cannot
  * replay against a new one.
  *
- * GET only. `Range:` is served from a single `fs.readBinaryRange` RPC when
- * one is wired, and otherwise by fetching the whole file and slicing.
+ * GET and HEAD; anything else gets a 405. `Range:` is served from a single
+ * `fs.readBinaryRange` RPC when one is wired, and otherwise by fetching the
+ * whole file and slicing.
  */
 export class ResourceBridge {
   private server: http.Server | null = null;

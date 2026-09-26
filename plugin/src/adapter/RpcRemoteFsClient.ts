@@ -4,6 +4,7 @@ import type { CloseListener, RemoteFsClient } from './RemoteFsClient';
 import type { Entry, Stat } from '../proto/types';
 import { RpcError } from '../transport/RpcError';
 import { withPerfTrace } from '../util/PerfTracer';
+import type { RpcCallSurface } from '../ConnectionManager';
 
 /**
  * RpcRemoteFsClient speaks to the Go daemon (obsidian-remote-server)
@@ -16,7 +17,9 @@ import { withPerfTrace } from '../util/PerfTracer';
  * uses elsewhere.
  */
 export class RpcRemoteFsClient implements RemoteFsClient {
-  constructor(private readonly rpc: RpcClient) {}
+  // Not the whole client: it forwards calls, and closing the wire belongs to
+  // ConnectionManager so the close handler can tell a teardown from a death.
+  constructor(private readonly rpc: RpcCallSurface) {}
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
 

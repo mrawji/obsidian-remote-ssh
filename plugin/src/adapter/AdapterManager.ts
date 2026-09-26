@@ -41,24 +41,20 @@ export const PATCHED_METHODS = [
   'trashSystem', 'trashLocal',
   // resources (binary URL for <img> / <iframe> / <audio>)
   'getResourcePath',
-  // basePath surface — patched so plugins that join paths against
-  // it (Templater's tp.file.path, Kanban clipboard paste, Importer,
-  // Copilot — see docs/en/user-guide/plugin-compatibility.md "basePath compat
-  // survey") get the shadow-vault local root explicitly. The natural
-  // FileSystemAdapter getter already returns this value, but routing
-  // through the replacement makes the contract explicit and gives
-  // tests a single hook to assert on. #170, follow-up to #133.
+  // Patched so plugins joining paths against it get the shadow root
+  // explicitly. The native getter returns the same value; routing through the
+  // replacement makes the contract explicit and gives tests one hook. #170.
   'basePath', 'getBasePath',
 ] as const;
 
 /**
- * Manages the lifetime of the monkey-patched `app.vault.adapter`,
- * the ResourceBridge, and the OfflineQueue. Extracted from main.ts
- * so that adapter-lifecycle concerns are cohesive and independently
- * testable (issue #197).
+ * Owns the lifetime of the patched `app.vault.adapter`, the ResourceBridge
+ * and the OfflineQueue. {@link patch} after a connect, {@link restore} on
+ * disconnect or unload.
  *
- * Call {@link patch} after a successful SSH connect; call
- * {@link restore} on disconnect or plugin unload.
+ * Lifted out of `main.ts` (#197) so those three lifetimes sit together and
+ * can be tested without standing up a plugin — worth knowing before anyone
+ * folds it back in.
  */
 export class AdapterManager {
   private patcher: AdapterPatcher<Record<string, unknown>> | null = null;
@@ -88,12 +84,9 @@ export class AdapterManager {
   }
 
   /**
-   * Build the SftpDataAdapter, start the ResourceBridge, monkey-patch
-   * `app.vault.adapter`, and subscribe to fs.watch when the active
-   * transport is RPC.
-   *
-   * Returns true on success, false on failure. Silent — the caller
-   * decides what notice (if any) to surface.
+   * Build the adapter, start the bridge, patch `app.vault.adapter`, and
+   * subscribe to fs.watch on RPC. Silent on failure — the caller decides what
+   * to show.
    */
   async patch(): Promise<boolean> {
     if (!this.conn.activeRemoteBasePath) {
@@ -105,26 +98,18 @@ export class AdapterManager {
       return true;
     }
     const targetAdapter = this.app.vault.adapter as unknown as Record<string, unknown>;
-    // Capture the shadow vault's local root *before* patching. The
-    // running window is the shadow window, so its FileSystemAdapter
-    // already points at `~/.obsidian-remote/vaults/<P-id>/`; we feed
-    // that value back into SftpDataAdapter so the patched basePath /
-    // getBasePath surface returns it explicitly. Falls back to '' if
-    // the host adapter isn't a FileSystemAdapter (mobile / unusual
-    // builds) — plugins that read basePath in those environments
-    // already had no useful answer. #170.
+    // Before patching: the host adapter still points at the shadow root, and
+    // that value is what the patched `basePath` must return. `''` on a host
+    // that is not a FileSystemAdapter — there was never a useful answer
+    // there anyway. #170.
     const shadowBasePath = this.app.vault.adapter instanceof FileSystemAdapter
       ? this.app.vault.adapter.getBasePath()
       : '';
     this.readCache = new ReadCache();
     this.dirCache = new DirCache();
-    // Pick the transport that matches the active session: when an
-    // RPC tunnel is up, route everything through the daemon; otherwise
-    // fall back to the direct-SFTP wrapper. The adapter itself is
-    // unaware of the choice — both clients implement RemoteFsClient.
-    // One value decides both halves — which client, and what prefix its
-    // paths need — because a reconnect can change them together. See
-    // ConnectionManager.buildBinding().
+    // One value carries both halves — which client, and what prefix its paths
+    // need — because a reconnect can change them together. See
+    // `ConnectionManager.buildBinding`.
     const binding = this.conn.buildBinding();
     const fsClient = binding.client;
     const transportLabel = this.conn.rpcConnection ? 'RPC' : 'SFTP';
@@ -141,15 +126,11 @@ export class AdapterManager {
 
     this.resourceBridge = await this.startResourceBridge();
 
-    // The Go daemon already knows the absolute vault root via its
-    // `--vault-root` flag, so RPC clients must send paths RELATIVE to
-    // that root (empty string for the root itself). Sending the same
-    // `work/VaultDev` prefix the SFTP path needs would double up:
-    // daemon-side `Resolve(absRoot, "work/VaultDev")` becomes
-    // `<absRoot>/work/VaultDev`, missing the real vault entirely
-    // (or — when a stale doubled mirror exists — quietly listing it).
-    // The SFTP transport has no such root-knowing server; it does need
-    // the prefix to anchor calls at the vault.
+    // The daemon knows the vault root from its `--vault-root` flag, so RPC
+    // paths must be relative to it. Sending the SFTP prefix as well makes
+    // `Resolve(absRoot, "work/VaultDev")` land at `<absRoot>/work/VaultDev` —
+    // missing the vault, or quietly listing a stale doubled mirror. SFTP has
+    // no such server and does need the prefix.
     const adapterRemoteBase = binding.remoteBase;
     // Per-session ancestor snapshot store. Powers the 3-way merge UI;
     // cleared on disconnect with the rest of the patched-adapter state.
@@ -198,18 +179,15 @@ export class AdapterManager {
   }
 
   /**
-   * Start the localhost binary bridge `getResourcePath` sends Obsidian to.
+   * Start the localhost bridge `getResourcePath` sends Obsidian to.
    *
-   * Best-effort: a bridge that cannot bind costs image rendering, not the
-   * session, so a failure returns null and the patch goes ahead.
+   * Best-effort: one that cannot bind costs image rendering, not the session.
+   * A daemon advertising the thumbnail or range methods also gets those fast
+   * paths wired.
    *
-   * On RPC, a daemon advertising `fs.thumbnail` / `fs.readBinaryRange` also
-   * gets the fast paths wired — image requests are served from the daemon's
-   * resize path instead of pulling the full original on every `<img>`.
-   *
-   * `bridge` is a test seam, same as `JumpHostTunnel`'s `clientFactory`: a
-   * bridge that fails to bind is the branch worth pinning, and it cannot be
-   * provoked through a real one.
+   * `bridge` is a test seam, like `JumpHostTunnel`'s `clientFactory` — the
+   * bind failure is the branch worth pinning and a real bridge will not
+   * produce it on request.
    */
   private async startResourceBridge(
     bridge: ResourceBridge = new ResourceBridge(),
@@ -267,16 +245,12 @@ export class AdapterManager {
   /**
    * Wire the two paths that keep the vault model current.
    *
-   * Writer self-reflect (#341) is transport-independent: the adapter mirrors
-   * every applied write/rename/remove/mkdir straight into this window's own
-   * `vault.fileMap` and trigger bus, and records the op. `VaultModelBuilder`
-   * is stateless and the adapter outlives a reconnect's `rebind`, so wiring
-   * it once holds for the whole patched lifetime.
+   * Self-reflect (#341) is transport-independent and wired once: the builder
+   * is stateless and the adapter outlives a reconnect's `rebind`.
    *
-   * The subscription only means anything on RPC — SFTP has no notification
-   * channel. There the daemon echoes our own writes back, and the shared
-   * registry is what lets `FsChangeListener` drop that echo instead of
-   * double-firing what the reflector already did. Other clients' changes
+   * The subscription only means anything on RPC. There the daemon echoes our
+   * own writes back, and the SHARED registry is what lets `FsChangeListener`
+   * drop that echo instead of firing a second time. Other clients' changes
    * never pass through `record`, so their echoes still apply.
    */
   private wireLiveUpdates(adapter: SftpDataAdapter, mapper: PathMapper): void {
@@ -399,11 +373,8 @@ export class AdapterManager {
   }
 
   /**
-   * Open the persistent offline-write queue under
-   * `<vault>/.obsidian/plugins/<id>/queue/`. The dir lives next to
-   * the plugin's other on-disk state (data.json, console.log, the
-   * thumbnails cache the daemon writes elsewhere) so a vault move
-   * carries the pending writes with it.
+   * Under the plugin's own dir, beside data.json and the log, so moving the
+   * vault carries the pending writes with it.
    */
   private async openOfflineQueue(): Promise<OfflineQueue> {
     const adapter = this.app.vault.adapter;
@@ -460,25 +431,18 @@ export class AdapterManager {
   }
 
   /**
-   * Build the bridge's range fetcher when the active session can
-   * support it (#134). Returns `null` for SFTP transports or for
-   * daemons that don't advertise `fs.readBinaryRange` — the bridge
-   * then transparently falls back to the full-binary path on every
-   * `Range:` request, which still works but allocates the whole file
-   * into memory just to slice.
+   * The bridge's range fetcher, or `null` when the session cannot serve one
+   * (#134). The bridge then falls back to the full binary on every `Range:`
+   * — correct, but it allocates the whole file just to slice it.
    */
   private makeBinaryRangeFetcherIfSupported(): null | ((vaultPath: string, offset: number, length: number, expectedMtime?: number) => Promise<{ bytes: Uint8Array; mtime: number; totalSize: number }>) {
     const conn = this.conn.rpcConnection;
     if (!conn) return null;
     if (!conn.info.capabilities.includes('fs.readBinaryRange')) return null;
     return async (vaultPath, offset, length, expectedMtime) => {
-      // Daemon's ReadBinaryRangeParams treats `expectedMtime` as
-      // optional — only include it when the bridge actually has a
-      // cached generation to pin against. The daemon rejects with
-      // PreconditionFailed (-32020) when the remote mtime no longer
-      // matches; ResourceBridge catches that and re-issues with
-      // `expectedMtime: undefined`. #171.
-      // Live, not captured — see the note in the thumbnail fetcher above.
+      // Only sent when the bridge has a generation to pin against; the daemon
+      // then rejects a newer one and the bridge re-issues unpinned (#171).
+      // Read live, not captured — see the thumbnail fetcher above.
       const live = this.conn.rpcConnection ?? conn;
       const result = await live.rpc.call('fs.readBinaryRange', {
         path: vaultPath,

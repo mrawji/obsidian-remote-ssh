@@ -5,6 +5,7 @@ import { RpcError } from './RpcError';
 import { PROTOCOL_VERSION, ErrorCode } from '../proto/types';
 import type { ServerInfo } from '../proto/types';
 import { logger } from '../util/logger';
+import { withTimeout } from '../util/withTimeout';
 
 /**
  * Concrete transport the α path needs: a Duplex stream reaching the
@@ -17,7 +18,29 @@ import { logger } from '../util/logger';
 export interface RpcConnectionInputs {
   stream: Duplex;
   token: string;
+  /** Override the handshake deadline; tests shorten it. */
+  handshakeTimeoutMs?: number;
 }
+
+/**
+ * How long the handshake may take before we give up on this socket.
+ *
+ * A connected socket proves nothing about the process behind it: the kernel
+ * accepts into the listen backlog whether or not the daemon is scheduling, so
+ * `openUnixStream` succeeds against a daemon that has wedged, slept or been
+ * SIGSTOPped, and `auth` then never returns.
+ *
+ * That matters because this is where the heartbeat's own recovery lands. The
+ * precondition for declaring a daemon dead — socket open, nothing answering —
+ * is exactly the precondition for this handshake to hang, so making `onDead`
+ * reachable made an unbounded wait reachable with it: the reconnect parks on
+ * "Reconnecting (attempt 1/3)" forever, never reports failure, and so never
+ * restores the adapter for Obsidian to fall back to local reads.
+ *
+ * Generous on purpose — a first handshake over a slow link is legitimately
+ * slow, and a false failure costs a working session.
+ */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 20_000;
 
 /**
  * Full result of a successful RPC handshake: the authenticated client
@@ -51,8 +74,15 @@ export async function establishRpcConnection(inputs: RpcConnectionInputs): Promi
     throw e;
   };
 
+  const deadline = inputs.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+
   try {
-    const authResult = await rpc.call('auth', { token: inputs.token });
+    // `cleanupOnFailure` closes the client, which rejects the abandoned call
+    // and ends the stream — so the deadline really does let the socket go,
+    // rather than leaving a hung promise and a live channel behind.
+    const authResult = await withTimeout(
+      rpc.call('auth', { token: inputs.token }), deadline, 'auth',
+    );
     if (!authResult.ok) {
       throw new RpcError(ErrorCode.AuthInvalid, 'daemon refused auth token');
     }
@@ -63,7 +93,7 @@ export async function establishRpcConnection(inputs: RpcConnectionInputs): Promi
 
   let info: ServerInfo;
   try {
-    info = await rpc.call('server.info', {});
+    info = await withTimeout(rpc.call('server.info', {}), deadline, 'server.info');
   } catch (e) {
     return cleanupOnFailure(e);
   }

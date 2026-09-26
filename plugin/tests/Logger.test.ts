@@ -439,7 +439,7 @@ describe('Logger — log rotation', () => {
     }
     // Spaces on purpose. An unbroken 1 MB run of one character matches the
     // secret-shaped patterns in `redactString` and is rewritten to
-    // `<REDACTED:1048576b>` — 21 bytes — so a naive filler never reaches the
+    // `<REDACTED:1048576b>` — 19 bytes — so a naive filler never reaches the
     // cap at all. Correct redaction; misleading test input.
     const megabyte = 'a log line that looks like prose '.repeat(32_000);
     for (let i = 0; i < 6; i++) log.info(megabyte);

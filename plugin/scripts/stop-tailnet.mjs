@@ -44,4 +44,7 @@ for (const node of ['vault', 'client']) {
   fs.rmSync(path.join(runDir, `authkey-${node}`), { force: true });
 }
 
-process.exit(r.status ?? 0);
+// `?? 1`, not `?? 0`: a spawn that failed for any reason other than ENOENT
+// leaves `status` null, and exiting 0 there would report a teardown that
+// never ran as done — leaving the containers and volumes behind.
+process.exit(r.status ?? 1);

@@ -566,13 +566,6 @@ export class VaultModelBuilder {
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Yield to the macrotask queue so the renderer can paint pending File
- * Explorer updates between build chunks. A microtask (`Promise.resolve()`)
- * would run before the browser paints; a 0 ms timer lets it paint first.
- * Uses `window.setTimeout` per the repo's timer convention (the vitest setup
- * polyfills `window`).
- */
 /** One entry's move between two `vault.fileMap` keys. */
 type PathMove = { entry: TAbstractFile; oldKey: string; newKey: string };
 
@@ -611,6 +604,13 @@ function applyPathMoves(map: Record<string, TAbstractFile>, moves: PathMove[]): 
   }
 }
 
+/**
+ * Yield to the macrotask queue so the renderer can paint pending File
+ * Explorer updates between build chunks. A microtask (`Promise.resolve()`)
+ * would run before the browser paints; a 0 ms timer lets it paint first.
+ * Uses `window.setTimeout` per the repo's timer convention (the vitest setup
+ * polyfills `window`).
+ */
 function yieldToEventLoop(): Promise<void> {
   return new Promise(resolve => { window.setTimeout(resolve, 0); });
 }

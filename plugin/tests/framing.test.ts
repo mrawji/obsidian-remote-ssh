@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { PassThrough } from 'stream';
+import { describe, it, expect, vi } from 'vitest';
+import { PassThrough, Duplex } from 'stream';
 import { FramedDuplex } from '../src/transport/framing';
 
 /**
@@ -241,5 +241,83 @@ describe('FramedDuplex', () => {
     await new Promise(r => setImmediate(r));
 
     expect(closeCount).toBe(1);
+  });
+});
+
+describe('FramedDuplex — the progress signals the heartbeat reads', () => {
+  // These exist because a pending-call count cannot tell a large transfer from
+  // a daemon that has stopped answering: `fs.readBinary` and `fs.writeBinary`
+  // carry the whole file in one call. Bytes can tell them apart.
+
+  it('counts from the last inbound byte, not the last whole message', async () => {
+    // The property that matters: a partial frame is traffic. A big read is ONE
+    // message arriving over many chunks, so anything measuring completed
+    // messages would call a working transfer silent.
+    // Only Date: faking the whole timer set would stop `setImmediate` too, and
+    // the stream's 'data' delivery rides on it.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const stream = new PassThrough();
+      const framed = new FramedDuplex(stream);
+
+      vi.advanceTimersByTime(5 * 60_000);
+      expect(framed.msSinceLastByte(), 'nothing has arrived yet')
+        .toBeGreaterThanOrEqual(5 * 60_000);
+
+      // A header promising more than follows: bytes, but no message.
+      const body = Buffer.from('{"jsonrpc":"2.0"', 'utf8');
+      stream.write(Buffer.concat([
+        Buffer.from(`Content-Length: ${body.length + 100}\r\n\r\n`, 'ascii'),
+        body,
+      ]));
+      await new Promise((resolve) => { setImmediate(resolve); });
+
+      expect(framed.msSinceLastByte(), 'a partial frame still counts as traffic')
+        .toBeLessThan(1_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports what the socket has not flushed yet', async () => {
+    // The mirror signal: while this is shrinking we are still uploading, even
+    // though the daemon says nothing for the whole of a large write.
+    //
+    // A Duplex that never completes a write, which is what an SSH channel looks
+    // like when its window is full. Not a PassThrough: that is a Transform, so
+    // what you write lands on its *readable* side and the writable buffer stays
+    // empty — the wrong shape for the question being asked.
+    let release: (() => void) | null = null;
+    const stalled = new Duplex({
+      read() { /* nothing to read */ },
+      write(_chunk, _enc, cb) { release = () => cb(); },
+    });
+    const framed = new FramedDuplex(stalled);
+
+    framed.writeMessage(Buffer.alloc(8 * 1024, 'x'));   // handed straight to _write
+    framed.writeMessage(Buffer.alloc(8 * 1024, 'y'));   // has to wait behind it
+
+    const queued = framed.outboundBacklogBytes();
+    expect(queued, 'the second frame is still queued').toBeGreaterThan(0);
+
+    release?.();
+    await new Promise((resolve) => { setImmediate(resolve); });
+
+    // A decrease is the signal the heartbeat actually consumes, and it is what
+    // can be observed here: Node keeps counting a chunk until its write
+    // callback returns, so letting one through shrinks the backlog rather than
+    // emptying it.
+    expect(framed.outboundBacklogBytes(), 'letting one through shrinks it')
+      .toBeLessThan(queued);
+  });
+
+  it('reports no backlog for a stream that cannot say', () => {
+    // ssh2 channels are Duplexes, but the plugin also wraps hand-rolled ones;
+    // a missing `writableLength` must read as "nothing queued" rather than NaN,
+    // which would make the comparison in the heartbeat always false.
+    const { a } = duplexPair();
+    const framed = new FramedDuplex(a as never);
+
+    expect(framed.outboundBacklogBytes()).toBe(0);
   });
 });
