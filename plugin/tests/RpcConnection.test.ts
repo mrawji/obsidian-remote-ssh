@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { PassThrough } from 'stream';
 import type { Duplex } from 'stream';
 import { establishRpcConnection } from '../src/transport/RpcConnection';
@@ -146,5 +146,37 @@ describe('establishRpcConnection', () => {
       establishRpcConnection({ stream: pair.clientSide, token: 'good' }),
     ).rejects.toThrow('method unavailable');
     stop();
+  });
+});
+
+describe('establishRpcConnection — a socket that accepts and then says nothing', () => {
+  // The kernel accepts into the listen backlog whether or not the daemon is
+  // scheduling, so opening the socket proves nothing. Before there was a
+  // deadline here, a wedged daemon meant `auth` never returned: the reconnect
+  // the heartbeat had just triggered parked on "Reconnecting (attempt 1/3)"
+  // for good, never reported failure, and so never restored the adapter.
+
+  it('gives up on the handshake, and lets the socket go', async () => {
+    vi.useFakeTimers();
+    try {
+      const { clientSide, serverSide } = duplexPair();
+      let ended = false;
+      serverSide.on('data', () => { /* drain, so 'end' can fire */ });
+      serverSide.on('end', () => { ended = true; });
+
+      const settled = establishRpcConnection({
+        stream: clientSide, token: 'tok', handshakeTimeoutMs: 5_000,
+      }).then(() => 'resolved', (e: unknown) => e);
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      const outcome = await settled;
+
+      expect(outcome, 'a hung handshake has to fail, not hang').toBeInstanceOf(Error);
+      expect((outcome as Error).message).toMatch(/auth timed out after 5000ms/);
+      expect(ended, 'and the stream must be closed so the caller has nothing to clean up')
+        .toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
