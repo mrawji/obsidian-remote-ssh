@@ -69,6 +69,8 @@ import { withTimeout } from './util/withTimeout';
 import * as path from 'path';
 import { errorMessage } from "./util/errorMessage";
 import { ConnectionManager, DaemonUnavailableError } from "./ConnectionManager";
+import { decideReconnect } from './transport/reconnectDecision';
+import { buildReconnectHooks } from './transport/reconnectHooks';
 import {
   detectRemoteTarget,
   ensureDaemonBinary as downloadDaemonBinary,
@@ -660,50 +662,38 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   private async startReconnect(cause?: Error): Promise<void> {
-    if (!this.conn.activeProfile) {
+    const decision = decideReconnect({
+      hasActiveProfile: this.conn.activeProfile !== null,
+      alreadyReconnecting: this.state === SyncState.RECONNECTING,
+      maxRetries: this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries,
+      cause,
+    });
+    if (decision.kind === 'no-profile') {
       logger.warn('startReconnect: no active profile to reconnect with');
       this.setState(SyncState.ERROR);
       return;
     }
-    // One failure, one notice. Both close paths lead here, and on the RPC
-    // transport a dropped SSH connection takes the tunnel with it, so both
-    // fire for the same event — announcing from the callers stacked two
-    // toasts on the most ordinary disconnect there is.
-    if (this.state === SyncState.RECONNECTING) {
-      logger.info(`startReconnect: already reconnecting${cause ? ` (${cause.message})` : ''}`);
+    if (decision.kind === 'already-reconnecting') {
+      logger.info(decision.log);
       return;
     }
-    // Say WHY, not just that. The transports go to some trouble to keep the
-    // reason a session died; discarding it here is what made every drop read
-    // as the same contentless line.
-    const lost = cause?.message ? `connection lost (${cause.message})` : 'connection lost';
-    const maxRetries = this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries;
-    if (maxRetries <= 0) {
+    if (decision.kind === 'disabled') {
       logger.info('startReconnect: auto-reconnect disabled (reconnectMaxRetries <= 0)');
-      new Notice(`Remote SSH: ${lost}. Auto-reconnect is off.`);
+      new Notice(decision.notice);
       this.adapterMgr.restore();
       this.setState(SyncState.ERROR);
       return;
     }
-    new Notice(`Remote SSH: ${lost} — reconnecting…`);
+    new Notice(decision.notice);
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
-      maxRetries,
+      maxRetries: decision.maxRetries,
       setAdapterReconnecting: (on) => this.adapterMgr.dataAdapter?.setReconnecting(on),
       onState: (s) => this.onReconnectStateChange(s),
-      hooks: {
-        rebind: (b) => this.adapterMgr.dataAdapter?.rebind(b),
-        prepareListenerForReconnect: () => this.fsChangeListener.prepareForReconnect(),
-        resumeListenerAfterReconnect: async (rpc) => {
-          const da = this.adapterMgr.dataAdapter;
-          if (da) {
-            await this.fsChangeListener.resumeAfterReconnect({
-              rpcConnection: rpc,
-              dataAdapter: da,
-            });
-          }
-        },
-      },
+      hooks: buildReconnectHooks({
+        dataAdapter: () => this.adapterMgr.dataAdapter,
+        fsChangeListener: this.fsChangeListener,
+      }),
     });
   }
 
