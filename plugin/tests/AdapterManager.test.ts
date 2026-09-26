@@ -18,18 +18,28 @@ import type { PluginSettings } from '../src/types';
  * mocks only need the methods that are called on a fresh (un-patched)
  * instance: FsChangeListener.unsubscribe() and ConnectionManager.rpcConnection.
  */
-function makeManager(opts: { transferTracker?: { clear: () => void } } = {}) {
+function makeManager(
+  opts: { transferTracker?: { clear: () => void }; rpcConnection?: unknown } = {},
+) {
   const unsubscribeSpy = vi.fn();
+  // Held as its own object so a test can swap `rpcConnection` afterwards —
+  // which is what a reconnect does, and `patch()` does not run again.
+  const conn = { rpcConnection: opts.rpcConnection ?? null, activeRemoteBasePath: null };
   const mgr = new AdapterManager(
     {} as App,
     { id: 'remote-ssh' } as unknown as PluginManifest,
-    { rpcConnection: null, activeRemoteBasePath: null } as unknown as ConnectionManager,
+    conn as unknown as ConnectionManager,
     { subscribe: vi.fn(), unsubscribe: unsubscribeSpy } as unknown as FsChangeListener,
     { startPolling: vi.fn() } as unknown as PendingEditsBar,
     () => ({}) as unknown as PluginSettings,
     opts.transferTracker ?? null,
   );
-  return { mgr, unsubscribeSpy };
+  return { mgr, unsubscribeSpy, conn };
+}
+
+/** A daemon handle advertising `capabilities`, with a spy for its calls. */
+function rpcHandle(capabilities: string[], call = vi.fn()) {
+  return { info: { capabilities }, rpc: { call } };
 }
 
 // ─── PATCHED_METHODS ─────────────────────────────────────────────────────────
@@ -316,8 +326,9 @@ describe('AdapterManager.startResourceBridge()', () => {
   });
 
   it('hands the bridge a fetcher wired to this manager', async () => {
-    // The bridge serves Obsidian's <img> requests; if that callback does not
-    // reach the patched adapter, every remote image renders broken.
+    // Only that the callback lands on this manager's method: it replaces the
+    // method to see that. What the method itself does is a separate case
+    // below, because for a while nothing drove it at all.
     const { mgr } = makeManager();
     const fetchSpy = vi.fn(async () => new Uint8Array([1]));
     (mgr as unknown as Record<string, unknown>).fetchBinaryForBridge = fetchSpy;
@@ -330,13 +341,14 @@ describe('AdapterManager.startResourceBridge()', () => {
     expect(fetchSpy).toHaveBeenCalledWith('notes/diagram.png');
   });
 
-  it('enables the daemon fast paths only when the daemon offers them', async () => {
+  it('enables the daemon fast paths when the daemon offers them', async () => {
     // Served from the daemon's resize path instead of pulling the full
-    // original on every <img> — but only when it advertises the method.
-    const { mgr } = makeManager();
-    const internals = mgr as unknown as Record<string, unknown>;
-    internals.makeThumbnailFetcherIfSupported = () => (() => Promise.resolve(new Uint8Array()));
-    internals.makeBinaryRangeFetcherIfSupported = () => (() => Promise.resolve(new Uint8Array()));
+    // original on every <img>. This used to stub both factories out, so the
+    // "only when it advertises the method" half was the stub talking; the
+    // real capability check now decides.
+    const { mgr } = makeManager({
+      rpcConnection: rpcHandle(['fs.thumbnail', 'fs.readBinaryRange']),
+    });
     const passed: unknown[] = [];
     const bridge = { start: async (...a: unknown[]) => { passed.push(...a); } };
 
@@ -345,6 +357,19 @@ describe('AdapterManager.startResourceBridge()', () => {
 
     expect(got).toBe(bridge);
     expect(passed.filter((x) => typeof x === 'function')).toHaveLength(3);
+  });
+
+  it('and offers only the plain fetcher when it does not', async () => {
+    const { mgr } = makeManager({ rpcConnection: rpcHandle([]) });
+    const passed: unknown[] = [];
+    const bridge = { start: async (...a: unknown[]) => { passed.push(...a); } };
+
+    await priv<(b: unknown) => Promise<unknown>>(mgr, 'startResourceBridge').call(mgr, bridge);
+
+    expect(
+      passed.filter((x) => typeof x === 'function'),
+      'a daemon without the methods must not be asked for them',
+    ).toHaveLength(1);
   });
 
   it('gives up the bridge, not the session, when it cannot bind', async () => {
@@ -523,5 +548,102 @@ describe('AdapterManager.openOfflineQueue()', () => {
 
     await expect(priv<() => Promise<unknown>>(mgr, 'openOfflineQueue').call(mgr))
       .rejects.toThrow(/FileSystemAdapter/);
+  });
+});
+
+describe('AdapterManager.fetchBinaryForBridge()', () => {
+  // Every image, PDF and audio file in the vault is served through here. The
+  // one test that named the behaviour replaced this method with a spy, so
+  // nothing executed it — returning an empty array instead would have made
+  // every attachment render blank with the suite still green.
+
+  it('refuses before the adapter is patched', async () => {
+    const { mgr } = makeManager();
+
+    await expect(
+      priv<(p: string) => Promise<unknown>>(mgr, 'fetchBinaryForBridge').call(mgr, 'a.png'),
+    ).rejects.toThrow(/not patched/);
+  });
+
+  it('goes through the patched adapter, for its cache and path mapping', async () => {
+    const { mgr } = makeManager();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchBinaryForBridge = vi.fn().mockResolvedValue(bytes);
+    (mgr as unknown as { _dataAdapter: unknown })._dataAdapter = { fetchBinaryForBridge };
+
+    const got = await priv<(p: string) => Promise<Uint8Array>>(mgr, 'fetchBinaryForBridge')
+      .call(mgr, 'notes/diagram.png');
+
+    expect(fetchBinaryForBridge).toHaveBeenCalledWith('notes/diagram.png');
+    expect(got, 'the bytes have to come back unchanged').toBe(bytes);
+  });
+});
+
+describe('AdapterManager — the daemon fast paths read the live connection', () => {
+  // `patch()` runs once per connect, so these closures outlive the handle
+  // they were built with. A reconnect replaces `rpcConnection` underneath
+  // them, and the bridge catches a failed fast path and pulls the whole
+  // original instead — so a captured handle degrades silently and
+  // permanently: an 8 MB JPEG per <img> where ~150 KB would do, with nothing
+  // failing to say so. Both closures were at zero executions.
+
+  it('asks whichever daemon is live now for a thumbnail', async () => {
+    const stale = rpcHandle(['fs.thumbnail']);
+    const { mgr, conn } = makeManager({ rpcConnection: stale });
+    const fetch = priv<() => ((p: string, d: number) => Promise<unknown>) | null>(
+      mgr, 'makeThumbnailFetcherIfSupported',
+    ).call(mgr)!;
+
+    const fresh = rpcHandle(['fs.thumbnail'], vi.fn().mockResolvedValue({
+      contentBase64: Buffer.from([7, 8]).toString('base64'),
+      format: 'png',
+    }));
+    conn.rpcConnection = fresh;   // the reconnect
+
+    const got = await fetch('notes/d.png', 64);
+
+    expect(stale.rpc.call, 'the handle it was built with is dead').not.toHaveBeenCalled();
+    expect(fresh.rpc.call).toHaveBeenCalledWith('fs.thumbnail', { path: 'notes/d.png', maxDim: 64 });
+    expect(got).toEqual({ bytes: new Uint8Array([7, 8]), format: 'png' });
+  });
+
+  it('asks whichever daemon is live now for a range', async () => {
+    const stale = rpcHandle(['fs.readBinaryRange']);
+    const { mgr, conn } = makeManager({ rpcConnection: stale });
+    const fetch = priv<() => ((p: string, o: number, l: number) => Promise<unknown>) | null>(
+      mgr, 'makeBinaryRangeFetcherIfSupported',
+    ).call(mgr)!;
+
+    const fresh = rpcHandle(['fs.readBinaryRange'], vi.fn().mockResolvedValue({
+      contentBase64: Buffer.from([1, 2, 3]).toString('base64'),
+      mtime: 42,
+      size: 3,
+    }));
+    conn.rpcConnection = fresh;
+
+    const got = await fetch('big.bin', 0, 3);
+
+    expect(stale.rpc.call).not.toHaveBeenCalled();
+    expect(fresh.rpc.call).toHaveBeenCalledWith(
+      'fs.readBinaryRange', { path: 'big.bin', offset: 0, length: 3 },
+    );
+    expect(got).toEqual({ bytes: new Uint8Array([1, 2, 3]), mtime: 42, totalSize: 3 });
+  });
+
+  it('falls back to the handle it was built with when there is no live one', async () => {
+    // Between a drop and a successful reconnect `rpcConnection` is null, and
+    // an in-flight <img> request still has to be answered.
+    const built = rpcHandle(['fs.thumbnail'], vi.fn().mockResolvedValue({
+      contentBase64: '', format: 'jpeg',
+    }));
+    const { mgr, conn } = makeManager({ rpcConnection: built });
+    const fetch = priv<() => ((p: string, d: number) => Promise<unknown>) | null>(
+      mgr, 'makeThumbnailFetcherIfSupported',
+    ).call(mgr)!;
+
+    conn.rpcConnection = null;
+    await fetch('a.png', 32);
+
+    expect(built.rpc.call).toHaveBeenCalled();
   });
 });
