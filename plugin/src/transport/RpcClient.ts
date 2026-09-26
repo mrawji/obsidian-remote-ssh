@@ -50,8 +50,19 @@ export class RpcClient {
    *
    * Rejects with an RpcError if the daemon returned an error envelope,
    * or if the stream closed before the reply arrived.
+   *
+   * `signal` abandons the call: the entry is dropped from `pending` and the
+   * promise rejects. Giving up on the promise alone is NOT enough — the entry
+   * would stay until a reply or a close, and `pendingCount()` would keep
+   * reporting a call in flight. The heartbeat reads that count as proof of
+   * life, so an abandoned probe that stayed behind made the daemon look busy
+   * forever and the miss counter reset on every tick.
    */
-  async call<M extends MethodName>(method: M, params: Params<M>): Promise<Result<M>> {
+  async call<M extends MethodName>(
+    method: M,
+    params: Params<M>,
+    signal?: AbortSignal,
+  ): Promise<Result<M>> {
     if (this.closed) {
       throw new RpcError(-32603, 'RpcClient: stream is closed');
     }
@@ -65,6 +76,16 @@ export class RpcClient {
         reject,
         method,
       });
+      if (signal) {
+        // `delete` returning false means the call already settled, so a late
+        // abort is a no-op rather than a second rejection.
+        const abandon = (): void => {
+          if (!this.pending.delete(id)) return;
+          reject(new RpcError(-32603, `RpcClient: ${method} abandoned by caller`));
+        };
+        if (signal.aborted) { abandon(); return; }
+        signal.addEventListener('abort', abandon, { once: true });
+      }
       try {
         this.framed.writeMessage(body);
       } catch (e) {

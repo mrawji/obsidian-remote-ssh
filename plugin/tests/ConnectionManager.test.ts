@@ -360,7 +360,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
       await mgr.startRpcSession(profile, 'work');
 
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(call, 'nothing would ever ask otherwise').toHaveBeenCalledWith('server.info', {});
+      expect(call, 'nothing would ever ask otherwise')
+        .toHaveBeenCalledWith('server.info', {}, expect.any(AbortSignal));
 
       const before = call.mock.calls.length;
       await mgr.disconnectTransport();

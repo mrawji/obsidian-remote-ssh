@@ -237,7 +237,7 @@ export class ConnectionManager {
     // made into it simply never returns.
     this.stopHeartbeat();
     this.heartbeat = new RpcHeartbeat({
-      probe: () => conn.rpc.call('server.info', {}),
+      probe: (signal) => conn.rpc.call('server.info', {}, signal),
       msSinceLastMessage: () => conn.rpc.msSinceLastMessage(),
       pendingCount: () => conn.rpc.pendingCount(),
       onDead: (reason) => {

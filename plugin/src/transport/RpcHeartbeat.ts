@@ -19,8 +19,13 @@ import { errorMessage } from '../util/errorMessage';
  */
 
 export interface RpcHeartbeatOptions {
-  /** Round trip used as the probe. Cheap and side-effect free. */
-  probe: () => Promise<unknown>;
+  /**
+   * Round trip used as the probe. Cheap and side-effect free.
+   *
+   * Takes a signal because giving up on the promise is not the same as
+   * giving up on the call; see `RpcClient.call`.
+   */
+  probe: (signal: AbortSignal) => Promise<unknown>;
   /** How long the line has been quiet. */
   msSinceLastMessage: () => number;
   /** How many calls are waiting; a probe only goes out at zero. */
@@ -107,9 +112,13 @@ export class RpcHeartbeat {
 
     this.probing = true;
     try {
-      await this.withTimeout(this.opts.probe());
+      await this.withTimeout((signal) => this.opts.probe(signal));
       this.misses = 0;
     } catch (e) {
+      // Retired while this probe was in flight. The connection it belonged to
+      // is already being torn down, and reporting it dead here would start a
+      // reconnect for a wire nobody owns.
+      if (this.stopped) return;
       this.misses++;
       logger.warn(
         `RpcHeartbeat: daemon did not answer (${this.misses}/${this.maxMisses}): ${errorMessage(e)}`,
@@ -128,13 +137,22 @@ export class RpcHeartbeat {
     this.schedule();
   }
 
-  private withTimeout(p: Promise<unknown>): Promise<unknown> {
+  private withTimeout(send: (signal: AbortSignal) => Promise<unknown>): Promise<unknown> {
+    const abandon = new AbortController();
     return new Promise((resolve, reject) => {
       const handle = this.setTimer(
-        () => reject(new Error(`probe timed out after ${this.probeTimeoutMs}ms`)),
+        () => {
+          // Abandon the call, not just our wait on it: a probe left in the
+          // client's pending map counts as a live line on the next tick, and
+          // the guard in `tick()` would reset `misses` for the rest of the
+          // session — so `maxMisses` was unreachable and `onDead` never fired
+          // in the one case this class exists for.
+          abandon.abort();
+          reject(new Error(`probe timed out after ${this.probeTimeoutMs}ms`));
+        },
         this.probeTimeoutMs,
       );
-      p.then(
+      send(abandon.signal).then(
         (v) => { this.clearTimer(handle); resolve(v); },
         (e) => { this.clearTimer(handle); reject(e instanceof Error ? e : new Error(String(e))); },
       );

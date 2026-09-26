@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { RpcHeartbeat, type RpcHeartbeatOptions } from '../src/transport/RpcHeartbeat';
+import { RpcClient } from '../src/transport/RpcClient';
+import { FakeFramed } from './helpers/fakeFramed';
 
 /**
  * What this pins is the pair of failures on either side of the heartbeat.
@@ -147,5 +149,94 @@ describe('RpcHeartbeat', () => {
 
     expect(probe).not.toHaveBeenCalled();
     expect(timers.size).toBe(0);
+  });
+
+  it('says nothing once it has been retired mid-probe', async () => {
+    // `stop()` is documented as final, and `disconnectTransport` /
+    // `reconnectAttempt` both call it with a probe possibly in flight. The
+    // stopped check was only at the top of `tick()`, so a probe that failed
+    // after the heartbeat was retired still counted its miss — and on the
+    // last one, reported a dead daemon for a wire nobody owned any more,
+    // restarting a reconnect on a session that had just recovered.
+    const { hb, timers, onDead } = make({
+      probe: () => new Promise(() => { /* never settles */ }),
+      maxMisses: 2,
+      probeTimeoutMs: 15_000,
+    });
+
+    hb.start();
+    await timers.run(2);   // first probe times out: one miss, one to go
+    await timers.run(1);   // second probe goes out and is still in flight
+    hb.stop();
+    await timers.run(1);   // ...and only now does it fail
+
+    expect(onDead, 'a retired heartbeat has no session to report on')
+      .not.toHaveBeenCalled();
+  });
+});
+
+describe('RpcHeartbeat, against a real RpcClient', () => {
+  // Every case above injects `pendingCount`. That is what let the bug this
+  // suite exists to prevent ship: `withTimeout` rejected its own wrapper and
+  // left the probe in the client's pending map, so from the second tick
+  // onwards `pendingCount() > 0` reset `misses` and `maxMisses` became
+  // unreachable. The stub said 0 forever, which no real client does.
+  //
+  // So this one wires the real thing up and lets the daemon go silent.
+
+  it('declares a silent daemon dead, and leaves no probe behind', async () => {
+    const framed = new FakeFramed();
+    const client = new RpcClient(framed.asFramed());
+    const timers = fakeTimers();
+    const onDead = vi.fn();
+    const hb = new RpcHeartbeat({
+      probe: (signal) => client.call('server.info', {}, signal),
+      msSinceLastMessage: () => 60_000,        // quiet
+      pendingCount: () => client.pendingCount(),   // the real count, not a stub
+      onDead,
+      idleMs: 30_000,
+      maxMisses: 2,
+      probeTimeoutMs: 15_000,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    hb.start();
+    await timers.run(8);
+
+    expect(framed.sent.length, 'a second probe has to be sent for a miss to count')
+      .toBeGreaterThanOrEqual(2);
+    expect(onDead, 'a daemon that never answers is dead').toHaveBeenCalledTimes(1);
+    expect(client.pendingCount(), 'an abandoned probe must not look like a live line')
+      .toBe(0);
+  });
+
+  it('stays quiet when the daemon is merely busy', async () => {
+    // The other half, and the reason `pendingCount` is consulted at all: a
+    // real call in flight is proof of life, and tearing down a session
+    // mid-transfer is worse than missing a dead one.
+    const framed = new FakeFramed();
+    const client = new RpcClient(framed.asFramed());
+    const timers = fakeTimers();
+    const onDead = vi.fn();
+    void client.call('fs.readBinary', { path: 'big.bin' });   // never answered
+
+    const hb = new RpcHeartbeat({
+      probe: (signal) => client.call('server.info', {}, signal),
+      msSinceLastMessage: () => 60_000,
+      pendingCount: () => client.pendingCount(),
+      onDead,
+      idleMs: 30_000,
+      maxMisses: 2,
+      probeTimeoutMs: 15_000,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    hb.start();
+    await timers.run(8);
+
+    expect(framed.sent.length, 'no probe goes out while the line is busy').toBe(1);
+    expect(onDead).not.toHaveBeenCalled();
   });
 });
