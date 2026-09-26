@@ -9,7 +9,27 @@
 
 FROM ubuntu:26.04
 
-RUN apt-get update \
+# The index fetch is retried because Ubuntu's mirrors are occasionally caught
+# mid-sync and serve a Packages.gz whose size disagrees with the Release file
+# they served a moment earlier:
+#
+#   E: Failed to fetch .../Packages.gz  File has unexpected size
+#      (642310 != 642308). Mirror sync in progress?
+#
+# apt treats that as fatal, the image build fails, and an E2E shard goes red
+# for a reason that has nothing to do with the change under test — twice in
+# one day, most recently on #577. The lists are wiped between attempts
+# because a half-fetched index is exactly what we are retrying past. The
+# final `apt-get update` is not redundant: it is what turns three exhausted
+# attempts into a build failure with apt's own message, rather than an
+# install step failing later with something less legible.
+RUN for attempt in 1 2 3; do \
+      apt-get update && break; \
+      echo "apt-get update failed (attempt ${attempt}/3); retrying after 5s"; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep 5; \
+    done; \
+    apt-get update \
  && apt-get install -y --no-install-recommends openssh-server iproute2 \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /var/run/sshd \

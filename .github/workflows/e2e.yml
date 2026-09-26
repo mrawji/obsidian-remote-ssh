@@ -183,8 +183,15 @@ jobs:
       # gets uploaded from: 200 lines in the job log cannot be lined up against
       # a trace, and a tail drops exactly the early handshake a connect failure
       # turns on. `sshd -e` sends its account to stderr, so 2>&1 is the log.
+      #
+      # `working-directory` is set because `defaults.run` puts every `run`
+      # step in `plugin/`, while `upload-artifact` resolves its path against
+      # the workspace. Without it this step wrote `plugin/plugin/e2e-results/`
+      # and the upload looked in `plugin/e2e-results/` — so the log this
+      # comment describes has never actually been attached to a failed run.
       - name: Capture test sshd log on failure
         if: failure()
+        working-directory: ${{ github.workspace }}
         run: |
           mkdir -p plugin/e2e-results
           docker logs --timestamps obsidian-remote-ssh-test-sshd \
@@ -210,5 +217,84 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: e2e-screenshots-${{ matrix.shard }}-${{ github.run_id }}
+          path: plugin/test-results/
+          retention-days: 14
+
+  # The same specs, against a vault reachable only across a private tailnet
+  # (`docker-compose.tailnet.yml`). The integration suite already runs that
+  # way on every PR; this is the other half — a real Obsidian window, whose
+  # every read and write leaves through a `ProxyCommand`. Worth ~5 minutes
+  # before stable ships, which is why it gates promotion into `main` rather
+  # than every PR.
+  #
+  # One shard: the point is to exercise the wiring, not to re-cover the suite.
+  # `core` drives connect, read, write and reconnect, which is every path the
+  # proxy sits under. Widening it is a later, cheaper call.
+  #
+  # Proven by hand before being wired here (run 36112856077: 21 passed,
+  # 2 skipped, 4.4 min). It had failed all three times it ran before that,
+  # always in the daemon build and never reaching a spec: `go build` cannot
+  # stamp a revision from a bind-mounted tree owned by another uid. Docker
+  # Desktop hides that, so a laptop called it ready.
+  e2e-tailnet:
+    # `base_ref` is set only on pull_request, so this is "a PR into main".
+    if: github.event_name == 'workflow_dispatch' || github.base_ref == 'main'
+    name: E2E (tailnet, containerised)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Only to run `tailnet:start`, which is a plain Node script with no
+      # dependencies. Everything the suite itself needs — Node, Obsidian, an
+      # X server, Go, the Docker client — is in the runner image, which is
+      # the point: this job and a developer's laptop execute the same thing.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Bring up the test tailnet
+        working-directory: plugin
+        run: npm run tailnet:start
+
+      # `run --rm` builds the image on first use. The suite runs inside it,
+      # on the tailnet network, reaching the vault through the peer node's
+      # SOCKS5 port rather than a published one.
+      - name: Run E2E core specs in the container
+        run: |
+          docker compose -f docker-compose.tailnet.yml --profile e2e \
+            run --rm e2e-runner \
+            npx playwright test --config e2e/playwright.config.ts --project=core
+
+      # Before the teardown: `tailnet:stop` removes the containers these
+      # logs live in.
+      - name: Capture tailnet logs on failure
+        if: failure()
+        run: |
+          mkdir -p plugin/e2e-results
+          for c in orst-tailnet-headscale orst-tailnet-vault \
+                   orst-tailnet-client orst-tailnet-sshd; do
+            echo "=== $c ==="
+            docker logs --timestamps "$c" 2>&1 || true
+          done > plugin/e2e-results/tailnet.log
+          echo "captured $(wc -l < plugin/e2e-results/tailnet.log) lines"
+
+      - name: Tear down the test tailnet
+        if: always()
+        working-directory: plugin
+        run: npm run tailnet:stop
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-report-tailnet-${{ github.run_id }}
+          path: plugin/e2e-results/
+          retention-days: 14
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-screenshots-tailnet-${{ github.run_id }}
           path: plugin/test-results/
           retention-days: 14

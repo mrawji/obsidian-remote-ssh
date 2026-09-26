@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import type { RemoteEntry } from './VaultModelBuilder';
 import { logger } from '../util/logger';
 import { errorMessage } from '../util/errorMessage';
+import { writeFileAtomic } from '../util/writeFileAtomic';
 
 /**
  * A per-device copy of the remote TREE (paths + mtime + size, never content),
@@ -33,7 +34,7 @@ import { errorMessage } from '../util/errorMessage';
  *
  * Lives beside `community-plugins.base.json` in
  * `~/.obsidian-remote/state/<profile>/`: per-device, never synced, outside
- * every vault (see `ShadowVaultBootstrap.communityPluginsBasePath`).
+ * every vault (see `communityPluginsBasePath` in CommunityPluginsSync).
  */
 
 const VERSION = 1;
@@ -122,9 +123,9 @@ export function writeTreeSnapshot(file: string, remotePath: string, entries: rea
     entries: entries.map((e) => [e.path, e.isDirectory ? 1 : 0, e.mtime, e.size]),
   };
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(body));
-  fs.renameSync(tmp, file);
+  // This was a fourth hand-written copy of tmp+rename, and the only one that
+  // never unlinked the temp file when the rename failed.
+  writeFileAtomic(file, JSON.stringify(body));
 }
 
 export function deleteTreeSnapshot(file: string): void {

@@ -18,6 +18,7 @@ import { deployTestDaemon, LOCAL_DAEMON_BINARY, type DeployedDaemon } from './he
 import { TEST_PRIVATE_KEY, TEST_VAULT } from './helpers/makeAdapter';
 import { buildRpcClient, type RpcClientHandle } from './helpers/multiclientRpc';
 import { FakeFileExplorer } from '../helpers/FakeFileExplorer';
+import { interpretWatchEvent } from '../../src/path/WatchEventFilter';
 import { assertSyncReflect } from './helpers/assertSyncReflect';
 import { HarnessVault, HarnessTFile, HarnessTFolder, asArrayBuffer } from './helpers/harnessVault';
 
@@ -460,10 +461,10 @@ describe('Phase C E2E — sync reflect matrix', () => {
     // F19 (in-order delivery) by pre-populating the OfflineQueue and
     // running QueueReplayer against the connected writerAdapter.
     //
-    // The "disconnect" half of the spec (forcibly killing the SSH
-    // socket so SftpDataAdapter.write* enqueues internally) involves
-    // AdapterManager orchestration that's already covered by the
-    // unit-test suite for OfflineQueue + ReconnectManager. Here we
+    // The "disconnect" half of the spec — killing the SSH socket so
+    // SftpDataAdapter.write* enqueues internally — is driven through
+    // AdapterManager, and the unit suite covers OfflineQueue and
+    // ReconnectManager rather than that orchestration itself. Here we
     // focus on the integration assertion the unit suites can't make:
     // queued ops, drained in order, surface on the reader's
     // FakeFileExplorer with the same ordering the user typed.
@@ -549,6 +550,14 @@ function handleFsChangedForReader(
   builder: VaultModelBuilder,
   readerAdapter: SftpDataAdapter,
 ): void {
+  // Through the SAME filter production uses, not a hand-rolled imitation of
+  // it. This used to insert `params.path` directly, so it saw events the
+  // real `FsChangeListener` drops — notably the `.rsh-write-<n>.tmp` file an
+  // atomic write leaves next to its target for the moment before the rename.
+  // A notification landing inside that window added a fifth `create` to a
+  // four-op test, roughly one run in ten.
+  const action = interpretWatchEvent(params.path, null);
+  if (!action) return;
   // T4a — first thing the reader sees after the push frame decodes.
   perfTracer.point('T4a', perfTracer.newCid(), {
     path: params.path,
@@ -564,10 +573,10 @@ function handleFsChangedForReader(
     try {
       switch (params.event) {
         case 'created': {
-          const stat = await readerAdapter.stat(params.path).catch(() => null);
+          const stat = await readerAdapter.stat(action.vaultPath).catch(() => null);
           if (!stat) return;
           builder.insertOne({
-            path: params.path,
+            path: action.vaultPath,
             isDirectory: stat.type === 'folder',
             ctime: stat.ctime ?? 0,
             mtime: stat.mtime ?? 0,
@@ -576,23 +585,27 @@ function handleFsChangedForReader(
           return;
         }
         case 'modified': {
-          const stat = await readerAdapter.stat(params.path).catch(() => null);
+          const stat = await readerAdapter.stat(action.vaultPath).catch(() => null);
           if (stat) {
-            builder.modifyOne(params.path, {
+            builder.modifyOne(action.vaultPath, {
               ctime: stat.ctime ?? 0, mtime: stat.mtime ?? 0, size: stat.size ?? 0,
             });
           } else {
-            builder.modifyOne(params.path);
+            builder.modifyOne(action.vaultPath);
           }
           return;
         }
         case 'deleted': {
-          builder.removeOne(params.path);
+          builder.removeOne(action.vaultPath);
           return;
         }
         case 'renamed': {
           if (!params.newPath) return;
-          builder.renameOne(params.path, params.newPath);
+          // The destination goes through the filter too: a rename INTO a tmp
+          // name is the first half of an atomic write and is not vault content.
+          const to = interpretWatchEvent(params.newPath, null);
+          if (!to) return;
+          builder.renameOne(action.vaultPath, to.vaultPath);
           return;
         }
       }

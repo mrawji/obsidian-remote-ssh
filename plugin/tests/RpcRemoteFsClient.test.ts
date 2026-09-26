@@ -252,3 +252,55 @@ describe('RpcRemoteFsClient', () => {
     expect(result.size).toBe(50);
   });
 });
+
+// ─── close translation ───────────────────────────────────────────────────────
+//
+// The `mockRpc` above hands `onClose` a stub that throws the callback away,
+// so this method had never run. It carries one bit — whether the close was
+// unexpected — and `main.ts` starts a reconnect loop on it. Invert that bit
+// and either every deliberate disconnect reconnects itself, or a real drop
+// is ignored.
+
+describe('RpcRemoteFsClient.onClose', () => {
+  function capturing() {
+    let cb: ((err?: Error) => void) | undefined;
+    const unsubscribe = vi.fn();
+    const rpc = {
+      isClosed: () => false,
+      onClose: (f: (err?: Error) => void) => { cb = f; return unsubscribe; },
+      call: vi.fn(),
+    } as unknown as RpcClient;
+    return { rpc, fire: (err?: Error) => cb?.(err), unsubscribe };
+  }
+
+  it('reports a close carrying an error as unexpected', () => {
+    const { rpc, fire } = capturing();
+    const seen: Array<{ unexpected: boolean }> = [];
+    new RpcRemoteFsClient(rpc).onClose((e) => seen.push(e));
+
+    fire(new Error('daemon died'));
+
+    expect(seen).toEqual([{ unexpected: true }]);
+  });
+
+  it('reports a close with no reason as expected', () => {
+    // A disconnect we asked for. Treating it as unexpected would have the
+    // plugin reconnect to the session the user just closed.
+    const { rpc, fire } = capturing();
+    const seen: Array<{ unexpected: boolean }> = [];
+    new RpcRemoteFsClient(rpc).onClose((e) => seen.push(e));
+
+    fire(undefined);
+
+    expect(seen).toEqual([{ unexpected: false }]);
+  });
+
+  it('hands back the underlying unsubscribe', () => {
+    const { rpc, unsubscribe } = capturing();
+
+    const off = new RpcRemoteFsClient(rpc).onClose(() => { /* ignored */ });
+    off();
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+});

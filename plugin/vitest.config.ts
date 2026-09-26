@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import * as path from 'path';
+import { coverageScope } from './vitest.coverage';
 
 // Default config runs unit tests only. Integration tests live under
 // `tests/integration/` and need a running docker sshd container —
@@ -36,33 +37,7 @@ export default defineConfig({
     // top-level key inside `test`, not under `poolOptions`.)
     execArgv: ['--max-old-space-size=6144'],
     coverage: {
-      provider: 'v8',
-      reporter: ['text', 'lcov'],
-      include: ['src/**/*.ts'],
-      // src/ui/** + src/settings/** are testable on the
-      // tests/__mocks__/obsidian.ts runtime mock. Files below are
-      // excluded only until they have a dedicated test suite — drop
-      // entries from this list as the suites land, then bump the
-      // global thresholds back up.
-      exclude: [
-        'src/main.ts',
-        'src/ui/ConnectModal.ts',
-        'src/ui/HostKeyMismatchModal.ts',
-        'src/ui/KbdInteractiveModal.ts',
-        'src/ui/LargeTransferBar.ts',
-        'src/ui/PendingEditsBar.ts',
-        'src/ui/PendingEditsModal.ts',
-        'src/ui/PendingPluginsModal.ts',
-        'src/ui/RemotePathBrowserModal.ts',
-        // #149 — heavy xterm.js DOM rendering + ResizeObserver makes
-        // jsdom unit tests impractical. Manual smoke against a real
-        // Obsidian window covers this; RemoteShell has its own unit tests.
-        'src/ui/RemoteTerminalView.ts',
-        'src/ui/StatusBar.ts',
-        'src/ui/ThreeWayMergeModal.ts',
-        'src/ui/WriteConflictModal.ts',
-        'src/settings/ProfileForm.ts',
-      ],
+      ...coverageScope,
       // Calibrated for the current measured scope. Bring back up as
       // more UI/settings suites land and per-file coverage rises.
       thresholds: {

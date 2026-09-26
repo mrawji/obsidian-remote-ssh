@@ -32,7 +32,7 @@ import * as path from 'node:path';
  *
  * The contract (product side)
  * ---------------------------
- * `ShadowVaultBootstrap.PLUGIN_BINARY_FILES = ['manifest.json','main.js','styles.css']`
+ * `PLUGIN_BINARY_FILES = ['manifest.json','main.js','styles.css']`
  * (`src/shadow/ShadowVaultBootstrap.ts:733`). `data.json` is NOT in that list,
  * on purpose: plugin code is IDENTITY-shared (every device runs the same
  * plugin), plugin settings are DEVICE-scoped. Leaking `data.json` into the

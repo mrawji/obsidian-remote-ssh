@@ -7,6 +7,7 @@ import { Client } from 'ssh2';
 import { CertificateAgent } from '../../src/ssh/CertificateAgent';
 import { enableCertificateAuth } from '../../src/ssh/certificateAuth';
 import { TEST_HOST, TEST_PORT, TEST_USER, TEST_PRIVATE_KEY } from './helpers/makeAdapter';
+import { SSHD_CONTAINER, TEST_PROXY_COMMAND } from '../../test-env/target';
 
 /**
  * #536, end to end: an OpenSSH certificate held by an `ssh-agent`.
@@ -26,7 +27,7 @@ import { TEST_HOST, TEST_PORT, TEST_USER, TEST_PRIVATE_KEY } from './helpers/mak
  * throwaway keys live in a temp dir that is removed afterwards.
  */
 
-const CONTAINER = 'obsidian-remote-ssh-test-sshd';
+const CONTAINER = SSHD_CONTAINER;
 const CA_REMOTE = '/etc/ssh/cert-test-ca.pub';
 const CONF_REMOTE = '/etc/ssh/sshd_config.d/cert-test-ca.conf';
 
@@ -78,7 +79,7 @@ function waitForSshd(): void {
 }
 
 beforeAll(() => {
-  if (!TOOLS_PRESENT) return;
+  if (!RUN_HERE) return;
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orst-cert-'));
 
   // A CA, a user key the server does not know, and a certificate for it.
@@ -199,7 +200,16 @@ function connect(withCertificateSupport: boolean, socket = agentSocket): Promise
   });
 }
 
-describe.skipIf(!TOOLS_PRESENT)('integration: an OpenSSH certificate held by an agent (#536)', () => {
+/**
+ * Only where the server is directly reachable. This file drives a bare ssh2
+ * `Client` rather than `SftpClient`, so it cannot follow a `ProxyCommand` —
+ * and what it tests is which bytes the certificate handshake puts on the
+ * wire, which the route to the server cannot change. Running it a second
+ * time over a proxy would cost time and prove nothing.
+ */
+const RUN_HERE = TOOLS_PRESENT && !TEST_PROXY_COMMAND;
+
+describe.skipIf(!RUN_HERE)('integration: an OpenSSH certificate held by an agent (#536)', () => {
   it('authenticates, and the server agrees who we are', async () => {
     await expect(connect(true)).resolves.toBe(TEST_USER);
   }, 60_000);

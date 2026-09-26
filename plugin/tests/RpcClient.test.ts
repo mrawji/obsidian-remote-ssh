@@ -1,37 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { EventEmitter } from 'events';
 import { RpcClient } from '../src/transport/RpcClient';
-import { RpcError } from '../src/transport/RpcError';
-
-/**
- * A FramedDuplex stand-in just rich enough for RpcClient: it exposes
- * the same events (`message`, `close`, `error`) and captures anything
- * written via `writeMessage` so tests can assert the wire shape.
- */
-class FakeFramed extends EventEmitter {
-  public sent: Buffer[] = [];
-  public closed = false;
-  writeMessage(body: Buffer): boolean {
-    if (this.closed) throw new Error('closed');
-    this.sent.push(body);
-    return true;
-  }
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.emit('close');
-  }
-
-  /** Drive a response back to the client; for tests only. */
-  pushMessage(envelope: unknown): void {
-    this.emit('message', Buffer.from(JSON.stringify(envelope), 'utf8'));
-  }
-}
+import { RpcError, RpcAbandonedError } from '../src/transport/RpcError';
+import { FakeFramed } from './helpers/fakeFramed';
 
 function setup() {
   const framed = new FakeFramed();
-  const client = new RpcClient(framed as unknown as import('../src/transport/framing').FramedDuplex);
-  return { framed, client };
+  return { framed, client: new RpcClient(framed.asFramed()) };
 }
 
 describe('RpcClient', () => {
@@ -166,5 +140,116 @@ describe('RpcClient', () => {
     off();
     framed.close();
     expect(cb).not.toHaveBeenCalled();
+  });
+});
+
+// ─── the two signals the heartbeat decides on ────────────────────────────────
+//
+// `RpcHeartbeat` never probes while these say "busy" or "recently heard
+// from". Its own tests hand it lambdas, so until now nothing had run the
+// real implementations — and a wrong answer here either probes a healthy
+// session to death or never notices a dead one.
+
+describe('RpcClient — liveness signals', () => {
+  it('counts a call while it is in flight, and stops when it is answered', () => {
+    // A long read is quiet on the wire but NOT idle. This is what stops the
+    // heartbeat probing underneath a transfer that is working fine.
+    const { framed, client } = setup();
+    expect(client.pendingCount()).toBe(0);
+
+    const pending = client.call('fs.readBinary', { path: 'big.bin' });
+    expect(client.pendingCount()).toBe(1);
+
+    const req = JSON.parse(framed.sent[0].toString('utf8')) as { id: number };
+    framed.pushMessage({ jsonrpc: '2.0', id: req.id, result: { data: '' } });
+
+    return pending.then(() => {
+      expect(client.pendingCount()).toBe(0);
+    });
+  });
+
+  it('counts each outstanding call separately', () => {
+    const { client } = setup();
+    void client.call('fs.stat', { path: 'a.md' });
+    void client.call('fs.stat', { path: 'b.md' });
+
+    expect(client.pendingCount()).toBe(2);
+  });
+
+  it('measures silence from the last frame the daemon sent', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const { framed, client } = setup();
+
+      vi.setSystemTime(new Date('2026-01-01T00:00:30Z'));
+      expect(client.msSinceLastMessage()).toBe(30_000);
+
+      framed.pushMessage({ jsonrpc: '2.0', id: 1, result: {} });
+      expect(client.msSinceLastMessage()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats a frame it cannot correlate as proof of life anyway', () => {
+    // The clock is bumped before the envelope is even parsed, deliberately:
+    // a response to a call we have forgotten, or a malformed one, still means
+    // the daemon is there. Counting only matched replies would let a session
+    // that is talking be declared dead.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const { framed, client } = setup();
+      vi.setSystemTime(new Date('2026-01-01T00:01:00Z'));
+      expect(client.msSinceLastMessage()).toBe(60_000);
+
+      framed.pushMessage({ jsonrpc: '2.0', id: 987654, result: {} }); // no such call
+
+      expect(client.msSinceLastMessage()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('RpcClient — abandoning a call', () => {
+  it('reports it as abandonment, not as a fault of the daemon', async () => {
+    // It used to reject with ErrorCode.InternalError, which errorTaxonomy
+    // renders as "Daemon internal error", points the user at the server log,
+    // and reports to telemetry as a server fault — for a call the plugin
+    // itself cancelled. Nothing in the types stopped that, because it was a
+    // well-formed RpcError carrying a daemon code.
+    const { client } = setup();
+    const abandon = new AbortController();
+
+    const call = client.call('server.info', {}, abandon.signal);
+    abandon.abort();
+    const err = await call.catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RpcAbandonedError);
+    expect(err, 'an RpcError here gets classified as the daemon misbehaving')
+      .not.toBeInstanceOf(RpcError);
+  });
+
+  it('stops listening to the signal once the call has settled', async () => {
+    // `{ once: true }` removes the listener only if it fires. A caller sharing
+    // one controller across an operation's calls would otherwise accumulate a
+    // listener, and the `reject` it closes over, for the signal's lifetime —
+    // and the optional-signal signature invites exactly that.
+    const { framed, client } = setup();
+    const addEventListener = vi.fn();
+    const removeEventListener = vi.fn();
+    const signal = {
+      aborted: false, addEventListener, removeEventListener,
+    } as unknown as AbortSignal;
+
+    const call = client.call('server.info', {}, signal);
+    framed.pushMessage({ jsonrpc: '2.0', id: 1, result: { ok: true } });
+    await call;
+
+    expect(addEventListener).toHaveBeenCalledTimes(1);
+    expect(removeEventListener, 'the listener has to go when the call does')
+      .toHaveBeenCalledTimes(1);
   });
 });

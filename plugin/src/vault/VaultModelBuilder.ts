@@ -337,15 +337,12 @@ export class VaultModelBuilder {
    * Move/rename one path in the vault model and fire
    * `vault.trigger('rename', file, oldPath)`.
    *
-   * Updates `path`, `name`, and (for files) `basename`/`extension`
-   * fields, moves the entry between `vault.fileMap` keys, and shifts
-   * it between parent.children arrays if the parent changed.
+   * Updates the entry's `name`, its `basename`/`extension` when it is a file,
+   * and shifts it between `parent.children` arrays; the key moves go through
+   * {@link collectDescendantMoves} and {@link applyPathMoves}.
    *
-   * For folders, recursively rewrites descendant paths so they keep
-   * pointing at the new parent.
-   *
-   * Returns `true` if the rename happened, `false` if the source
-   * wasn't in the model or the destination's parent is missing.
+   * Returns `false` if the source wasn't in the model or the destination's
+   * parent is missing.
    */
   renameOne(oldPath: string, newPath: string, opts: { ensureParents?: boolean } = {}): boolean {
     if (!oldPath || !newPath || oldPath === newPath) return false;
@@ -375,43 +372,25 @@ export class VaultModelBuilder {
       if (idx >= 0) oldParent.children.splice(idx, 1);
     }
 
-    // Update path-derived fields on the entry itself.
+    // Renaming a folder carries its whole subtree, so the moves are gathered
+    // before any of them is applied.
+    const moves: PathMove[] = [{ entry: target, oldKey: oldPath, newKey: newPath }];
+    if (isFolder(target)) moves.push(...collectDescendantMoves(map, oldPath, newPath));
+
     const newName = basename(newPath);
-    const oldPaths: Array<{ entry: TAbstractFile; oldKey: string; newKey: string }> = [
-      { entry: target, oldKey: oldPath, newKey: newPath },
-    ];
-    target.path   = newPath;
     target.name   = newName;
     target.parent = newParent;
-    if (!isFolder(target)) {
-      // Narrow via `instanceof this.deps.TFile` (same pattern as
-      // `modifyOne`). Tests inject FakeTFile, and every file in the
-      // model was constructed via `new this.deps.TFile(...)`, so the
-      // check holds in both contexts.
-      if (target instanceof this.deps.TFile) {
-        const file: TFile = target;
-        const dot = newName.lastIndexOf('.');
-        file.basename  = dot > 0 ? newName.slice(0, dot) : newName;
-        file.extension = dot > 0 ? newName.slice(dot + 1) : '';
-      }
-    } else {
-      // For a folder, also rewrite every descendant's path so
-      // fileMap keys + entry.path stay in sync. Collect first, then
-      // mutate, so the iteration doesn't re-scan our own changes.
-      const prefix = oldPath + '/';
-      for (const key of Object.keys(map)) {
-        if (!key.startsWith(prefix)) continue;
-        const desc = map[key];
-        const newKey = newPath + '/' + key.slice(prefix.length);
-        oldPaths.push({ entry: desc, oldKey: key, newKey });
-        desc.path = newKey;
-      }
+    // Narrow via `instanceof this.deps.TFile` (same pattern as `modifyOne`).
+    // Tests inject FakeTFile, and every file in the model was constructed via
+    // `new this.deps.TFile(...)`, so the check holds in both contexts.
+    if (!isFolder(target) && target instanceof this.deps.TFile) {
+      const file: TFile = target;
+      const dot = newName.lastIndexOf('.');
+      file.basename  = dot > 0 ? newName.slice(0, dot) : newName;
+      file.extension = dot > 0 ? newName.slice(dot + 1) : '';
     }
 
-    // Apply fileMap key moves (delete olds, then set news, so a
-    // self-overlap can't lose entries).
-    for (const m of oldPaths) delete map[m.oldKey];
-    for (const m of oldPaths) map[m.newKey] = m.entry;
+    applyPathMoves(map, moves);
 
     // Attach to new parent's children.
     newParent.children.push(target);
@@ -586,6 +565,44 @@ export class VaultModelBuilder {
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
+
+/** One entry's move between two `vault.fileMap` keys. */
+type PathMove = { entry: TAbstractFile; oldKey: string; newKey: string };
+
+/**
+ * Every descendant of `oldPath`, rebased on `newPath`.
+ *
+ * Gathering is separate from applying because the walk reads the same keys
+ * the apply rewrites — collecting first is what stops it re-scanning its own
+ * changes.
+ */
+function collectDescendantMoves(
+  map: Record<string, TAbstractFile>,
+  oldPath: string,
+  newPath: string,
+): PathMove[] {
+  const prefix = oldPath + '/';
+  const moves: PathMove[] = [];
+  for (const key of Object.keys(map)) {
+    if (!key.startsWith(prefix)) continue;
+    moves.push({ entry: map[key], oldKey: key, newKey: newPath + '/' + key.slice(prefix.length) });
+  }
+  return moves;
+}
+
+/**
+ * Re-key `map` and bring each entry's own `path` with it.
+ *
+ * Every old key is deleted before any new one is written: a move that
+ * overlaps itself would otherwise delete the entry it had just placed.
+ */
+function applyPathMoves(map: Record<string, TAbstractFile>, moves: PathMove[]): void {
+  for (const m of moves) delete map[m.oldKey];
+  for (const m of moves) {
+    m.entry.path = m.newKey;
+    map[m.newKey] = m.entry;
+  }
+}
 
 /**
  * Yield to the macrotask queue so the renderer can paint pending File

@@ -1,4 +1,4 @@
-import { Plugin, Notice, Modal, FileSystemAdapter, TFile, TFolder, requestUrl } from 'obsidian';
+import { Plugin, Notice, Modal, FileSystemAdapter, TFile, TFolder } from 'obsidian';
 import type { PluginSettings, SshProfile } from './types';
 import { SyncState } from './types';
 import { DEFAULT_SETTINGS, DEFAULT_WALK_IGNORE_DIRS } from './constants';
@@ -38,9 +38,19 @@ import type { RemoteEntry } from './vault/VaultModelBuilder';
 import { pathVisibility } from './vault/BulkWalker';
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
-import { ShadowVaultBootstrap, sanitiseStateKey } from './shadow/ShadowVaultBootstrap';
-import type { SharedConfigReader, BootstrapResult } from './shadow/ShadowVaultBootstrap';
+import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
+import { sanitiseStateKey } from './shadow/vaultNaming';
+import type { BootstrapResult } from './shadow/ShadowVaultBootstrap';
+import { pullSharedObsidianConfig } from './shadow/SharedObsidianConfigSync';
+import type { SharedConfigReader } from './shadow/SharedObsidianConfigSync';
+import {
+  communityPluginsBasePath,
+  pullCommunityPlugins,
+  pullPluginBinaries,
+  readEnabledPluginIds,
+} from './shadow/CommunityPluginsSync';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
+import { syncConfigAfterConnect } from './shadow/postConnectConfigSync';
 import { ShadowVaultManager } from './shadow/ShadowVaultManager';
 import { WindowSpawner } from './shadow/WindowSpawner';
 import { ShadowStartupCoordinator } from './shadow/ShadowStartupCoordinator';
@@ -53,27 +63,20 @@ import { withTimeout } from './util/withTimeout';
 import * as path from 'path';
 import { errorMessage } from "./util/errorMessage";
 import { ConnectionManager, DaemonUnavailableError } from "./ConnectionManager";
-import {
-  detectRemoteTarget,
-  ensureDaemonBinary as downloadDaemonBinary,
-  resolveDaemonConsent,
-  DaemonVerificationError,
-  binaryFilename,
-} from './transport/DaemonDownloader';
-import { createHash } from 'crypto';
+import { connectionLostNotice } from './transport/connectionLostNotice';
+import { buildReconnectHooks } from './transport/reconnectHooks';
+import { DaemonVerificationError } from './transport/DaemonDownloader';
+import { ensureDaemonBinary as ensureRemoteDaemonBinary } from './transport/ensureDaemonBinary';
 import { TransferTracker } from "./util/TransferTracker";
 import { LargeTransferBar } from "./ui/LargeTransferBar";
 import { OnboardingModal } from "./ui/OnboardingModal";
 import { telemetry, telemetryLogPath } from "./util/Telemetry";
 
-/** GitHub `owner/repo` the daemon binaries are released from. */
-const DAEMON_RELEASE_REPO = 'sotashimozono/obsidian-remote-ssh';
-
 /**
  * Everything this plugin keeps OUTSIDE any vault, on every OS:
  * `~/.obsidian-remote/` — the shadow `vaults/` themselves, plus the
  * per-device, never-synced `state/` (the community-plugins base
- * snapshots; see `ShadowVaultBootstrap.communityPluginsBasePath`).
+ * snapshots; see `communityPluginsBasePath` in CommunityPluginsSync).
  * `os.homedir()` resolves at runtime — no hardcoded user.
  */
 const shadowStateRoot = (): string => path.join(os.homedir(), '.obsidian-remote');
@@ -168,15 +171,17 @@ export default class RemoteSshPlugin extends Plugin {
       (prompts) => new KbdInteractiveModal(this.app, prompts).prompt(),
       (info) => new HostKeyMismatchModal(this.app, info).prompt(),
     );
-    client.onClose(({ unexpected }) => {
-      if (unexpected) {
-        new Notice('Remote SSH: connection lost — reconnecting…');
-        void this.startReconnect();
-      }
+    client.onClose(({ unexpected, reason }) => {
+      if (unexpected) void this.startReconnect(reason);
     });
     this.conn = new ConnectionManager(client, {
       locateDaemonBinary: () => this.locateDaemonBinary(),
       ensureDaemonBinary: (c) => this.ensureDaemonBinary(c),
+      // The daemon dying is a lost connection too, even though SSH may be
+      // fine. Both go to the same place, and `startReconnect` announces —
+      // on the RPC transport an SSH drop kills the tunnel with it, so both
+      // paths fire for one failure and the user must still see one notice.
+      onRpcClose: (reason) => { void this.startReconnect(reason); },
     });
     this.conn.activeRemoteBasePath = null;
 
@@ -235,6 +240,34 @@ export default class RemoteSshPlugin extends Plugin {
       this.app.vault.on('rename', (file) => renameFollower.handleRename(file)),
     );
 
+    this.registerCommands();
+
+    // Inside `onLayoutReady` so Obsidian has finished initialising the vault
+    // before anything touches plugins or the adapter. See `runShadowStartup`.
+    this.app.workspace.onLayoutReady(() => {
+      if (this.settings.autoConnectProfileId) {
+        void this.runShadowStartup();
+        return;
+      }
+      // F17 — first-launch onboarding. Opens the wizard when the user
+      // has no profiles yet AND hasn't dismissed onboarding before.
+      // Skipped on shadow vaults (auto-connect path above).
+      if (this.settings.profiles.length === 0 && !this.settings.onboardingCompleted) {
+        this.showOnboarding();
+      }
+    });
+  }
+
+  /**
+   * The command palette surface, and the terminal view the last one opens.
+   *
+   * Lifted out of `onload` whole: it was 86 lines of the 202, and the only
+   * stretch a reader has to scroll past to find the wiring. Order-independent
+   * with respect to everything around it, which the rest of `onload` is not —
+   * the construction above it is sequenced on purpose and the comments there
+   * say why, so it stays where those constraints are visible.
+   */
+  private registerCommands(): void {
     this.addCommand({
       id: 'connect',
       name: 'Connect to remote vault',
@@ -321,29 +354,6 @@ export default class RemoteSshPlugin extends Plugin {
         return true;
       },
     });
-
-    // Phase 4 + 6C-prep: if this vault was opened with an
-    // autoConnectProfileId marker (= a shadow vault from
-    // `ShadowVaultBootstrap`):
-    //   1. install any plugins listed in community-plugins.json that
-    //      aren't yet on disk (marketplace download via
-    //      `app.plugins.installPlugin`),
-    //   2. then connect to the remote and populate the file model.
-    // Done inside `onLayoutReady` so we wait for Obsidian's own
-    // vault initialization to finish before touching plugins or the
-    // adapter.
-    this.app.workspace.onLayoutReady(() => {
-      if (this.settings.autoConnectProfileId) {
-        void this.runShadowStartup();
-        return;
-      }
-      // F17 — first-launch onboarding. Opens the wizard when the user
-      // has no profiles yet AND hasn't dismissed onboarding before.
-      // Skipped on shadow vaults (auto-connect path above).
-      if (this.settings.profiles.length === 0 && !this.settings.onboardingCompleted) {
-        this.showOnboarding();
-      }
-    });
   }
 
   private showOnboarding() {
@@ -369,12 +379,9 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Shadow window startup orchestration: prompt the user about any
-   * pending plugin suggestions captured at bootstrap, fill in any
-   * binaries missing from the shadow's community-plugins.json (safety
-   * net for re-bootstraps), then auto-connect. Split from
-   * `runAutoConnect` so the Reconnect command can re-run just the
-   * connect half without re-fetching anything.
+   * Offer the plugin suggestions captured at bootstrap, stage any binaries
+   * the list names but disk lacks, then connect. Separate from
+   * `runAutoConnect` so Reconnect re-runs only the connect half.
    */
   private async runShadowStartup(): Promise<void> {
     const coordinator = new ShadowStartupCoordinator(
@@ -453,17 +460,13 @@ export default class RemoteSshPlugin extends Plugin {
     const profile = this.conn.activeProfile;
     const basePath = this.conn.activeRemoteBasePath;
     if (!profile || !basePath) throw new Error('No active profile');
-    if (this.conn.daemonDeployer && this.conn.isAlive()) {
-      try { await this.conn.daemonDeployer.stop(); } catch { /* best effort */ }
-    }
-    if (this.conn.rpcConnection) {
-      try { this.conn.rpcConnection.close(); } catch { /* already dead */ }
-      this.conn.rpcConnection = null;
-    }
-    this.conn.daemonDeployer = null;
+    // Through the manager, not around it: closing the wire from here left the
+    // "we hung up" flag unset, so the restart announced itself as a lost
+    // connection and started a reconnect that raced it.
+    await this.conn.teardownRpcSession();
     await this.conn.startRpcSession(profile, basePath);
     // Rebind adapter to the fresh RPC client
-    this.adapterMgr.dataAdapter?.swapClient(this.conn.buildFsClient());
+    this.adapterMgr.dataAdapter?.rebind(this.conn.buildBinding());
   }
 
   async saveSettings() {
@@ -572,13 +575,9 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Phase 4 entry point: connect to the profile pointed at by
-   * `settings.autoConnectProfileId`, then populate the empty shadow
-   * vault from the remote tree via `VaultModelBuilder`. Called once
-   * on `onLayoutReady` and again from the `Reconnect` command.
-   *
-   * `tag` shows up in the log line so we can tell whether a given
-   * run came from the layout-ready hook or a manual reconnect.
+   * Connect to `settings.autoConnectProfileId` and populate the vault from
+   * the remote tree. Runs at layout-ready and again from Reconnect; `tag`
+   * distinguishes the two in the log.
    */
   private async runAutoConnect(tag: 'layout-ready' | 'reconnect'): Promise<void> {
     const profileId = this.settings.autoConnectProfileId;
@@ -619,143 +618,23 @@ export default class RemoteSshPlugin extends Plugin {
       return;
     }
 
-    // Pull this device's Obsidian config (app.json / appearance.json /
-    // core-plugins.json / hotkeys.json — now per-client via PathMapper)
-    // from the remote onto the local shadow disk *before* the populate, so
-    // the next time this window restarts Obsidian reads fresh settings
-    // instead of the stale local copy (#342). Best-effort: a failure here
-    // must not block rendering the vault.
     const da = this.adapterMgr.dataAdapter;
     const hostAdapter = this.app.vault.adapter;
     if (da && hostAdapter instanceof FileSystemAdapter) {
-      const localConfigDir = path.join(
-        hostAdapter.getBasePath(), this.app.vault.configDir,
-      );
-      const remoteConfigDir = this.app.vault.configDir;
-      try {
-        const cfg = await ShadowVaultBootstrap.pullSharedObsidianConfig(
-          da, remoteConfigDir, localConfigDir,
-        );
-        if (cfg.errored.length > 0) {
-          // The connection is up but some shared-config files the
-          // remote *had* couldn't be pulled (transient SSH error /
-          // corrupt file). Without a signal the user would just see
-          // settings silently not update — the #342 symptom. Absent
-          // files are not errored, so a fresh vault stays quiet.
-          new Notice(
-            `Remote SSH: ${cfg.errored.length} config file` +
-            `${cfg.errored.length === 1 ? '' : 's'} (${cfg.errored.join(', ')}) ` +
-            'could not be synced — settings may be stale until the next connect',
-          );
-        }
-      } catch (e) {
-        logger.warn(
-          `runAutoConnect(${tag}): shared-config pull failed: ${errorMessage(e)}`,
-        );
-      }
-
-      // #429 / #342 residual: round-trip the enabled community-plugins
-      // list. Pull first so plugins set up on the remote load in the
-      // shadow vault (the marketplace installer then fetches any missing
-      // binaries); then push the converged result so a plugin enabled —
-      // or UNINSTALLED — only here reaches the remote for other machines.
-      // Kept out of the verbatim shared-config set because `remote-ssh`
-      // must be force-preserved through the merge (a verbatim copy of a
-      // remote list omitting it would disable this very plugin).
-      //
-      // Both halves take this device's BASE snapshot: the converged list
-      // as of the last successful round-trip HERE. It is what turns the
-      // old monotonic union into a real 3-way merge, so a local uninstall
-      // propagates instead of being resurrected by the next pull. The
-      // pull only reads it; the push commits it once both sides agree.
-      const cpBasePath = ShadowVaultBootstrap.communityPluginsBasePath(
-        shadowStateRoot(), profile.id,
-      );
-      try {
-        await ShadowVaultBootstrap.pullCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
-        await ShadowVaultBootstrap.pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
-      } catch (e) {
-        logger.warn(
-          `runAutoConnect(${tag}): community-plugins round-trip failed: ${errorMessage(e)}`,
-        );
-      }
-
-      // #429b: the startup installer (prepareForAutoConnect) ran BEFORE
-      // the pull above — and not at all on a reconnect — so a plugin the
-      // pull just added to community-plugins.json has no binary staged yet
-      // and won't load. Re-run the marketplace installer now the list is
-      // current; `enablePluginAndSave` loads a marketplace plugin live, no
-      // restart. Idempotent (already-installed ids are skipped). BRAT /
-      // non-marketplace plugins still need their binary on the remote.
-      try {
-        await new ShadowStartupCoordinator(this.app, this.settings, () => this.saveSettings())
-          .installMissingShadowPlugins();
-      } catch (e) {
-        logger.warn(`runAutoConnect(${tag}): post-pull plugin install failed: ${errorMessage(e)}`);
-      }
-
-      // #429b binary round-trip: the marketplace installer above can't
-      // fetch a BRAT / sideloaded plugin (it isn't on the registry). Run
-      // AFTER the installer so the plugins it just fetched are on disk —
-      // the pull then only stages what's STILL missing (the non-market
-      // ones), which keeps the installer's live load intact and also
-      // acts as a fallback if a marketplace fetch failed. The push makes
-      // the remote `.obsidian/plugins/` a complete vault so every machine
-      // can pull. A pulled binary loads on the next vault open (Obsidian
-      // scans the plugins dir at startup).
-      try {
-        const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
-        await ShadowVaultBootstrap.pullPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
-        await ShadowVaultBootstrap.pushPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
-      } catch (e) {
-        logger.warn(`runAutoConnect(${tag}): plugin-binary round-trip failed: ${errorMessage(e)}`);
-      }
-
-      // #342 push half: pull only brought remote→local. Without this,
-      // a settings change made HERE never reaches the remote, so the
-      // next session's pull finds nothing and the change evaporates.
-      // Watch the local config dir and push divergent shared files.
+      const localConfigDir = path.join(hostAdapter.getBasePath(), this.app.vault.configDir);
       this.sharedConfigWatcher?.stop();
-      const watcher = new SharedConfigWatcher({
-        watch: (onChange) => {
-          const w = fs.watch(
-            localConfigDir, { persistent: false },
-            (_evt, filename) => onChange(filename ? String(filename) : null),
-          );
-          return { close: () => w.close() };
-        },
-        readLocal: (b) => {
-          try { return fs.readFileSync(path.join(localConfigDir, b), 'utf-8'); }
-          catch { return null; }
-        },
-        flush: async () => {
-          const r = await ShadowVaultBootstrap.pushSharedObsidianConfig(
-            da, remoteConfigDir, localConfigDir,
-          );
-          if (r.errored.length > 0) {
-            new Notice(
-              `Remote SSH: ${r.errored.length} config file` +
-              `${r.errored.length === 1 ? '' : 's'} (${r.errored.join(', ')}) ` +
-              'could not be pushed — settings change not yet saved remotely',
-            );
-          }
-        },
-        debounceMs: 1500,
-        setTimer: (cb, ms) => window.setTimeout(cb, ms),
-        clearTimer: (h) => window.clearTimeout(h as number),
+      this.sharedConfigWatcher = await syncConfigAfterConnect({
+        adapter: da,
+        remoteConfigDir: this.app.vault.configDir,
+        localConfigDir,
+        stateRoot: shadowStateRoot(),
+        profileId: profile.id,
+        installMissingPlugins: () =>
+          new ShadowStartupCoordinator(this.app, this.settings, () => this.saveSettings())
+            .installMissingShadowPlugins(),
+        notify: (m) => { new Notice(m); },
+        tag,
       });
-      // Seed the just-pulled bytes as the synced baseline so the
-      // pull's own writes (and Obsidian re-saving an identical file
-      // on open) don't immediately echo back to the remote.
-      for (const base of ShadowVaultBootstrap.SHARED_OBSIDIAN_CONFIG_FILES) {
-        try {
-          watcher.markSynced(
-            base, fs.readFileSync(path.join(localConfigDir, base), 'utf-8'),
-          );
-        } catch { /* absent locally — nothing to baseline */ }
-      }
-      watcher.start();
-      this.sharedConfigWatcher = watcher;
     }
 
     // Adapter is patched; build the file model so File Explorer
@@ -780,37 +659,38 @@ export default class RemoteSshPlugin extends Plugin {
     new Notice('Remote SSH: reconnect cancelled');
   }
 
-  private async startReconnect(): Promise<void> {
+  private async startReconnect(cause?: Error): Promise<void> {
     if (!this.conn.activeProfile) {
       logger.warn('startReconnect: no active profile to reconnect with');
       this.setState(SyncState.ERROR);
       return;
     }
+    // One failure, one notice. Both close paths lead here, and on the RPC
+    // transport a dropped SSH connection takes the tunnel with it, so both
+    // fire for the same event — announcing from the callers stacked two
+    // toasts on the most ordinary disconnect there is.
+    if (this.state === SyncState.RECONNECTING) {
+      logger.info(`startReconnect: already reconnecting${cause ? ` (${cause.message})` : ''}`);
+      return;
+    }
     const maxRetries = this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries;
     if (maxRetries <= 0) {
       logger.info('startReconnect: auto-reconnect disabled (reconnectMaxRetries <= 0)');
+      new Notice(connectionLostNotice(cause, false));
       this.adapterMgr.restore();
       this.setState(SyncState.ERROR);
       return;
     }
+    new Notice(connectionLostNotice(cause, true));
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
       maxRetries,
       setAdapterReconnecting: (on) => this.adapterMgr.dataAdapter?.setReconnecting(on),
       onState: (s) => this.onReconnectStateChange(s),
-      hooks: {
-        swapClient: (c) => this.adapterMgr.dataAdapter?.swapClient(c),
-        prepareListenerForReconnect: () => this.fsChangeListener.prepareForReconnect(),
-        resumeListenerAfterReconnect: async (rpc) => {
-          const da = this.adapterMgr.dataAdapter;
-          if (da) {
-            await this.fsChangeListener.resumeAfterReconnect({
-              rpcConnection: rpc,
-              dataAdapter: da,
-            });
-          }
-        },
-      },
+      hooks: buildReconnectHooks({
+        dataAdapter: () => this.adapterMgr.dataAdapter,
+        fsChangeListener: this.fsChangeListener,
+      }),
     });
   }
 
@@ -907,15 +787,11 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Open or reveal the remote terminal pane in the right sidebar.
-   * Re-using an existing leaf keeps the shell channel alive across
-   * focus changes; opening a fresh leaf each time would reset
-   * scrollback and lose any in-flight commands.
+   * Re-uses an existing leaf so the shell channel, scrollback and any
+   * in-flight command survive a focus change.
    *
-   * Uses `setActiveLeaf` rather than `revealLeaf` because the latter
-   * requires Obsidian v1.7.2 and our manifest declares
-   * `minAppVersion: 1.4.0` — `setActiveLeaf` has the same observable
-   * effect (focus + render) and has been stable since pre-1.0.
+   * `setActiveLeaf`, not `revealLeaf`: the latter needs Obsidian 1.7.2 and
+   * the manifest declares 1.5.0. Same observable effect.
    */
   async openRemoteTerminal(): Promise<void> {
     if (this.openingTerminal) return;
@@ -1028,21 +904,17 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Once connected, fire `modify` for restored files that need a real read.
+   * Fire `modify` for restored files that need a real read.
    *
-   * Two groups, both created by the same gap: between `onload` (where the
-   * snapshot lands in the model) and the adapter patch (which happens after
-   * layout ready), the only adapter is Obsidian's native one, pointed at a
-   * shadow disk that holds no notes.
+   * Both groups come from one gap: between `onload`, where the snapshot lands
+   * in the model, and the adapter patch after layout-ready, the only adapter
+   * is Obsidian's native one — pointed at a shadow disk holding no notes.
    *
-   *  - Notes with NO metadata: their cached stat didn't match the snapshot,
-   *    so `metadataCache.initialize()` tried to read them, through the native
-   *    adapter, and failed.
-   *  - Notes OPEN in a tab: Obsidian restores the workspace layout in that
-   *    same window and loads each open file's content the same way. The read
-   *    fails and the editor shows nothing. These notes usually DO have valid
-   *    metadata (that is the whole point of the snapshot), so the check above
-   *    would skip them and the tab would stay blank until reopened by hand.
+   *  - No metadata: `metadataCache.initialize()` already tried to read them
+   *    through that adapter and failed.
+   *  - Open in a tab: the workspace restore loads their content the same way
+   *    and the editor shows nothing. These usually DO have metadata, so the
+   *    first check skips them and the tab stays blank until reopened by hand.
    */
   private reindexSnapshotFilesWithoutMetadata(): void {
     if (!this.snapshotFiles || this.snapshotMetadataChecked) return;
@@ -1103,14 +975,11 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Start (or restart) the background full-index pass that completes the vault
-   * model behind the lazy root-level populate.
+   * Complete the vault model behind the lazy root-level populate.
    *
-   * Fire-and-forget by design: connect returns immediately and the indexer
-   * trickles the rest of the tree into `vault.fileMap`, yielding to the renderer
-   * between units. Any previous pass (e.g. from the connect before a reconnect)
-   * is cancelled first, so only one indexer is ever live and a stale one can't
-   * write progress over the new one's.
+   * Fire-and-forget: connect returns at once and the indexer trickles the rest
+   * of the tree in, yielding to the renderer between units. Any previous pass
+   * is cancelled first, so a stale one cannot write progress over the new one.
    */
   private startBackgroundIndex(): void {
     this.backgroundIndexer?.cancel();
@@ -1135,13 +1004,12 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Surface indexing honestly. Until the pass completes, search / graph /
-   * backlinks really ARE incomplete, so say so in the status bar rather than
-   * letting a vault that has registered 12 of 30 000 files look "ready".
+   * Say so while it runs: until the pass completes, search, graph and
+   * backlinks really ARE incomplete, and a vault holding 12 of 30,000 files
+   * should not look ready.
    *
-   * Non-nagging: status-bar text while it runs (no modal, no toast spam), and a
-   * single Notice when it finishes. A cancelled pass says nothing — the user
-   * disconnected; they don't need a report.
+   * Status-bar text while running, one Notice at the end, nothing at all when
+   * cancelled — the user disconnected and needs no report.
    */
   private onIndexProgress(indexer: BackgroundIndexer, p: IndexProgress): void {
     // A pass superseded by a reconnect, or one still unwinding after disconnect,
@@ -1203,34 +1071,14 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * POC for the shadow-vault architecture (see
-   * docs/en/architecture/shadow-vault.md, Phase 1): walk the patched
-   * adapter, then hand the resulting entry list to `VaultModelBuilder`
-   * which materialises TFile/TFolder objects in `app.vault.fileMap`
-   * and fires `vault.trigger('create', file)` for each new file. File
-   * Explorer should redraw with the remote tree.
+   * Walk the patched adapter and build the model so File Explorer renders the
+   * remote tree. Public so the debug command and auto-connect share one path.
    *
-   * Stat is intentionally skipped per file in this POC — every entry
-   * lands with zero ctime/mtime/size. Shadow-vault Phase 4 will
-   * decide whether to batch-stat at walk time or stat lazily.
+   * Per-file stat is skipped: every entry lands with zero ctime/mtime/size and
+   * faults in real values on access.
    *
-   * Run from a vault that's already connected to a profile via the
-   * existing in-place patch flow (Tier 1-A); the command is hidden
-   * unless `this.conn.client?.isAlive()`.
-   */
-  /**
-   * Walk the patched adapter and run `VaultModelBuilder` so File
-   * Explorer renders the remote tree. Public so both the debug
-   * command and the Phase 4 auto-connect flow share one path.
-   *
-   * Stat is intentionally skipped per file — every entry lands with
-   * zero ctime/mtime/size. Subsequent file accesses fault in real
-   * stat values via the patched adapter as needed; a Phase 6
-   * follow-up can switch to a daemon-side batch-stat if it shows
-   * up in profiles.
-   *
-   * Returns a short summary string suitable for a Notice; logs the
-   * full counts + first 5 errors via `logger.info`/`logger.warn`.
+   * Returns a short summary for a Notice; full counts and the first five
+   * errors go to the log.
    */
   async populateVaultFromRemote(label: string = 'remote'): Promise<string> {
     const start = Date.now();
@@ -1314,18 +1162,11 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Settings UI Connect button handler (Phase 3) and the underlying
-   * implementation of the shadow-vault flow.
+   * Bootstrap the shadow vault for `profile` and open it in a new Obsidian
+   * window via `obsidian://open`.
    *
-   * Bootstraps the shadow vault for `profile` (creates the dir,
-   * installs the plugin per-file, writes data.json with the
-   * auto-connect marker, registers the path in obsidian.json) and
-   * opens it in a new Obsidian window via the
-   * `obsidian://open?path=…` URL scheme.
-   *
-   * Does NOT require an SSH connection — the shadow vault setup is
-   * a local-disk operation; the connect happens later, inside the
-   * shadow window (Phase 4).
+   * No SSH needed: this is local-disk work, and the connect happens inside
+   * the shadow window afterwards.
    */
   async openShadowVaultFor(profile: SshProfile): Promise<void> {
     // Connect clicked from INSIDE the shadow window for this same
@@ -1368,17 +1209,14 @@ export default class RemoteSshPlugin extends Plugin {
     const manager = new ShadowVaultManager(bootstrap, spawner);
 
     try {
-      // #399: flush the in-memory SecretStore to the SOURCE data.json
-      // BEFORE the bootstrap reads it. A password typed in ConnectModal
-      // lives only in `secretStore` memory until a save; without this
-      // the bootstrap seeds the shadow vault with empty secrets and its
-      // auto-connect fails with "No password stored for profile",
-      // opening an empty vault. Also persists the profile's freshly-set
-      // passwordRef. On the Settings-button path (no password typed)
-      // this is a harmless idempotent re-write of the current settings.
-      // A transient save failure must NOT abort the spawn (the shadow
-      // may still connect from previously-persisted secrets), so it is
-      // logged and swallowed rather than surfaced as a spawn failure.
+      // #399: a password typed in ConnectModal lives only in memory until a
+      // save, so flush it to the SOURCE data.json before the bootstrap reads
+      // it — otherwise the shadow is seeded with empty secrets and its
+      // auto-connect dies with "No password stored for profile", opening an
+      // empty vault. Harmless and idempotent when nothing was typed.
+      //
+      // A save failure must not abort the spawn: the shadow may still connect
+      // from previously-persisted secrets.
       try {
         await this.saveSettings();
       } catch (e) {
@@ -1437,34 +1275,28 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Pre-spawn pull (#429b / Phase B-3). Before the shadow window opens,
-   * pull the remote `.obsidian/` — shared config (#342), the enabled-
-   * plugins list, and plugin binaries (#429b) — into the freshly
-   * bootstrapped shadow dir, so the window boots on the CANONICAL remote
-   * config instead of a stale local copy (no mid-session settings reload).
+   * Pull the remote `.obsidian/` into the fresh shadow dir before the window
+   * opens, so it boots on the canonical remote config rather than a stale
+   * local copy and never reloads settings mid-session (#429b).
    *
-   * Strictly best-effort and time-boxed. It builds a STANDALONE
-   * `SftpClient` that does NOT patch this (source) window's vault adapter,
-   * so the user's real vault is never hijacked. The kbd-interactive and
-   * host-key callbacks REJECT rather than prompt: pre-spawn must be
-   * non-interactive, so a 2FA / unknown-host connect falls through to the
-   * shadow window (which prompts exactly once) — no double prompt, no
-   * surprise modal in the source window. On ANY error or timeout it logs
-   * and returns; `ShadowVaultManager` then spawns and the shadow window's
-   * own connect catches up. Never throws.
+   * Best-effort and time-boxed. The `SftpClient` here is standalone and never
+   * patches the SOURCE window's adapter, so the user's real vault is not
+   * hijacked. The kbd-interactive and host-key callbacks REJECT rather than
+   * prompt: a 2FA or unknown-host connect falls through to the shadow window,
+   * which asks exactly once — no double prompt, no modal in the wrong window.
+   *
+   * Any error or timeout just logs and returns; the shadow window's own
+   * connect catches up. Never throws.
    */
   private async preSpawnPull(profile: SshProfile, result: BootstrapResult): Promise<void> {
     const localConfigDir = result.layout.configDir;
     const remoteConfigDir = this.app.vault.configDir; // ".obsidian"
     const remoteBase = normalizeRemotePath(profile.remotePath);
-    // Apply the SAME per-client redirect the shadow window's adapter will use
-    // (AdapterManager builds `new PathMapper(resolveClientId(settings), configDir)`),
-    // so the four now-per-device config files (app/appearance/core-plugins/hotkeys)
-    // are pulled from THIS client's `<configDir>/user/<id>/` subtree — NOT the dead
-    // shared identity path. Without this, pre-spawn read the shared path and
-    // clobbered the per-device config on every spawn, undoing the redirect.
-    // `PathMapper.toRemote` is identity for non-private paths (community-plugins.json,
-    // plugins/…), so those still round-trip shared, unchanged.
+    // The same redirect the shadow window's adapter will use, so the
+    // per-device config files are pulled from THIS client's subtree and not
+    // the dead shared path. Without it, pre-spawn clobbered the per-device
+    // config on every spawn. Non-private paths map to themselves, so the
+    // plugin list and binaries still round-trip shared.
     const mapper = new PathMapper(ConnectionManager.resolveClientId(this.settings), remoteConfigDir);
     const toRemote = (p: string): string => preSpawnRemotePath(mapper, remoteBase, p);
 
@@ -1490,21 +1322,17 @@ export default class RemoteSshPlugin extends Plugin {
     // the expected post-disconnect noise.
     const pull = (async () => {
       await client.connect(profile);
-      await ShadowVaultBootstrap.pullSharedObsidianConfig(reader, remoteConfigDir, localConfigDir);
-      // Same base as the shadow window's own round-trip will use (same
-      // device, same profile), so a removal another machine made is
-      // applied here too and the window boots on the converged list.
-      // `pullCommunityPlugins` never WRITES the base — only the push
-      // does, once both sides hold it — so this pre-spawn pull cannot
-      // make the real connect's push mistake this device's local
-      // additions for remote removals, and re-running the merge over the
-      // same base is idempotent: no removal is ever double-applied.
-      await ShadowVaultBootstrap.pullCommunityPlugins(
+      await pullSharedObsidianConfig(reader, remoteConfigDir, localConfigDir);
+      // The same base the shadow window will use, so a removal made elsewhere
+      // is applied here too. The pull never writes the base, so it cannot
+      // make the later push read this device's additions as remote removals,
+      // and re-merging over one base is idempotent.
+      await pullCommunityPlugins(
         reader, remoteConfigDir, localConfigDir,
-        ShadowVaultBootstrap.communityPluginsBasePath(shadowStateRoot(), profile.id),
+        communityPluginsBasePath(shadowStateRoot(), profile.id),
       );
-      const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
-      await ShadowVaultBootstrap.pullPluginBinaries(reader, remoteConfigDir, localConfigDir, enabledIds);
+      const enabledIds = readEnabledPluginIds(localConfigDir);
+      await pullPluginBinaries(reader, remoteConfigDir, localConfigDir, enabledIds);
     })();
     pull.catch(() => { /* post-timeout teardown error — handled via the race */ });
     try {
@@ -1564,19 +1392,10 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   /**
-   * Full α-path round-trip with auto-deploy:
-   *   1. Locate the staged daemon binary inside the plugin folder.
-   *   2. Upload it over the existing SFTP session, kill any prior
-   *      daemon, start the new one with `nohup`, wait for the token
-   *      to land on disk.
-   *   3. Open a unix-socket Duplex through the same SSH connection.
-   *   4. Run `auth` + `server.info`.
-   *   5. Smoke-list `activeRemoteBasePath` via `RpcRemoteFsClient`.
-   *
-   * Each step logs to `console.log` so the daemon and plugin can be
-   * debugged in tandem. Optional overrides on the active profile
-   * (`rpcSocketPath`, `rpcTokenPath`) are honoured; both default to
-   * `.obsidian-remote/{server.sock,token}` (home-relative).
+   * Debug command: deploy the daemon over the live SFTP session, open a
+   * unix-socket Duplex through the same SSH connection, authenticate, and
+   * smoke-list the vault root. Every step logs, so the daemon and the plugin
+   * can be followed together.
    */
   private async debugTestRpcTunnel(): Promise<void> {
     if (this.state !== SyncState.CONNECTED || !this.conn.client.isAlive()) {
@@ -1675,173 +1494,21 @@ export default class RemoteSshPlugin extends Plugin {
     return fs.existsSync(candidate) ? candidate : null;
   }
 
-  /**
-   * sha256 (hex) of a cached daemon binary, or null if it can't be read.
-   * Used by the connect fast-path to re-validate the cached bytes without a
-   * network round-trip. Reads the whole file (a daemon binary is a few MB) —
-   * cheap next to the SSH connect it gates.
-   */
-  private async sha256File(abs: string): Promise<string | null> {
-    try {
-      const buf = await fs.promises.readFile(abs);
-      return createHash('sha256').update(buf).digest('hex');
-    } catch {
-      return null;
-    }
-  }
+
 
   /**
-   * Acquire a daemon binary for the REMOTE's os/arch when one isn't staged
-   * locally. Community-store installs don't ship `server-bin/`, so we probe
-   * the remote with `uname`, download the matching binary from this plugin's
-   * GitHub release, and verify it against `daemon-manifest.json` (sha256)
-   * before caching it under `server-bin/`. Returns `null` (→ caller
-   * downgrades to SFTP) for an unsupported arch, a failed probe, a declined
-   * download, or a benign download failure. A sha256/integrity failure is
-   * NOT swallowed — it throws so the connect surfaces it loudly.
+   * Acquire a daemon binary for the remote's os/arch. The logic lives in
+   * `transport/ensureDaemonBinary` so it can be tested without building a
+   * plugin, and so its coverage is visible.
    */
-  private async ensureDaemonBinary(client: SftpClient): Promise<string | null> {
-    // Probe the remote os/arch. A FAILED probe (non-zero exit / SSH exec
-    // error) is logged distinctly from an UNSUPPORTED arch — both stay on
-    // SFTP, but conflating them hid real exec failures behind a misleading
-    // "unsupported arch" message (#406 review).
-    let target: Awaited<ReturnType<typeof detectRemoteTarget>>;
-    try {
-      target = await detectRemoteTarget(async (cmd) => {
-        const r = await client.exec(cmd);
-        if (r.exitCode !== 0) {
-          throw new Error(`'${cmd}' exited ${r.exitCode}: ${r.stderr.trim() || '(no stderr)'}`);
-        }
-        return r.stdout;
-      });
-    } catch (e) {
-      logger.warn(`ensureDaemonBinary: remote uname probe failed (${errorMessage(e)}); staying on SFTP`);
-      return null;
-    }
-    if (!target) {
-      logger.warn('ensureDaemonBinary: unsupported remote os/arch; staying on SFTP');
-      return null;
-    }
-
-    const pluginDir = this.pluginDir();
-    if (!pluginDir) return null;
-    const cacheDir = path.join(pluginDir, 'server-bin');
-
-    // R3: `server-bin` must be a REAL per-shadow dir. Older installs (and dev
-    // symlink installs) could leave it as a junction to ANOTHER vault's
-    // server-bin (installPlugin used to propagate it); if that target vault was
-    // later deleted, the junction dangles and mkdir throws a raw ENOENT — the
-    // connect then silently degrades to SFTP. Try a plain mkdir first (a valid
-    // dir/junction is fine); on failure, unlink a stale reparse point (never
-    // following into / deleting its target) and recreate a real dir. Only give
-    // up to SFTP if even that fails.
-    try {
-      fs.mkdirSync(cacheDir, { recursive: true });
-    } catch (firstErr) {
-      let repaired = false;
-      try {
-        // lstat succeeds for a dangling junction; unlink drops the link only.
-        if (fs.lstatSync(cacheDir).isSymbolicLink()) {
-          fs.unlinkSync(cacheDir);
-          fs.mkdirSync(cacheDir, { recursive: true });
-          repaired = true;
-        }
-      } catch { /* fall through to the SFTP path below */ }
-      if (!repaired) {
-        logger.error(
-          `ensureDaemonBinary: server-bin unusable (${errorMessage(firstErr)}); staying on SFTP. ` +
-          'If this persists, delete the shadow vault dir under ~/.obsidian-remote/vaults and reconnect.',
-        );
-        new Notice(
-          'Remote SSH: the daemon cache dir is broken — staying on SFTP. If this persists, ' +
-          'delete the vault dir under ~/.obsidian-remote/vaults and reconnect.',
-        );
-        return null;
-      }
-      logger.warn(`ensureDaemonBinary: repaired a stale server-bin link at ${cacheDir}`);
-    }
-
-    // Fast path: reuse the cached binary without a GitHub round-trip when it
-    // was provisioned for THIS plugin version AND its bytes still hash to the
-    // recorded sha. The sha re-check upholds the "never deploy an unverified
-    // binary" invariant even here — a file corrupted/truncated after its
-    // verified download is caught (network-free) and re-fetched below. A
-    // version mismatch, missing marker, or sha mismatch falls through to the
-    // manifest sha re-check / download.
-    const dest = path.join(cacheDir, binaryFilename(target));
-    if (
-      this.settings.daemonBinaryVersion === this.manifest.version &&
-      this.settings.daemonBinarySha &&
-      (await this.sha256File(dest)) === this.settings.daemonBinarySha
-    ) {
-      logger.info(`ensureDaemonBinary: cached daemon validated for ${this.manifest.version}; reusing`);
-      return dest;
-    }
-
-    // Consent gate (asked once; the decision — accept OR decline — is
-    // persisted so a decline doesn't re-prompt on every connect / restart).
-    const consented = await resolveDaemonConsent(
-      this.settings.daemonDownloadConsented === true,
-      () => this.confirmDaemonDownload(this.manifest.version),
-      async (c) => { this.settings.daemonDownloadConsented = c; await this.saveSettings(); },
-    );
-    if (!consented) {
-      logger.info('ensureDaemonBinary: user declined daemon download; staying on SFTP');
-      return null;
-    }
-
-    try {
-      const local = await downloadDaemonBinary(
-        {
-          fetchBinary: async (url) => new Uint8Array((await requestUrl({ url })).arrayBuffer),
-          fetchText: async (url) => (await requestUrl({ url })).text,
-          cacheDir,
-          readCached: async (abs) => {
-            try { return new Uint8Array(await fs.promises.readFile(abs)); }
-            catch { return null; }
-          },
-          writeExecutable: async (abs, bytes) => {
-            // Atomic: write a temp sibling, chmod, then rename. A crash
-            // mid-write can't then leave a torn binary that a later sha
-            // re-check would hand back unverified (#406 review).
-            await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-            const tmp = `${abs}.${process.pid}.tmp`;
-            await fs.promises.writeFile(tmp, bytes);
-            await fs.promises.chmod(tmp, 0o755);
-            await fs.promises.rename(tmp, abs);
-          },
-          repo: DAEMON_RELEASE_REPO,
-          version: this.manifest.version,
-        },
-        target,
-      );
-      // Record the version + sha this cached binary is validated for, so the
-      // next same-version connect takes the network-free fast path above.
-      // Non-fatal: the binary is verified on disk, so a marker-persist failure
-      // must NOT be reported as a download failure — we just re-verify on the
-      // next connect.
-      try {
-        this.settings.daemonBinaryVersion = this.manifest.version;
-        this.settings.daemonBinarySha = (await this.sha256File(local)) ?? undefined;
-        await this.saveSettings();
-      } catch (e) {
-        logger.warn(
-          `ensureDaemonBinary: daemon ready but failed to persist cache marker ` +
-          `(${errorMessage(e)}); will re-verify on the next connect`,
-        );
-      }
-      new Notice(`Remote SSH: daemon ready for ${target.os}/${target.arch}.`);
-      return local;
-    } catch (e) {
-      // A sha256 mismatch / malformed manifest (DaemonVerificationError) is a
-      // tamper/integrity signal — rethrow so the connect surfaces it loudly
-      // (ERROR state + classified Notice) instead of a quiet "Using SFTP".
-      // Only benign failures (network / 404) downgrade silently.
-      if (e instanceof DaemonVerificationError) throw e;
-      logger.error(`ensureDaemonBinary: download failed: ${errorMessage(e)}`);
-      new Notice(`Remote SSH: daemon download failed — ${errorMessage(e)}. Using SFTP.`);
-      return null;
-    }
+  private ensureDaemonBinary(client: SftpClient): Promise<string | null> {
+    return ensureRemoteDaemonBinary(client, {
+      pluginDir: () => this.pluginDir(),
+      pluginVersion: this.manifest.version,
+      settings: this.settings,
+      saveSettings: () => this.saveSettings(),
+      confirmDownload: (v) => this.confirmDaemonDownload(v),
+    });
   }
 
   /** One-time consent dialog for the daemon auto-download. */

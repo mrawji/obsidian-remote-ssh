@@ -650,7 +650,7 @@ describe('SftpDataAdapter (read-side)', () => {
     });
   });
 
-  describe('swapClient', () => {
+  describe('rebind', () => {
     it('routes subsequent reads through the new client', async () => {
       const oldClient = makeFakeClient({
         files: { '/v/note.md': { data: Buffer.from('OLD'), mtime: 1 } },
@@ -661,7 +661,7 @@ describe('SftpDataAdapter (read-side)', () => {
       const adapter = new SftpDataAdapter(oldClient.client, '/v', readCache, dirCache, 'v');
       // Sanity: the adapter sees the old client's data first.
       expect(await adapter.read('note.md')).toBe('OLD');
-      adapter.swapClient(newClient.client);
+      adapter.rebind({ client: newClient.client, remoteBase: '/v' });
       // After swap, mtime mismatch invalidates the cache and the
       // newer client's data flows through.
       expect(await adapter.read('note.md')).toBe('NEW');
@@ -676,7 +676,7 @@ describe('SftpDataAdapter (read-side)', () => {
       });
       const adapter = new SftpDataAdapter(oldClient.client, '/v', readCache, dirCache, 'v');
       await adapter.read('note.md'); // primes cache
-      adapter.swapClient(newClient.client);
+      adapter.rebind({ client: newClient.client, remoteBase: '/v' });
       // Same mtime → cache hit, the new client only sees a stat call.
       const out = await adapter.read('note.md');
       expect(out).toBe('SAME');
@@ -1752,5 +1752,26 @@ describe('SftpDataAdapter — config write-through to the local shadow disk (#34
 
     // Nothing was written outside the shadow root.
     await expect(fs.stat(victim)).rejects.toThrow();
+  });
+});
+
+describe('SftpDataAdapter.fetchBinaryForBridge', () => {
+  // Reachable from AdapterManager, but nothing had ever executed it: the
+  // bridge is never driven end to end in the suites. Its docblock makes a
+  // claim worth holding — a view, not a copy. This serves every <img> in
+  // the vault, so a copy here doubles memory per asset.
+  it('hands the bridge a view over the bytes it read, not a copy', async () => {
+    const fake = makeFakeClient();
+    const adapter = new SftpDataAdapter(
+      fake.client, '/srv/vault', new ReadCache(), new DirCache(), 'v',
+    );
+    const ab = new ArrayBuffer(4);
+    new Uint8Array(ab).set([0x89, 0x50, 0x4e, 0x47]); // PNG magic
+    (adapter as unknown as Record<string, unknown>).readBinary = () => Promise.resolve(ab);
+
+    const out = await adapter.fetchBinaryForBridge('notes/diagram.png');
+
+    expect(Array.from(out)).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect(out.buffer).toBe(ab);
   });
 });

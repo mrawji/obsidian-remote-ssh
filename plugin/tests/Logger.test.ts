@@ -356,3 +356,107 @@ describe('Logger — installFileSink mkdir failure', () => {
     }
   });
 });
+
+// ─── rotation ────────────────────────────────────────────────────────────────
+//
+// Measured across both suites, `rotateNow` and `cascadeRotate` had never
+// executed. They are the only thing bounding how much disk this plugin uses
+// on a user's machine, and the only thing that keeps logging working past
+// the first 5 MB.
+
+const OVERSIZED = 5 * 1024 * 1024 + 1;
+
+/** A file of `size` bytes without writing them — stat.size is what rotation reads. */
+function sparseFile(at: string, size: number): void {
+  fs.writeFileSync(at, '');
+  fs.truncateSync(at, size);
+}
+
+describe('Logger — log rotation', () => {
+  it('moves an already-oversized log aside when the sink opens', async () => {
+    // Otherwise a vault that logged 5 MB last session keeps appending to the
+    // same file forever.
+    sparseFile(logFile, OVERSIZED);
+    const log = new Logger(50, false);
+
+    log.installFileSink(logFile);
+    log.info('first line of the new generation');
+    await log.uninstallFileSink();
+
+    expect(fs.existsSync(`${logFile}.1`)).toBe(true);
+    expect(fs.statSync(`${logFile}.1`).size).toBe(OVERSIZED);
+    expect(fs.statSync(logFile).size).toBeLessThan(OVERSIZED);
+  });
+
+  it('keeps logging into the fresh file after it rotates', async () => {
+    // A rotation that failed to reopen the sink would lose every line from
+    // then on, silently.
+    sparseFile(logFile, OVERSIZED);
+    const log = new Logger(50, false);
+
+    log.installFileSink(logFile);
+    log.info('after rotation');
+    await log.uninstallFileSink();
+
+    expect(readJsonl().map((l) => l.msg)).toContain('after rotation');
+  });
+
+  it('keeps three generations and drops the oldest', async () => {
+    // What this actually pins: no `.4` ever appears, and each generation
+    // shifts one older. The explicit unlink of the oldest is belt-and-braces
+    // — on POSIX the rename onto `.3` overwrites it anyway, so removing that
+    // line does NOT fail this test. Checked, rather than assumed.
+    for (const [gen, body] of [['1', 'gen-one'], ['2', 'gen-two'], ['3', 'gen-three']] as const) {
+      fs.writeFileSync(`${logFile}.${gen}`, body);
+    }
+    sparseFile(logFile, OVERSIZED);
+    const log = new Logger(50, false);
+
+    log.installFileSink(logFile);
+    await log.uninstallFileSink();
+
+    expect(fs.existsSync(`${logFile}.4`)).toBe(false);
+    // Each generation shifted one older; the previous oldest is gone.
+    expect(fs.readFileSync(`${logFile}.3`, 'utf8')).toBe('gen-two');
+    expect(fs.readFileSync(`${logFile}.2`, 'utf8')).toBe('gen-one');
+    expect(fs.statSync(`${logFile}.1`).size).toBe(OVERSIZED);
+  });
+
+  it('rotates mid-session once the running total passes the cap', async () => {
+    // The other rotation trigger: not "the file was already big when we
+    // opened it", but "we have written enough during this session". Without
+    // it a long-lived window grows one file without bound.
+    const log = new Logger(50, false);
+    log.installFileSink(logFile);
+    // Wait for the sink to actually exist on disk. `createWriteStream` opens
+    // asynchronously, and rotation is synchronous `fs` calls — a burst fired
+    // before the open lands finds no file to rename, resets the byte counter
+    // and lets the log sail past the cap. Not reachable in production, where
+    // the sink opens at plugin load and 5 MB takes a while, but it is why
+    // this test has to wait.
+    for (let i = 0; i < 100 && !fs.existsSync(logFile); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // Spaces on purpose. An unbroken 1 MB run of one character matches the
+    // secret-shaped patterns in `redactString` and is rewritten to
+    // `<REDACTED:1048576b>` — 19 bytes — so a naive filler never reaches the
+    // cap at all. Correct redaction; misleading test input.
+    const megabyte = 'a log line that looks like prose '.repeat(32_000);
+    for (let i = 0; i < 6; i++) log.info(megabyte);
+    log.info('after the mid-session rotation');
+    await log.uninstallFileSink();
+
+    expect(fs.existsSync(`${logFile}.1`)).toBe(true);
+    // Logging survived it.
+    expect(readJsonl().map((l) => l.msg)).toContain('after the mid-session rotation');
+  });
+
+  it('does nothing to a log that is still small', async () => {
+    const log = new Logger(50, false);
+    log.installFileSink(logFile);
+    log.info('small');
+    await log.uninstallFileSink();
+
+    expect(fs.existsSync(`${logFile}.1`)).toBe(false);
+  });
+});

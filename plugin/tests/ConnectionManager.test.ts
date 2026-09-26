@@ -79,12 +79,21 @@ describe('ConnectionManager.startRpcSession — daemon-reuse vault-root guard', 
     return new ConnectionManager(makeClient(), {
       locateDaemonBinary: () => '/local/daemon',
       ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose: vi.fn(),
       ...deps,
     });
   }
+  /**
+   * Shaped like a real `RpcConnectionHandle`, `rpc.onClose` included.
+   *
+   * It was missing once, and the omission was not neutral: subscribing to
+   * that is how the manager notices a daemon dying under a healthy SSH
+   * session, and a fake without it cannot tell whether the manager does.
+   */
   function reusedConn(vaultRoot: string | undefined) {
     return {
       info: { version: '0', protocolVersion: 1, capabilities: [], vaultRoot },
+      rpc: { onClose: vi.fn().mockReturnValue(() => { /* unsubscribe */ }) },
       close: vi.fn(),
     };
   }
@@ -96,6 +105,9 @@ describe('ConnectionManager.startRpcSession — daemon-reuse vault-root guard', 
     deployMock.mockResolvedValue({ token: 'tok', remoteSocketPath: 'sock' });
     estRpc.mockResolvedValue({
       info: { version: '0', protocolVersion: 1, capabilities: [], vaultRoot: `${HOME}/work` },
+      // Real handles carry this, and the manager subscribes to it to notice
+      // a daemon dying under a healthy SSH session.
+      rpc: { onClose: vi.fn().mockReturnValue(() => { /* unsubscribe */ }) },
       close: vi.fn(),
     } as never);
   });
@@ -174,6 +186,9 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
     deployMock.mockResolvedValue({ token: 'tok', remoteSocketPath: 'sock' });
     estRpc.mockResolvedValue({
       info: { version: '0', protocolVersion: 1, capabilities: [], vaultRoot: `${HOME}/work` },
+      // Real handles carry this, and the manager subscribes to it to notice
+      // a daemon dying under a healthy SSH session.
+      rpc: { onClose: vi.fn().mockReturnValue(() => { /* unsubscribe */ }) },
       close: vi.fn(),
     } as never);
     tryReuse.mockResolvedValue(null); // always fresh-deploy
@@ -182,7 +197,7 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
   it('downloads via ensureDaemonBinary when no binary is staged, then deploys that path', async () => {
     const downloaded = '/cache/server-bin/obsidian-remote-server-linux-amd64';
     const ensureDaemonBinary = vi.fn().mockResolvedValue(downloaded);
-    const mgr = new ConnectionManager(makeClient(), { locateDaemonBinary: () => null, ensureDaemonBinary });
+    const mgr = new ConnectionManager(makeClient(), { locateDaemonBinary: () => null, ensureDaemonBinary, onRpcClose: vi.fn() });
 
     await mgr.startRpcSession(profile, 'work');
 
@@ -192,7 +207,7 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
 
   it('throws DaemonUnavailableError (→ SFTP downgrade) when neither staged nor downloaded binary exists', async () => {
     const ensureDaemonBinary = vi.fn().mockResolvedValue(null);
-    const mgr = new ConnectionManager(makeClient(), { locateDaemonBinary: () => null, ensureDaemonBinary });
+    const mgr = new ConnectionManager(makeClient(), { locateDaemonBinary: () => null, ensureDaemonBinary, onRpcClose: vi.fn() });
 
     await expect(mgr.startRpcSession(profile, 'work')).rejects.toBeInstanceOf(DaemonUnavailableError);
     expect(deployMock).not.toHaveBeenCalled();
@@ -200,7 +215,7 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
 
   it('does NOT call ensureDaemonBinary when a binary is staged locally (dev build)', async () => {
     const ensureDaemonBinary = vi.fn().mockResolvedValue(null);
-    const mgr = new ConnectionManager(makeClient(), { locateDaemonBinary: () => '/local/daemon', ensureDaemonBinary });
+    const mgr = new ConnectionManager(makeClient(), { locateDaemonBinary: () => '/local/daemon', ensureDaemonBinary, onRpcClose: vi.fn() });
 
     await mgr.startRpcSession(profile, 'work');
 
@@ -211,11 +226,11 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
   it('#406 I-1: a reconnect downgrades to SFTP when the daemon is unavailable (does NOT throw into the retry loop)', async () => {
     const ensureDaemonBinary = vi.fn().mockResolvedValue(null);
     const client = { isAlive: vi.fn().mockReturnValue(true) } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
-    const mgr = new ConnectionManager(client, { locateDaemonBinary: () => null, ensureDaemonBinary });
+    const mgr = new ConnectionManager(client, { locateDaemonBinary: () => null, ensureDaemonBinary, onRpcClose: vi.fn() });
     // reconnectAttempt reads activeProfile; seed an RPC one directly.
     (mgr as unknown as { activeProfile: SshProfile }).activeProfile = { ...profile, transport: 'rpc' } as SshProfile;
     const hooks = {
-      swapClient: vi.fn(),
+      rebind: vi.fn(),
       prepareListenerForReconnect: vi.fn(),
       resumeListenerAfterReconnect: vi.fn(),
     };
@@ -231,6 +246,553 @@ describe('ConnectionManager.startRpcSession — daemon binary fallback (#397)', 
 
     expect(ensureDaemonBinary).toHaveBeenCalledTimes(1);
     expect(mgr.rpcConnection).toBeNull();              // stayed on SFTP
-    expect(hooks.swapClient).toHaveBeenCalledTimes(1); // rebound to the SFTP fs client
+    expect(hooks.rebind).toHaveBeenCalledTimes(1); // rebound to the SFTP fs client AND its prefix
+  });
+});
+
+// ─── startRpcSession: the RPC wire's own death ───────────────────────────────
+// Reconnect is driven off SftpClient's close, which only fires when SSH goes.
+// A daemon killed under a healthy session took the RPC channel with it and
+// nothing noticed: no reconnect, no notice, no log — while every later file
+// operation failed on its own with "stream is closed" and the status bar
+// still said connected.
+
+describe('ConnectionManager — a daemon that dies under a healthy SSH session', () => {
+  const tryReuse = vi.mocked(tryReuseExistingDaemon);
+  const estRpc = vi.mocked(establishRpcConnection);
+  const HOME = '/home/souta';
+  const profile = { id: 'p', name: 'P', remotePath: '~/work' } as unknown as SshProfile;
+
+  function makeClient() {
+    return {
+      getRemoteHome: vi.fn().mockResolvedValue(HOME),
+      openUnixStream: vi.fn().mockResolvedValue({}),
+      isAlive: vi.fn().mockReturnValue(true),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+  }
+
+  /** Captures the handler the manager subscribes with, so we can fire it. */
+  /**
+   * The progress surface the heartbeat reads: silent and idle by default, so a
+   * probe is due. Bytes and call age rather than a pending count — a count
+   * could not tell a big transfer from a save that would never return.
+   */
+  function liveness(over: Record<string, unknown> = {}) {
+    return {
+      msSinceLastByte: () => 10 * 60_000,
+      outboundBacklogBytes: () => 0,
+      oldestPending: () => null,
+      ...over,
+    };
+  }
+
+  function handleWithCapturedCloseHandler() {
+    let fire: ((err?: Error) => void) | undefined;
+    const handle = {
+      info: { version: '0', protocolVersion: 1, capabilities: [], vaultRoot: `${HOME}/work` },
+      rpc: {
+        onClose: vi.fn((h: (err?: Error) => void) => { fire = h; return () => { /* unsub */ }; }),
+      },
+      close: vi.fn(),
+    };
+    return { handle, fire: (err?: Error) => fire?.(err) };
+  }
+
+  beforeEach(() => {
+    tryReuse.mockReset();
+    estRpc.mockReset();
+    deployMock.mockReset();
+    deployMock.mockResolvedValue({ token: 'tok', remoteSocketPath: 'sock' });
+  });
+
+  it('tells its owner when the wire dies on a freshly deployed daemon', async () => {
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+
+    expect(handle.rpc.onClose, 'the manager must subscribe').toHaveBeenCalledTimes(1);
+    fire(new Error('daemon went away'));
+    expect(onRpcClose).toHaveBeenCalledTimes(1);
+    // The owner turns this into what the user is told, so it has to arrive.
+    expect(onRpcClose.mock.calls[0][0]).toMatchObject({ message: 'daemon went away' });
+  });
+
+  it('tells its owner just the same when the daemon was reused', async () => {
+    // The commonest case in a long session — reconnecting to a daemon that
+    // is already up takes an entirely different branch, and watching only
+    // the fresh one would leave this as silent as before.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+
+    expect(deployMock, 'this is the reuse branch').not.toHaveBeenCalled();
+    fire();
+    expect(onRpcClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a heartbeat, and stops it when we disconnect', async () => {
+    // The wire closing is the loud case. The quiet one — a daemon that is
+    // still there as far as TCP is concerned but has stopped answering —
+    // only surfaces if something is asking. And a heartbeat still running
+    // after a disconnect would probe a wire nobody owns any more.
+    vi.useFakeTimers();
+    try {
+      const onRpcClose = vi.fn();
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockResolvedValue({ ok: true });
+      const rpc = {
+        ...handle.rpc,
+        call,
+        ...liveness(),   // long quiet, nothing in flight
+      };
+      const conn = { ...handle, rpc };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose,
+      });
+      await mgr.startRpcSession(profile, 'work');
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(call, 'nothing would ever ask otherwise')
+        .toHaveBeenCalledWith('server.info', {}, expect.any(AbortSignal));
+
+      const before = call.mock.calls.length;
+      await mgr.disconnectTransport();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(call.mock.calls.length, 'a disconnected wire must not be probed').toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('asks the client how busy it is, rather than assuming', async () => {
+    // The manager used to build the heartbeat's view of the connection out of
+    // separate callbacks, and hard-coding one of them to "idle" passed every
+    // other test in this file — the same stub that let an inert heartbeat ship
+    // a release. It now hands over the client itself, so this asserts the
+    // client is what gets asked: a call still within its grace has to suppress
+    // the probe, because the daemon serves one request at a time and a probe
+    // sent mid-transfer queues behind it and times out on our own account.
+    vi.useFakeTimers();
+    try {
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockResolvedValue({ ok: true });
+      const oldestPending = vi.fn().mockReturnValue({ ageMs: 1_000, requestBytes: 4_000_000 });
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          ...liveness({ oldestPending }),   // quiet, but a young big write in flight
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose: vi.fn(),
+      });
+      await mgr.startRpcSession(profile, 'work');
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(oldestPending, 'the manager has to ask the client').toHaveBeenCalled();
+      expect(call, 'work in progress is not silence; do not probe it').not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports the quiet death too, and says what it was', async () => {
+    // Narrow on purpose: that `onDead` reaches the owner carrying its reason.
+    // The progress surface is stubbed here, and stubbing it is what hid the bug
+    // that made `onDead` unreachable at all — the detection itself is pinned
+    // against a real RpcClient in tests/RpcHeartbeat.test.ts, not here.
+    vi.useFakeTimers();
+    try {
+      const onRpcClose = vi.fn();
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockRejectedValue(new Error('no answer'));
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          ...liveness(),   // long quiet, nothing in flight
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const mgr = new ConnectionManager(makeClient(), {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose,
+      });
+      await mgr.startRpcSession(profile, 'work');
+
+      // Three misses at a 10s tick; 60s leaves room without depending on
+      // the exact schedule.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(onRpcClose, 'a daemon that stops answering is a lost connection')
+        .toHaveBeenCalledTimes(1);
+      expect(onRpcClose.mock.calls[0][0]).toMatchObject({
+        message: expect.stringContaining('stopped answering') as unknown as string,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('restarting the daemon is not a lost connection', async () => {
+    // This pins the teardown primitive, not the button: that `restartDaemon`
+    // reaches it is in tests/startReconnect.wiring.test.ts, since `main.ts` is
+    // outside the coverage scope and deleting the call used to be free.
+    //
+    // The button closed the wire from the plugin, where the manager's own
+    // reasoning about who hung up was out of reach, so the user got a toast
+    // saying the connection had dropped for something they had just asked for
+    // — and a reconnect loop racing the restart, two deploys deep.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    handle.close = vi.fn(() => { fire(undefined); });   // a real close is synchronous
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.teardownRpcSession();
+
+    expect(handle.close, 'the wire still has to go down').toHaveBeenCalled();
+    expect(onRpcClose, 'we asked for this; nothing was lost').not.toHaveBeenCalled();
+    expect(mgr.rpcConnection, 'and the dead handle must not be left behind').toBeNull();
+  });
+
+  it('stays quiet when killing the daemon drops the wire from the far end', async () => {
+    // Why the flag spans the whole teardown rather than just our own close:
+    // stopping the daemon takes the far end away, and that close arrives on
+    // its own schedule — before we have closed anything ourselves.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const client = {
+      getRemoteHome: vi.fn().mockResolvedValue(HOME),
+      openUnixStream: vi.fn().mockResolvedValue({}),
+      isAlive: vi.fn().mockReturnValue(true),
+    } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+    const mgr = new ConnectionManager(client, {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+
+    const stop = vi.fn(async () => { fire(new Error('daemon exited')); });
+    mgr.daemonDeployer = { stop } as never;
+    await mgr.teardownRpcSession();
+
+    expect(stop, 'the daemon has to be stopped for this to mean anything')
+      .toHaveBeenCalled();
+    expect(onRpcClose, 'we killed it; that is not a death').not.toHaveBeenCalled();
+  });
+
+  it('stops watching, and lets the deployer go', async () => {
+    // Deleting either `stopHeartbeat()` or `daemonDeployer = null` from the
+    // teardown passed the whole suite. The heartbeat is the one that bites: if
+    // `startRpcSession` then throws — a missing binary, a failed handshake,
+    // neither unlikely right after a restart — the orphan keeps probing a
+    // closed client, every probe rejects, and it reports the session lost.
+    vi.useFakeTimers();
+    try {
+      const { handle } = handleWithCapturedCloseHandler();
+      const call = vi.fn().mockResolvedValue({ ok: true });
+      const conn = {
+        ...handle,
+        rpc: {
+          ...handle.rpc,
+          call,
+          ...liveness(),
+        },
+      };
+      tryReuse.mockResolvedValue(null);
+      estRpc.mockResolvedValue(conn as never);
+
+      const client = {
+        getRemoteHome: vi.fn().mockResolvedValue(HOME),
+        openUnixStream: vi.fn().mockResolvedValue({}),
+        isAlive: vi.fn().mockReturnValue(true),
+      } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+      const mgr = new ConnectionManager(client, {
+        locateDaemonBinary: () => '/local/daemon',
+        ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+        onRpcClose: vi.fn(),
+      });
+      await mgr.startRpcSession(profile, 'work');
+      mgr.daemonDeployer = { stop: vi.fn().mockResolvedValue(undefined) } as never;
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      const before = call.mock.calls.length;
+      expect(before, 'it has to be probing for this to mean anything').toBeGreaterThan(0);
+
+      await mgr.teardownRpcSession();
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(call.mock.calls.length, 'a torn-down session must not be probed').toBe(before);
+      expect(mgr.daemonDeployer, 'and the deployer must not outlive the teardown').toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a close that arrives after we let the wire go', async () => {
+    // The case a boolean flag could not cover. Killing the daemon drops the
+    // wire from the far end, and that close lands on its own schedule —
+    // possibly after the teardown has returned. Ownership has to be a fact
+    // about which wire we hold, not a window in time.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.teardownRpcSession();
+
+    fire(new Error('daemon exited'));   // the far end, late
+
+    expect(onRpcClose, 'we let that wire go; its death is not news')
+      .not.toHaveBeenCalled();
+  });
+
+  it('a late close from a retired wire does not disarm the new session', async () => {
+    // `stopHeartbeat()` in the close handler acts on `this.heartbeat`, which
+    // after a restart is the NEW session's. A retired handle reaching it
+    // would leave the restarted session with no liveness watch for the rest
+    // of its life, and nothing would say so.
+    const onRpcClose = vi.fn();
+    const first = handleWithCapturedCloseHandler();
+    const second = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValueOnce(first.handle as never)
+      .mockResolvedValueOnce(second.handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.teardownRpcSession();
+    await mgr.startRpcSession(profile, 'work');
+
+    const watch = () => (mgr as unknown as { heartbeat: unknown }).heartbeat;
+    expect(watch(), 'the replacement session must be watched').not.toBeNull();
+
+    first.fire(new Error('the old daemon finally noticed'));
+
+    expect(watch(), 'and a retired wire must not disarm it').not.toBeNull();
+    expect(onRpcClose).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet when WE are the ones hanging up', async () => {
+    // Otherwise a manual Disconnect, and every pass of the reconnect loop,
+    // would each kick off a reconnect of their own.
+    const onRpcClose = vi.fn();
+    const { handle } = handleWithCapturedCloseHandler();
+    handle.close = vi.fn(() => {
+      // A real close reaches the same handler, synchronously — that is the
+      // point of the framing fix this guards.
+      handle.rpc.onClose.mock.calls[0][0](undefined);
+    });
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.disconnectTransport();
+
+    expect(handle.close).toHaveBeenCalled();
+    expect(onRpcClose, 'our own disconnect is not a lost connection').not.toHaveBeenCalled();
+  });
+});
+
+// ─── the reconnect lifecycle ─────────────────────────────────────────────────
+//
+// `startReconnect` and `cancelReconnect` are reached only from `main.ts`,
+// which is excluded from coverage — so measured across BOTH suites, neither
+// had ever run — `main.ts` calls one of them from one place and the other
+// from two, so nothing here was reached by driving the plugin either.
+
+describe('ConnectionManager — starting and cancelling a reconnect', () => {
+  const profile = { id: 'p', name: 'P', remotePath: '~/work' } as unknown as SshProfile;
+
+  function aliveClient() {
+    return {
+      getRemoteHome: vi.fn().mockResolvedValue('/home/souta'),
+      openUnixStream: vi.fn().mockResolvedValue({}),
+      isAlive: () => true,
+      connect: vi.fn(),
+    } as unknown as ConstructorParameters<typeof ConnectionManager>[0];
+  }
+
+  function reconnectable(withProfile = true) {
+    const mgr = new ConnectionManager(aliveClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose: vi.fn(),
+    });
+    if (withProfile) (mgr as unknown as { activeProfile: unknown }).activeProfile = profile;
+    return mgr;
+  }
+
+  function opts(over: Record<string, unknown> = {}) {
+    return {
+      maxRetries: 3,
+      setAdapterReconnecting: vi.fn(),
+      onState: vi.fn(),
+      hooks: {
+        rebind: vi.fn(),
+        prepareListenerForReconnect: vi.fn(),
+        resumeListenerAfterReconnect: vi.fn().mockResolvedValue(undefined),
+      },
+      ...over,
+    } as unknown as Parameters<ConnectionManager['startReconnect']>[0];
+  }
+
+  it('does not start without a profile to reconnect to', async () => {
+    const mgr = reconnectable(false);
+    const o = opts();
+
+    await mgr.startReconnect(o);
+
+    expect(o.setAdapterReconnecting).not.toHaveBeenCalled();
+  });
+
+  it('respects the user turning auto-reconnect off', async () => {
+    // reconnectMaxRetries <= 0 is the setting for "leave it to me".
+    const mgr = reconnectable();
+    const o = opts({ maxRetries: 0 });
+
+    await mgr.startReconnect(o);
+
+    expect(o.setAdapterReconnecting).not.toHaveBeenCalled();
+  });
+
+  it('tells the adapter it is reconnecting before the loop runs', async () => {
+    // This is what parks a read instead of failing it — without it, every
+    // in-flight read during a drop surfaces as an error to the user.
+    const mgr = reconnectable();
+    const o = opts({ maxRetries: 1 });
+
+    await mgr.startReconnect(o);
+
+    expect(o.setAdapterReconnecting).toHaveBeenCalledWith(true);
+  });
+
+  it('ignores a second start while a loop is already running', async () => {
+    // `main.ts` fires this from two places; two loops would race each other
+    // through the same transport.
+    const mgr = reconnectable();
+    let release!: () => void;
+    const hung = new Promise<void>((r) => { release = r; });
+    const o = opts({
+      hooks: {
+        rebind: vi.fn(),
+        prepareListenerForReconnect: () => hung,   // never settles until released
+        resumeListenerAfterReconnect: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const first = mgr.startReconnect(o);
+    await Promise.resolve();
+
+    await mgr.startReconnect(o);   // returns at once
+
+    expect(o.setAdapterReconnecting).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+  });
+
+  it('reports liveness from the underlying client, not its own guesswork', () => {
+    // `main.ts` gates the Reconnect command on this; a stale local flag would
+    // either hide the command when it is needed or offer it when it is not.
+    const client = aliveClient() as unknown as { isAlive: () => boolean };
+    const mgr = new ConnectionManager(client as never, {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose: vi.fn(),
+    });
+    expect(mgr.isAlive()).toBe(true);
+
+    client.isAlive = () => false;
+    expect(mgr.isAlive()).toBe(false);
+  });
+
+  it('cancelling when nothing is running is harmless', () => {
+    // `main.ts` calls this on every disconnect, reconnect and unload.
+    const mgr = reconnectable();
+
+    expect(() => mgr.cancelReconnect()).not.toThrow();
+  });
+
+  it('cancelling clears the loop so the next one can start', async () => {
+    const mgr = reconnectable();
+    let release!: () => void;
+    const hung = new Promise<void>((r) => { release = r; });
+    const o = opts({
+      hooks: {
+        rebind: vi.fn(),
+        prepareListenerForReconnect: () => hung,
+        resumeListenerAfterReconnect: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+    const first = mgr.startReconnect(o);
+    void first.catch(() => { /* the cancelled loop's fate is not this test's */ });
+    await Promise.resolve();
+
+    mgr.cancelReconnect();
+
+    // Deliberately not awaiting the cancelled loop: the claim is that
+    // cancelling CLEARS the registration, so the next start is not blocked
+    // by it — not that the in-flight attempt unwinds promptly.
+    const second = opts({ maxRetries: 1 });
+    await mgr.startReconnect(second);
+    expect(second.setAdapterReconnecting).toHaveBeenCalledWith(true);
+    release();
   });
 });

@@ -7,37 +7,30 @@ import { AuthResolver } from './AuthResolver';
 import { CertificateAgent, canSpeakToAgent } from './CertificateAgent';
 import { enableCertificateAuth } from './certificateAuth';
 import { HostKeyStore, type HostKeyMismatchHandler } from './HostKeyStore';
-import { createJumpTunnel } from './JumpHostTunnel';
-import { createProxyCommandTunnel } from './ProxyCommandTunnel';
+import { selectTransport } from './Transport';
 import { logger } from '../util/logger';
 import { asError, errorMessage } from '../util/errorMessage';
 
-export type CloseListener = (info: { unexpected: boolean }) => void;
+export type CloseListener = (info: {
+  unexpected: boolean;
+  /** What ssh2 said went wrong; see {@link wireConnectionLifecycle}. */
+  reason?: Error;
+}) => void;
 
 /**
- * Async callback invoked when the SSH server asks for a
- * `keyboard-interactive` round (TOTP / RSA SecurID / PAM PIN, etc.).
- * Receives the server's per-prompt challenge list and resolves with
- * one response per prompt in the same order. Returning `null` is
- * treated as cancel — `SftpClient` forwards `[]` to ssh2's `finish`
- * callback, which fails the auth round cleanly.
+ * Answers a `keyboard-interactive` round (TOTP, PAM PIN, …): one response per
+ * prompt, in order. `null` is a cancel and fails the round cleanly.
  *
- * Wired only by the plugin's UI layer (`main.ts` constructs the
- * callback as `prompts => new KbdInteractiveModal(app, prompts).prompt()`).
- * Integration tests and the rest of the codebase that doesn't need
- * an interactive prompt simply pass nothing — `tryKeyboard` stays
- * off and ssh2 behaves exactly as before.
+ * Only the UI layer wires it. Callers that pass nothing leave `tryKeyboard`
+ * off entirely.
  */
 export type KbdInteractiveHandlerFn = (
   prompts: Array<{ prompt: string; echo: boolean }>,
 ) => Promise<string[] | null>;
 
 /**
- * String encoding accepted by Buffer / NodeJS.Buffer's `toString` /
- * `Buffer.from(..., enc)`. Re-declared here as a local alias so this
- * file does not depend on the ambient `BufferEncoding` global from
- * `@types/node`, which trips ESLint's `no-undef` in the ObsidianReviewBot
- * environment.
+ * A local alias rather than the ambient `BufferEncoding`, which trips
+ * ESLint's `no-undef` in the ObsidianReviewBot environment.
  */
 type SftpEncoding =
   | 'ascii' | 'utf8' | 'utf-8' | 'utf16le' | 'utf-16le'
@@ -51,11 +44,64 @@ export interface RemoteEntryWithRel extends RemoteEntry {
 }
 
 /**
- * Single-connection SFTP wrapper used by the data adapter and by
- * higher-level features (watch poller, resource bridge). Atomic writes
- * are implemented via tmp+rename. The OpenSSH posix-rename extension is
- * preferred when the server advertises it.
+ * Attach the `error` and `close` handlers a live session needs, and carry
+ * the reason from one to the other.
+ *
+ * Exported for the same reason `wireKeyboardInteractiveHandler` is: it lives
+ * inside `connect()`, which needs a real server, so the only way to hold it
+ * to anything is to lift it out. The behaviour here was shipped untested and
+ * it showed — every post-handshake failure used to be discarded, because the
+ * `error` handler's whole job was to reject the connect promise and
+ * rejecting a settled promise is a silent no-op.
+ *
+ * `onError` still rejects that promise (harmless after it settles); what
+ * matters is that the error is also remembered, so the `close` that follows
+ * can say what happened instead of logging one contentless line.
  */
+export function wireConnectionLifecycle(
+  client: {
+    on(event: 'error', listener: (err: unknown) => void): unknown;
+    on(event: 'close', listener: () => void): unknown;
+  },
+  opts: {
+    /** For the log line only. */
+    host: string;
+    /** Called for every `error`, including ones after the connect settled. */
+    onError: (err: Error) => void;
+    /** Whether this client is still the one the owner is using. */
+    isCurrent: () => boolean;
+    /** Drop the owner's references to this client. */
+    onTeardown: () => void;
+    /** Whether the owner asked for this disconnect. */
+    wasIntentional: () => boolean;
+    notify: (info: { unexpected: boolean; reason?: Error }) => void;
+  },
+): void {
+  // ssh2 keeps using `error` for the whole session — keepalive timeouts,
+  // ECONNRESET, protocol failures — long after the connect promise it was
+  // written for has settled. Whatever it last said is the only account of
+  // why the session ended.
+  let lastError: Error | null = null;
+
+  client.on('error', (err: unknown) => {
+    lastError = err instanceof Error ? err : new Error(String(err));
+    opts.onError(lastError);
+  });
+
+  client.on('close', () => {
+    const wasAlive = opts.isCurrent();
+    opts.onTeardown();
+    if (!wasAlive) return;
+
+    const reason: Error | undefined = lastError ?? undefined;
+    logger.warn(
+      `SftpClient: connection closed (${opts.host})` +
+      (reason ? `: ${errorMessage(reason)}` : ''),
+    );
+    opts.notify({ unexpected: !opts.wasIntentional(), reason });
+  });
+}
+
 /**
  * Wire a keyboard-interactive handler onto an EventEmitter-shaped client.
  * Extracted from `SftpClient.connect` so the normalisation, forwarding,
@@ -103,6 +149,12 @@ export function wireKeyboardInteractiveHandler(
   });
 }
 
+/**
+ * Single-connection SFTP wrapper used by the data adapter and by
+ * higher-level features (watch poller, resource bridge). Atomic writes
+ * are implemented via tmp+rename. The OpenSSH posix-rename extension is
+ * preferred when the server advertises it.
+ */
 export class SftpClient {
   private client: Client | null = null;
   private sftp: SFTPWrapper | null = null;
@@ -114,22 +166,12 @@ export class SftpClient {
   constructor(
     private authResolver: AuthResolver,
     private hostKeyStore: HostKeyStore,
-    /**
-     * Optional. When supplied, `connect()` enables ssh2's
-     * `tryKeyboard` and forwards keyboard-interactive challenges to
-     * this callback (typically a Modal in the UI). Omitted by the
-     * integration test fixtures and any non-UI caller, so existing
-     * 2-arg constructions stay valid.
-     */
+    /** Enables ssh2's `tryKeyboard` and forwards the challenges here. */
     private kbdInteractiveHandler?: KbdInteractiveHandlerFn,
     /**
-     * Optional. When supplied, `connect()` uses ssh2's async
-     * `HostVerifier` overload and forwards a fingerprint mismatch to
-     * this callback so the user can choose to trust the new key (=
-     * `'trust'` → forget old + re-pin via TOFU) or refuse the
-     * handshake (= `'abort'` → connect rejects). Omitted by tests
-     * and non-UI callers, in which case mismatch falls back to the
-     * existing fail-closed sync `verify()` path.
+     * Switches to ssh2's async `HostVerifier` so a fingerprint change can be
+     * answered `'trust'` (re-pin) or `'abort'` (reject the handshake).
+     * Without it, a mismatch fails closed.
      */
     private hostKeyMismatchHandler?: HostKeyMismatchHandler,
   ) {}
@@ -159,36 +201,17 @@ export class SftpClient {
     logger.info(`SftpClient: connecting to ${profile.host}:${profile.port} as ${profile.username}`);
 
     const authConfig = this.authResolver.buildAuthConfig(profile);
+    // `null` means direct: ssh2 opens its own socket. Anything else is a
+    // route with a contract — see `Transport`.
+    const transport = selectTransport(profile, {
+      authResolver:           this.authResolver,
+      hostKeyStore:           this.hostKeyStore,
+      hostKeyMismatchHandler: this.hostKeyMismatchHandler,
+    });
     let sock: Duplex | undefined;
-    if (profile.jumpHost) {
-      logger.info(`SftpClient: opening jump tunnel via ${profile.jumpHost.host}`);
-      // Share the host-key store + connect timings between the jump
-      // and target so a compromised bastion is caught the same way
-      // as a compromised target, and the jump session tears down
-      // around the same time the target idle-keepalive does.
-      sock = await createJumpTunnel(
-        profile.jumpHost,
-        profile.host,
-        profile.port,
-        this.authResolver,
-        {
-          hostKeyStore:           this.hostKeyStore,
-          // Pass the same mismatch handler we use for the target
-          // host so a jump-host fingerprint change also surfaces the
-          // recovery modal instead of failing with a generic "Jump
-          // host connect failed" error (#132 follow-up).
-          hostKeyMismatchHandler: this.hostKeyMismatchHandler,
-          connectTimeoutMs:       profile.connectTimeoutMs,
-          keepaliveIntervalMs:    profile.keepaliveIntervalMs,
-        },
-      );
-    } else if (profile.proxyCommand) {
-      // ProxyCommand transport (#430): run the command (e.g.
-      // `cloudflared access ssh --hostname %h`) and hand ssh2 its
-      // stdio as the `sock`. Mutually exclusive with jumpHost; if both
-      // are somehow set, the bastion jump above wins (it already ran).
-      logger.info(`SftpClient: opening ProxyCommand transport for ${profile.host}`);
-      sock = createProxyCommandTunnel(profile.proxyCommand, {
+    if (transport) {
+      logger.info(`SftpClient: opening ${transport.name} for ${profile.host}`);
+      sock = await transport.open({
         host: profile.host,
         port: profile.port,
         user: profile.username,
@@ -215,23 +238,25 @@ export class SftpClient {
         resolve();
       });
 
-      client.on('error', err => {
-        window.clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      });
-
-      client.on('close', () => {
-        const wasAlive = this.client === client;
-        this.client = null;
-        this.sftp = null;
-        this.remoteHome = null;
-        if (wasAlive) {
-          logger.warn(`SftpClient: connection closed (${profile.host})`);
-          const unexpected = !this.intentionalDisconnect;
+      wireConnectionLifecycle(client, {
+        host: profile.host,
+        onError: (err) => {
+          window.clearTimeout(timer);
+          reject(err);
+        },
+        isCurrent: () => this.client === client,
+        onTeardown: () => {
+          this.client = null;
+          this.sftp = null;
+          this.remoteHome = null;
+        },
+        wasIntentional: () => this.intentionalDisconnect,
+        notify: (info) => {
           for (const cb of [...this.closeListeners]) {
-            try { cb({ unexpected }); } catch (e) { logger.warn(`onClose listener threw: ${errorMessage(e)}`); }
+            try { cb(info); }
+            catch (e) { logger.warn(`onClose listener threw: ${errorMessage(e)}`); }
           }
-        }
+        },
       });
 
       // keyboard-interactive (TOTP / SecurID / Duo Push / PAM PIN).
@@ -308,13 +333,9 @@ export class SftpClient {
   }
 
   /**
-   * Forward a local Duplex to a unix-domain socket on the remote host.
-   *
-   * Used by the α transport to reach `obsidian-remote-server`'s
-   * listening socket (e.g. `~/.obsidian-remote/server.sock`) through
-   * the same SSH connection that already carries the SFTP channel.
-   * Requires OpenSSH's `direct-streamlocal@openssh.com` extension,
-   * which every mainstream sshd has shipped since OpenSSH 6.7.
+   * Reach the daemon's unix socket through the same SSH connection that
+   * already carries SFTP. Needs `direct-streamlocal@openssh.com`, shipped by
+   * every mainstream sshd since OpenSSH 6.7.
    */
   async openUnixStream(socketPath: string): Promise<Duplex> {
     const client = this.requireClient();
@@ -353,20 +374,13 @@ export class SftpClient {
   }
 
   /**
-   * Open an interactive shell channel (PTY-backed) on the same SSH
-   * connection that already carries SFTP / RPC. The returned
-   * `ClientChannel` is a Duplex — write keystrokes in, read terminal
-   * output out — plus `setWindow(rows, cols, h, w)` for live resize.
+   * A PTY-backed shell on the same connection as SFTP. The channel is a
+   * Duplex — keystrokes in, output out — with `setWindow` for live resize.
+   * `cmd` runs a specific program instead of the login shell.
    *
-   * `cmd` is optional; when supplied, ssh2 uses `exec` on the channel
-   * with the PTY attached so the user can launch a specific shell or
-   * program (e.g. `/usr/bin/zsh -l`). When omitted, the remote opens
-   * the user's default login shell.
-   *
-   * Errors propagate via Promise rejection. The most common one in
-   * the wild is `Channel open failure: administratively prohibited`,
-   * which means the remote sshd has `PermitTTY no` — surface as a
-   * notice telling the user to flip it on.
+   * The common failure in the wild is `Channel open failure: administratively
+   * prohibited`, which means the sshd has `PermitTTY no`; say so rather than
+   * showing the raw message.
    */
   async openShell(opts: {
     rows: number;
@@ -432,17 +446,12 @@ export class SftpClient {
   }
 
   /**
-   * Resolve and cache the remote `$HOME` for the active connection.
+   * Resolve and cache the remote `$HOME`.
    *
-   * Needed because OpenSSH unix-socket forwarding (direct-streamlocal)
-   * does not chdir on the sshd side: a relative socket path passed to
-   * `openssh_forwardOutStreamLocal` is resolved against `/`, not the
-   * user's home, so callers that want "home-relative" paths must
-   * absolutise them client-side.
-   *
-   * The shape of `$HOME` is environment-dependent (`/home/<user>`,
-   * `/Users/<user>`, custom container paths, shell-overridden, etc.) —
-   * never assume; always ask the actual remote.
+   * Unix-socket forwarding does not chdir on the sshd side: a relative socket
+   * path resolves against `/`, not the user's home, so home-relative paths
+   * must be absolutised client-side. `$HOME` varies by platform and can be
+   * overridden, so it is asked for rather than assumed.
    */
   async getRemoteHome(): Promise<string> {
     if (this.remoteHome) return this.remoteHome;
@@ -597,12 +606,10 @@ export class SftpClient {
   /**
    * Create the directory, treating "already exists" as success.
    *
-   * OpenSSH's SFTP server reports an existing directory as
-   * SSH_FX_FAILURE with the opaque message "Failure", so a substring
-   * match on "exist" misses it. Stat-then-mkdir avoids the ambiguity:
-   * if a directory is already there we are done; if a non-directory
-   * is in the way we surface the conflict; otherwise we mkdir and let
-   * a real SFTP error bubble up.
+   * OpenSSH reports an existing directory as SSH_FX_FAILURE with the opaque
+   * message "Failure", so matching on "exist" misses it. Stat first: a
+   * directory means done, a non-directory is a real conflict, anything else
+   * goes to mkdir.
    */
   async mkdir(remotePath: string): Promise<void> {
     const sftp = this.requireSftp();

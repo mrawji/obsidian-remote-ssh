@@ -3,8 +3,19 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ShadowVaultBootstrap } from '../../src/shadow/ShadowVaultBootstrap';
+import {
+  pullSharedObsidianConfig,
+  pushSharedObsidianConfig,
+} from '../../src/shadow/SharedObsidianConfigSync';
+import {
+  pullCommunityPlugins,
+  pushCommunityPlugins,
+  pullPluginBinaries,
+  pushPluginBinaries,
+} from '../../src/shadow/CommunityPluginsSync';
 import { ObsidianRegistry } from '../../src/shadow/ObsidianRegistry';
 import { setupClientPair, TEST_PRIVATE_KEY, type TestClient } from './helpers/makeAdapter';
+import { TEST_USER, targetConnection } from '../../test-env/target';
 import type { SshProfile } from '../../src/types';
 
 /**
@@ -71,7 +82,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     return {
       id: `cfg-${caseId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       name: `Config consistency (${caseId})`,
-      host: '127.0.0.1', port: 2222, username: 'tester',
+      ...targetConnection(), username: TEST_USER,
       authMethod: 'privateKey', privateKeyPath: TEST_PRIVATE_KEY,
       remotePath: remoteClient.vaultRoot,
       connectTimeoutMs: 10_000, keepaliveIntervalMs: 0, keepaliveCountMax: 0,
@@ -86,7 +97,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
 
     const profile = profileFor('cp-pull');
     const { layout } = await freshSession().bootstrap(profile, [profile]);
-    await ShadowVaultBootstrap.pullCommunityPlugins(remoteClient.adapter, REMOTE_CFG, layout.configDir);
+    await pullCommunityPlugins(remoteClient.adapter, REMOTE_CFG, layout.configDir);
 
     expect(readLocalCp(layout.configDir)).toEqual(expect.arrayContaining(['dataview', 'remote-ssh']));
   });
@@ -100,12 +111,12 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     const s1 = await freshSession().bootstrap(p1, [p1]);
     fs.writeFileSync(path.join(s1.layout.configDir, 'community-plugins.json'),
       JSON.stringify(['remote-ssh', 'templater']));
-    await ShadowVaultBootstrap.pushCommunityPlugins(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
+    await pushCommunityPlugins(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
 
     // Session 2: a brand-new shadow (different id → different local dir) pulls.
     const p2 = profileFor('cycle-2');
     const s2 = await freshSession().bootstrap(p2, [p2]);
-    await ShadowVaultBootstrap.pullCommunityPlugins(remoteClient.adapter, REMOTE_CFG, s2.layout.configDir);
+    await pullCommunityPlugins(remoteClient.adapter, REMOTE_CFG, s2.layout.configDir);
 
     expect(readLocalCp(s2.layout.configDir), 'templater enabled in session 1 must survive into session 2')
       .toContain('templater');
@@ -120,7 +131,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     const sA = await freshSession().bootstrap(pA, [pA]);
     fs.writeFileSync(path.join(sA.layout.configDir, 'community-plugins.json'),
       JSON.stringify(['remote-ssh', 'templater']));
-    await ShadowVaultBootstrap.pushCommunityPlugins(remoteClient.adapter, REMOTE_CFG, sA.layout.configDir);
+    await pushCommunityPlugins(remoteClient.adapter, REMOTE_CFG, sA.layout.configDir);
 
     const remoteAfter = JSON.parse(await remoteClient.adapter.read(CP));
     expect(remoteAfter, 'remote dataview + obsidian-git must survive a push from a minimal local')
@@ -132,12 +143,12 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     await remoteClient.adapter.write(APP, JSON.stringify({ useMarkdownLinks: false, theme: 'obsidian' }));
     const p1 = profileFor('app-1');
     const s1 = await freshSession().bootstrap(p1, [p1]);
-    await ShadowVaultBootstrap.pullSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
+    await pullSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
 
     // User changes a setting in the shadow, then it's pushed back.
     const changed = { useMarkdownLinks: true, theme: 'things' };
     fs.writeFileSync(path.join(s1.layout.configDir, 'app.json'), JSON.stringify(changed));
-    await ShadowVaultBootstrap.pushSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
+    await pushSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
 
     // The test holds a snapshot of the intended state.
     const snapshot = JSON.parse(fs.readFileSync(path.join(s1.layout.configDir, 'app.json'), 'utf-8'));
@@ -145,7 +156,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     // Session 2: a fresh shadow pulls — must equal the snapshot.
     const p2 = profileFor('app-2');
     const s2 = await freshSession().bootstrap(p2, [p2]);
-    await ShadowVaultBootstrap.pullSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s2.layout.configDir);
+    await pullSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s2.layout.configDir);
 
     const local2 = JSON.parse(fs.readFileSync(path.join(s2.layout.configDir, 'app.json'), 'utf-8'));
     expect(local2, 'the setting changed in session 1 must be consistent in session 2').toEqual(snapshot);
@@ -159,7 +170,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
 
     const profile = profileFor('bin-pull');
     const { layout } = await freshSession().bootstrap(profile, [profile]);
-    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(
+    const { pulled } = await pullPluginBinaries(
       remoteClient.adapter, REMOTE_CFG, layout.configDir, [id]);
 
     expect(pulled).toContain(id);
@@ -178,12 +189,12 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
     fs.writeFileSync(path.join(dirA, 'manifest.json'),
       JSON.stringify({ id, version: '2.0.0', name: 'LocalOnly', minAppVersion: '1.5.0' }));
     fs.writeFileSync(path.join(dirA, 'main.js'), '/* local-only code v2 */\n');
-    await ShadowVaultBootstrap.pushPluginBinaries(remoteClient.adapter, REMOTE_CFG, sA.layout.configDir, [id]);
+    await pushPluginBinaries(remoteClient.adapter, REMOTE_CFG, sA.layout.configDir, [id]);
 
     // Session 2 (machine B): a fresh shadow pulls the pushed binary.
     const pB = profileFor('bin-push-2');
     const sB = await freshSession().bootstrap(pB, [pB]);
-    await ShadowVaultBootstrap.pullPluginBinaries(remoteClient.adapter, REMOTE_CFG, sB.layout.configDir, [id]);
+    await pullPluginBinaries(remoteClient.adapter, REMOTE_CFG, sB.layout.configDir, [id]);
 
     expect(fs.readFileSync(path.join(sB.layout.configDir, 'plugins', id, 'main.js'), 'utf-8'),
       'a sideloaded plugin installed in session 1 must reach session 2')
@@ -206,7 +217,7 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
       JSON.stringify({ id, version: '2.0.0', name: 'Conflict', minAppVersion: '1.5.0' }));
     fs.writeFileSync(path.join(dir, 'main.js'), '/* LOCAL v2 */\n');
 
-    await ShadowVaultBootstrap.pullPluginBinaries(remoteClient.adapter, REMOTE_CFG, layout.configDir, [id]);
+    await pullPluginBinaries(remoteClient.adapter, REMOTE_CFG, layout.configDir, [id]);
 
     expect(fs.readFileSync(path.join(dir, 'main.js'), 'utf-8'), 'older remote must not downgrade newer local')
       .toBe('/* LOCAL v2 */\n');
