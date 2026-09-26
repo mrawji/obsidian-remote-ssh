@@ -469,6 +469,60 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
     expect(onRpcClose, 'we killed it; that is not a death').not.toHaveBeenCalled();
   });
 
+  it('ignores a close that arrives after we let the wire go', async () => {
+    // The case a boolean flag could not cover. Killing the daemon drops the
+    // wire from the far end, and that close lands on its own schedule —
+    // possibly after the teardown has returned. Ownership has to be a fact
+    // about which wire we hold, not a window in time.
+    const onRpcClose = vi.fn();
+    const { handle, fire } = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValue(handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.teardownRpcSession();
+
+    fire(new Error('daemon exited'));   // the far end, late
+
+    expect(onRpcClose, 'we let that wire go; its death is not news')
+      .not.toHaveBeenCalled();
+  });
+
+  it('a late close from a retired wire does not disarm the new session', async () => {
+    // `stopHeartbeat()` in the close handler acts on `this.heartbeat`, which
+    // after a restart is the NEW session's. A retired handle reaching it
+    // would leave the restarted session with no liveness watch for the rest
+    // of its life, and nothing would say so.
+    const onRpcClose = vi.fn();
+    const first = handleWithCapturedCloseHandler();
+    const second = handleWithCapturedCloseHandler();
+    tryReuse.mockResolvedValue(null);
+    estRpc.mockResolvedValueOnce(first.handle as never)
+      .mockResolvedValueOnce(second.handle as never);
+
+    const mgr = new ConnectionManager(makeClient(), {
+      locateDaemonBinary: () => '/local/daemon',
+      ensureDaemonBinary: vi.fn().mockResolvedValue(null),
+      onRpcClose,
+    });
+    await mgr.startRpcSession(profile, 'work');
+    await mgr.teardownRpcSession();
+    await mgr.startRpcSession(profile, 'work');
+
+    const watch = () => (mgr as unknown as { heartbeat: unknown }).heartbeat;
+    expect(watch(), 'the replacement session must be watched').not.toBeNull();
+
+    first.fire(new Error('the old daemon finally noticed'));
+
+    expect(watch(), 'and a retired wire must not disarm it').not.toBeNull();
+    expect(onRpcClose).not.toHaveBeenCalled();
+  });
+
   it('stays quiet when WE are the ones hanging up', async () => {
     // Otherwise a manual Disconnect, and every pass of the reconnect loop,
     // would each kick off a reconnect of their own.

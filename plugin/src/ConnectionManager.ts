@@ -85,24 +85,17 @@ export class ConnectionManager {
   private _rpcConnection: RpcConnectionHandle | null = null;
 
   /**
-   * Read-only on purpose. Closing the wire has to go through this class, so
-   * the close handler can tell a deliberate teardown from a death.
+   * Read-only on purpose: closing the wire goes through this class, which is
+   * what lets the close handler tell a teardown from a death by comparing
+   * against this field.
    *
-   * `restartDaemon` used to close it directly from the plugin, where the
-   * `closingRpcIntentionally` flag is out of reach. The result was a toast
-   * saying the connection had been lost for a button the user had just
-   * pressed, and a reconnect racing the restart — two `ServerDeployer.deploy`
-   * passes, each with `killExisting`, against the same socket and token.
+   * `restartDaemon` used to close it directly from the plugin. The result was
+   * a toast saying the connection had been lost for a button the user had
+   * just pressed, and a reconnect racing the restart — two
+   * `ServerDeployer.deploy` passes, each with `killExisting`, against the
+   * same socket and token.
    */
   get rpcConnection(): RpcConnectionHandle | null { return this._rpcConnection; }
-
-  /**
-   * Set while we are the ones closing the RPC wire, so the close handler in
-   * {@link watchRpcWire} can tell "we hung up" from "it died". Mirrors `SftpClient`'s
-   * `intentionalDisconnect`; without it, every manual disconnect and every
-   * reconnect pass would kick off a reconnect of its own.
-   */
-  private closingRpcIntentionally = false;
 
   /** Watches for a daemon that stops answering without the wire dropping. */
   private heartbeat: RpcHeartbeat | null = null;
@@ -235,11 +228,22 @@ export class ConnectionManager {
    * a daemon that is already up, as silent as before.
    */
   private watchRpcWire(): void {
-    const conn = this.rpcConnection;
+    const conn = this._rpcConnection;
     if (!conn) return;
 
     conn.rpc.onClose((err) => {
-      if (this.closingRpcIntentionally) return;
+      // Identity, not a flag. This handler belongs to `conn`; if the manager
+      // has moved on, the close is either one we asked for or one for a wire
+      // nobody owns any more, and either way it is not news.
+      //
+      // A boolean could only cover a close arriving in the same turn as our
+      // own `close()` call, and that held solely because `FramedDuplex.close()`
+      // emits synchronously — a fact three modules away. Killing the daemon
+      // drops the wire from the far end on its own schedule, so that close
+      // landed after the flag was already down: a toast saying the connection
+      // was lost, a reconnect racing the restart, and `stopHeartbeat()` here
+      // killing the heartbeat of the session that had just replaced this one.
+      if (this._rpcConnection !== conn) return;
       logger.warn(`RPC wire closed unexpectedly${err ? `: ${errorMessage(err)}` : ''}`);
       this.stopHeartbeat();
       this.deps.onRpcClose(err);
@@ -256,7 +260,8 @@ export class ConnectionManager {
       msSinceLastMessage: () => conn.rpc.msSinceLastMessage(),
       pendingCount: () => conn.rpc.pendingCount(),
       onDead: (reason) => {
-        if (this.closingRpcIntentionally) return;
+        // Same reasoning as the close handler above.
+        if (this._rpcConnection !== conn) return;
         logger.warn(`RPC heartbeat: ${reason.message}`);
         this.deps.onRpcClose(reason);
       },
@@ -270,49 +275,42 @@ export class ConnectionManager {
   }
 
   /**
-   * Drop the wire without the close handler reading it as a death.
+   * Drop the wire deliberately.
    *
-   * Every deliberate teardown goes through here or through
-   * {@link teardownRpcSession}; the flag is what separates the two cases, and
-   * it is private so that cannot be got wrong from outside.
+   * Releasing the field BEFORE closing is the whole trick: the close handler
+   * compares identity, so once we have let go it does not matter whether the
+   * close lands this turn or three ticks from now.
    */
   private closeRpcIntentionally(): void {
-    if (!this._rpcConnection) return;
+    const conn = this._rpcConnection;
+    if (!conn) return;
     this.stopHeartbeat();
-    this.closingRpcIntentionally = true;
-    try { this._rpcConnection.close(); }
-    catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
-    finally { this.closingRpcIntentionally = false; }
     this._rpcConnection = null;
+    try { conn.close(); }
+    catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
   }
 
   /**
    * Stop the daemon and drop the wire, for a caller that means to bring both
    * straight back up.
    *
-   * The flag spans stopping the daemon as well as closing the wire, because
-   * killing the far end drops the connection from over there and that close
-   * arrives on its own schedule. Closing our side first would also work, but
-   * only because `RpcClient` ignores a second close — leaning on that is how
-   * this went wrong to begin with.
+   * Release first, again: killing the far end drops the connection from over
+   * there, and that close can arrive after this method has already returned
+   * and a new session is up. Nothing here has to hold a window open.
    */
   async teardownRpcSession(): Promise<void> {
-    this.closingRpcIntentionally = true;
-    try {
-      this.stopHeartbeat();
-      if (this.daemonDeployer && this.client.isAlive()) {
-        try { await this.daemonDeployer.stop(); }
-        catch (e) { logger.warn(`daemon stop: ${errorMessage(e)}`); }
-      }
-      if (this._rpcConnection) {
-        try { this._rpcConnection.close(); }
-        catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
-        this._rpcConnection = null;
-      }
-      this.daemonDeployer = null;
-    } finally {
-      this.closingRpcIntentionally = false;
+    this.stopHeartbeat();
+    const conn = this._rpcConnection;
+    this._rpcConnection = null;
+    if (this.daemonDeployer && this.client.isAlive()) {
+      try { await this.daemonDeployer.stop(); }
+      catch (e) { logger.warn(`daemon stop: ${errorMessage(e)}`); }
     }
+    if (conn) {
+      try { conn.close(); }
+      catch (e) { logger.warn(`rpcConnection.close: ${errorMessage(e)}`); }
+    }
+    this.daemonDeployer = null;
   }
 
   /** Close RPC tunnel, stop daemon, disconnect SSH. */
