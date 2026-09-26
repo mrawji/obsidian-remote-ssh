@@ -85,8 +85,6 @@ import { LargeTransferBar } from "./ui/LargeTransferBar";
 import { OnboardingModal } from "./ui/OnboardingModal";
 import { telemetry, telemetryLogPath } from "./util/Telemetry";
 
-/** GitHub `owner/repo` the daemon binaries are released from. */
-
 /**
  * Everything this plugin keeps OUTSIDE any vault, on every OS:
  * `~/.obsidian-remote/` — the shadow `vaults/` themselves, plus the
@@ -794,7 +792,7 @@ export default class RemoteSshPlugin extends Plugin {
    * in-flight command survive a focus change.
    *
    * `setActiveLeaf`, not `revealLeaf`: the latter needs Obsidian 1.7.2 and
-   * the manifest declares 1.4.0. Same observable effect.
+   * the manifest declares 1.5.0. Same observable effect.
    */
   async openRemoteTerminal(): Promise<void> {
     if (this.openingTerminal) return;

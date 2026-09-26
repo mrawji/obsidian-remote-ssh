@@ -499,8 +499,8 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
 //
 // `startReconnect` and `cancelReconnect` are reached only from `main.ts`,
 // which is excluded from coverage — so measured across BOTH suites, neither
-// had ever run. `main.ts` calls `startReconnect` from two places and
-// `cancelReconnect` from three, which is exactly why its guards matter.
+// had ever run — `main.ts` calls one of them from one place and the other
+// from two, so nothing here was reached by driving the plugin either.
 
 describe('ConnectionManager — starting and cancelling a reconnect', () => {
   const profile = { id: 'p', name: 'P', remotePath: '~/work' } as unknown as SshProfile;

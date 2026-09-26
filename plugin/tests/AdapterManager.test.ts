@@ -175,10 +175,12 @@ describe('AdapterManager.restore()', () => {
 
 // ─── the pieces patch() is built from ────────────────────────────────────────
 //
-// `patch()` itself needs a real vault, a live transport and a bound port, so
-// nothing had ever executed it — the helper above says as much. These three
-// steps were lifted out of it precisely so they could be reached, in the same
-// way `wireKeyboardInteractiveHandler` was lifted out of `SftpClient.connect`.
+// Nothing had ever executed `patch()`. These three steps were lifted out of
+// it so they could be reached one at a time, in the same way
+// `wireKeyboardInteractiveHandler` was lifted out of `SftpClient.connect`.
+// `patch()` is driven directly further down as well, with the bridge and the
+// queue stubbed — which is what made it reachable at all, and is why the
+// steps still earn separate cases: each one's failure mode is its own.
 
 /** Reach a private method without widening the class's surface. */
 function priv<T>(mgr: unknown, name: string): T {
@@ -387,9 +389,10 @@ describe('AdapterManager.startResourceBridge()', () => {
 
 // ─── patch() itself ──────────────────────────────────────────────────────────
 //
-// Never executed by anything: not the unit suite, and — measured — not the
-// integration suite either. Only the E2E run drives it, and that uploads no
-// coverage. It is the step that puts this plugin in front of the vault.
+// Had never been executed by anything: not the unit suite, and — measured —
+// not the integration suite either. Only the E2E run drove it, and that
+// uploads no coverage. It is the step that puts this plugin in front of the
+// vault, which is why these cases exist.
 
 describe('AdapterManager.patch()', () => {
   function patchableManager() {

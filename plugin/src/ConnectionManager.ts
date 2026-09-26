@@ -36,8 +36,9 @@ export interface ConnectionDeps {
    * no notice and no log line, while every later file operation failed one
    * at a time with "stream is closed" and the status bar still said
    * connected.
+   *
+   * @param reason why the wire died, when the layer that noticed could tell.
    */
-  /** Why the wire died, when the layer that noticed could tell. */
   onRpcClose: (reason?: Error) => void;
 }
 
