@@ -460,14 +460,10 @@ export default class RemoteSshPlugin extends Plugin {
     const profile = this.conn.activeProfile;
     const basePath = this.conn.activeRemoteBasePath;
     if (!profile || !basePath) throw new Error('No active profile');
-    if (this.conn.daemonDeployer && this.conn.isAlive()) {
-      try { await this.conn.daemonDeployer.stop(); } catch { /* best effort */ }
-    }
-    if (this.conn.rpcConnection) {
-      try { this.conn.rpcConnection.close(); } catch { /* already dead */ }
-      this.conn.rpcConnection = null;
-    }
-    this.conn.daemonDeployer = null;
+    // Through the manager, not around it: closing the wire from here left the
+    // "we hung up" flag unset, so the restart announced itself as a lost
+    // connection and started a reconnect that raced it.
+    await this.conn.teardownRpcSession();
     await this.conn.startRpcSession(profile, basePath);
     // Rebind adapter to the fresh RPC client
     this.adapterMgr.dataAdapter?.rebind(this.conn.buildBinding());
