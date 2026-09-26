@@ -467,10 +467,14 @@ describe('ConnectionManager — a daemon that dies under a healthy SSH session',
   });
 
   it('restarting the daemon is not a lost connection', async () => {
-    // The restart button closed the wire from the plugin, where the
-    // "we hung up" flag is out of reach, so the user got a toast saying the
-    // connection had dropped for something they had just asked for — and a
-    // reconnect loop racing the restart, two deploys deep.
+    // This pins the teardown primitive, not the button: that `restartDaemon`
+    // reaches it is in tests/startReconnect.wiring.test.ts, since `main.ts` is
+    // outside the coverage scope and deleting the call used to be free.
+    //
+    // The button closed the wire from the plugin, where the manager's own
+    // reasoning about who hung up was out of reach, so the user got a toast
+    // saying the connection had dropped for something they had just asked for
+    // — and a reconnect loop racing the restart, two deploys deep.
     const onRpcClose = vi.fn();
     const { handle, fire } = handleWithCapturedCloseHandler();
     handle.close = vi.fn(() => { fire(undefined); });   // a real close is synchronous
