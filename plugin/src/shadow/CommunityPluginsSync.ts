@@ -4,6 +4,7 @@ import { logger } from '../util/logger';
 import { errorMessage } from '../util/errorMessage';
 import { sanitiseStateKey } from './vaultNaming';
 import type { SharedConfigReader, SharedConfigWriter } from './SharedObsidianConfigSync';
+import { writeFileAtomic } from '../util/writeFileAtomic';
 
 // ─── community-plugins list round-trip (#429 / #342 / uninstall) ─────────
 //
@@ -344,17 +345,6 @@ function versionGt(a: number[], b: number[]): boolean {
 }
 
 /** Atomic (tmp + rename) write of arbitrary file content. */
-function writeFileAtomic(localFile: string, content: string): void {
-  const tmp = `${localFile}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, content, 'utf-8');
-  try {
-    fs.renameSync(tmp, localFile);
-  } catch (e) {
-    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
-    throw e;
-  }
-}
-
 /** Parse a community-plugins.json body into a string-id array, or null if malformed. */
 function parsePluginIdList(content: string): string[] | null {
   try {
@@ -500,12 +490,5 @@ function writePluginIdBase(basePath: string | null | undefined, ids: string[]): 
 
 /** Atomic (tmp + rename) write of an id array as JSON. */
 function writePluginIdListAtomic(localPath: string, ids: string[]): void {
-  const tmp = `${localPath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(ids) + '\n', 'utf-8');
-  try {
-    fs.renameSync(tmp, localPath);
-  } catch (e) {
-    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
-    throw e;
-  }
+  writeFileAtomic(localPath, JSON.stringify(ids) + '\n');
 }

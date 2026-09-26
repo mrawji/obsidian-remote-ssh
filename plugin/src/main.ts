@@ -1,4 +1,4 @@
-import { Plugin, Notice, Modal, FileSystemAdapter, TFile, TFolder, requestUrl } from 'obsidian';
+import { Plugin, Notice, Modal, FileSystemAdapter, TFile, TFolder } from 'obsidian';
 import type { PluginSettings, SshProfile } from './types';
 import { SyncState } from './types';
 import { DEFAULT_SETTINGS, DEFAULT_WALK_IGNORE_DIRS } from './constants';
@@ -41,18 +41,12 @@ import { ObsidianRegistry } from './shadow/ObsidianRegistry';
 import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
 import { sanitiseStateKey } from './shadow/vaultNaming';
 import type { BootstrapResult } from './shadow/ShadowVaultBootstrap';
-import {
-  pullSharedObsidianConfig,
-  pushSharedObsidianConfig,
-  SHARED_OBSIDIAN_CONFIG_FILES,
-} from './shadow/SharedObsidianConfigSync';
+import { pullSharedObsidianConfig } from './shadow/SharedObsidianConfigSync';
 import type { SharedConfigReader } from './shadow/SharedObsidianConfigSync';
 import {
   communityPluginsBasePath,
   pullCommunityPlugins,
-  pushCommunityPlugins,
   pullPluginBinaries,
-  pushPluginBinaries,
   readEnabledPluginIds,
 } from './shadow/CommunityPluginsSync';
 import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
@@ -71,15 +65,8 @@ import { errorMessage } from "./util/errorMessage";
 import { ConnectionManager, DaemonUnavailableError } from "./ConnectionManager";
 import { decideReconnect } from './transport/reconnectDecision';
 import { buildReconnectHooks } from './transport/reconnectHooks';
-import {
-  detectRemoteTarget,
-  ensureDaemonBinary as downloadDaemonBinary,
-  resolveDaemonConsent,
-  DaemonVerificationError,
-  binaryFilename,
-} from './transport/DaemonDownloader';
+import { DaemonVerificationError } from './transport/DaemonDownloader';
 import { ensureDaemonBinary as ensureRemoteDaemonBinary } from './transport/ensureDaemonBinary';
-import { createHash } from 'crypto';
 import { TransferTracker } from "./util/TransferTracker";
 import { LargeTransferBar } from "./ui/LargeTransferBar";
 import { OnboardingModal } from "./ui/OnboardingModal";

@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../util/logger';
 import { errorMessage } from '../util/errorMessage';
+import { writeFileAtomic } from '../util/writeFileAtomic';
 
 /**
  * The narrow read surface `pullSharedObsidianConfig` needs from the
@@ -101,18 +102,8 @@ export async function pullSharedObsidianConfig(
         errored.push(basename);
         continue;
       }
-      const dest = path.join(localConfigDir, basename);
-      const tmp = `${dest}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, content, 'utf-8');
-      try {
-        fs.renameSync(tmp, dest);
-      } catch (renameErr) {
-        // rename failed (perms / cross-device) — drop the orphan
-        // tmp so it can't accumulate or be mistaken for real data,
-        // then rethrow into the outer catch for the skip+error path.
-        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
-        throw renameErr;
-      }
+      // A failed rename rethrows into the outer catch, for the skip+error path.
+      writeFileAtomic(path.join(localConfigDir, basename), content);
       pulled.push(basename);
     } catch (e) {
       // Best-effort: a single unreadable file must not abort the
