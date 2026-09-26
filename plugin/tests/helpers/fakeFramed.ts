@@ -14,6 +14,20 @@ import type { FramedDuplex } from '../../src/transport/framing';
 export class FakeFramed extends EventEmitter {
   public sent: Buffer[] = [];
   public closed = false;
+  private lastByteAt = Date.now();
+
+  /** Pretend nothing has arrived for `ms` — a daemon gone quiet. */
+  silentFor(ms: number): void {
+    this.lastByteAt = Date.now() - ms;
+  }
+
+  msSinceLastByte(): number {
+    return Date.now() - this.lastByteAt;
+  }
+
+  outboundBacklogBytes(): number {
+    return 0;   // nothing queued; these tests drive the inbound side
+  }
 
   writeMessage(body: Buffer): boolean {
     if (this.closed) throw new Error('closed');
@@ -29,6 +43,7 @@ export class FakeFramed extends EventEmitter {
 
   /** Drive a response back to the client; for tests only. */
   pushMessage(envelope: unknown): void {
+    this.lastByteAt = Date.now();
     this.emit('message', Buffer.from(JSON.stringify(envelope), 'utf8'));
   }
 

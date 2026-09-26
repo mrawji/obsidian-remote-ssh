@@ -2,7 +2,7 @@ import { App, TFile, TFolder } from 'obsidian';
 import type { SftpDataAdapter } from '../adapter/SftpDataAdapter';
 import type { LocalOpRegistry } from '../adapter/LocalOpRegistry';
 import type { PathMapper } from '../path/PathMapper';
-import type { RpcConnection } from '../transport/RpcConnection';
+import type { RpcSessionView } from '../ConnectionManager';
 import type { FsChangedParams } from '../proto/types';
 import { interpretWatchEvent } from '../path/WatchEventFilter';
 import { VaultModelBuilder } from './VaultModelBuilder';
@@ -70,7 +70,7 @@ export class FsChangeListener {
    * pushed event.
    */
   async subscribe(opts: {
-    rpcConnection: RpcConnection;
+    rpcConnection: RpcSessionView;
     dataAdapter: SftpDataAdapter;
     pathMapper: PathMapper;
     /**
@@ -121,7 +121,7 @@ export class FsChangeListener {
    * never called or if the subscription is already live (idempotent).
    */
   async resumeAfterReconnect(opts: {
-    rpcConnection: RpcConnection;
+    rpcConnection: RpcSessionView;
     dataAdapter: SftpDataAdapter;
   }): Promise<void> {
     if (!this.lastPathMapper) return;
@@ -138,7 +138,7 @@ export class FsChangeListener {
    * all local state including lastPathMapper. Called from the
    * adapter-restore path. Safe when nothing was subscribed.
    */
-  unsubscribe(rpcConnection: RpcConnection | null): void {
+  unsubscribe(rpcConnection: RpcSessionView | null): void {
     const id = this.subscriptionId;
     this.subscriptionId = null;
     this.lastPathMapper = null;

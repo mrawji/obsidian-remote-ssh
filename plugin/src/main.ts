@@ -63,7 +63,7 @@ import { withTimeout } from './util/withTimeout';
 import * as path from 'path';
 import { errorMessage } from "./util/errorMessage";
 import { ConnectionManager, DaemonUnavailableError } from "./ConnectionManager";
-import { decideReconnect } from './transport/reconnectDecision';
+import { connectionLostNotice } from './transport/connectionLostNotice';
 import { buildReconnectHooks } from './transport/reconnectHooks';
 import { DaemonVerificationError } from './transport/DaemonDownloader';
 import { ensureDaemonBinary as ensureRemoteDaemonBinary } from './transport/ensureDaemonBinary';
@@ -660,32 +660,31 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   private async startReconnect(cause?: Error): Promise<void> {
-    const decision = decideReconnect({
-      hasActiveProfile: this.conn.activeProfile !== null,
-      alreadyReconnecting: this.state === SyncState.RECONNECTING,
-      maxRetries: this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries,
-      cause,
-    });
-    if (decision.kind === 'no-profile') {
+    if (!this.conn.activeProfile) {
       logger.warn('startReconnect: no active profile to reconnect with');
       this.setState(SyncState.ERROR);
       return;
     }
-    if (decision.kind === 'already-reconnecting') {
-      logger.info(decision.log);
+    // One failure, one notice. Both close paths lead here, and on the RPC
+    // transport a dropped SSH connection takes the tunnel with it, so both
+    // fire for the same event — announcing from the callers stacked two
+    // toasts on the most ordinary disconnect there is.
+    if (this.state === SyncState.RECONNECTING) {
+      logger.info(`startReconnect: already reconnecting${cause ? ` (${cause.message})` : ''}`);
       return;
     }
-    if (decision.kind === 'disabled') {
+    const maxRetries = this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries;
+    if (maxRetries <= 0) {
       logger.info('startReconnect: auto-reconnect disabled (reconnectMaxRetries <= 0)');
-      new Notice(decision.notice);
+      new Notice(connectionLostNotice(cause, false));
       this.adapterMgr.restore();
       this.setState(SyncState.ERROR);
       return;
     }
-    new Notice(decision.notice);
+    new Notice(connectionLostNotice(cause, true));
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
-      maxRetries: decision.maxRetries,
+      maxRetries,
       setAdapterReconnecting: (on) => this.adapterMgr.dataAdapter?.setReconnecting(on),
       onState: (s) => this.onReconnectStateChange(s),
       hooks: buildReconnectHooks({

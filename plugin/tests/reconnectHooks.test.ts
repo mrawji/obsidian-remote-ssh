@@ -9,6 +9,11 @@ import type { RemoteBinding, RpcConnectionHandle } from '../src/ConnectionManage
  * replacing it with an empty function left the suite green. What it carries is
  * the vault prefix: lose it on a transport downgrade and writes land beside
  * the vault instead of in it, which is the bug the binding type exists for.
+ *
+ * This file pins the hooks; that `main.ts` builds them around a live adapter
+ * rather than a captured one is pinned in
+ * `tests/startReconnect.wiring.test.ts`, since replacing that getter with
+ * `() => null` restores the original no-op and nothing here would notice.
  */
 
 function listener() {

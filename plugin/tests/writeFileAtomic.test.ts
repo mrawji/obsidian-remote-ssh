@@ -26,7 +26,32 @@ function leftovers(): string[] {
   return fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'));
 }
 
+const POSIX = process.platform !== 'win32';
+
 describe('writeFileAtomic', () => {
+  // Replacing the whole body with a plain `writeFileSync(dest, content)`
+  // passed every other case here — so nothing pinned the tmp+rename at all,
+  // which is the only reason this function exists.
+  //
+  // A read-only destination tells them apart for real: writing to it is
+  // EACCES, but renaming over it needs write permission on the *directory*,
+  // not on the file. Windows has no mode bits for `chmod` to set, and root
+  // ignores them, so this is POSIX and non-root only.
+  it.skipIf(!POSIX || process.getuid?.() === 0)(
+    'replaces a file even when the file itself is read-only',
+    () => {
+      const dest = path.join(dir, 'app.json');
+      fs.writeFileSync(dest, '{"old":true}', 'utf-8');
+      fs.chmodSync(dest, 0o444);
+
+      writeFileAtomic(dest, '{"new":true}');
+
+      expect(fs.readFileSync(dest, 'utf-8'), 'a direct write could not have done this')
+        .toBe('{"new":true}');
+      expect(leftovers()).toEqual([]);
+    },
+  );
+
   it('leaves the content in place and nothing beside it', () => {
     const dest = path.join(dir, 'community-plugins.json');
 

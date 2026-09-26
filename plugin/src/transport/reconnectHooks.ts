@@ -1,5 +1,5 @@
 import type {
-  ReconnectAdapterHooks, RemoteBinding, RpcConnectionHandle,
+  ReconnectAdapterHooks, RemoteBinding, RpcSessionView,
 } from '../ConnectionManager';
 import type { SftpDataAdapter } from '../adapter/SftpDataAdapter';
 import type { FsChangeListener } from '../vault/FsChangeListener';
@@ -27,7 +27,7 @@ export function buildReconnectHooks(deps: {
     prepareListenerForReconnect(): void {
       deps.fsChangeListener.prepareForReconnect();
     },
-    async resumeListenerAfterReconnect(rpcConn: RpcConnectionHandle): Promise<void> {
+    async resumeListenerAfterReconnect(rpcConn: RpcSessionView): Promise<void> {
       const dataAdapter = deps.dataAdapter();
       // No adapter means the reconnect gave up and `restore()` ran; there is
       // nothing left to point the watch at.
