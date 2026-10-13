@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -258,3 +259,40 @@ func TestFsWalk_ReportsCreated(t *testing.T) {
 	}
 	t.Errorf("sub/a.md missing from walk")
 }
+
+func TestCreatedHelpers_ErrorPaths(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing.md")
+
+	if err := writeCreatedXattr(missing, seededCreated); err == nil {
+		t.Error("writeCreatedXattr on a missing file: want error")
+	}
+	if _, ok := birthMillis(missing, nil); ok {
+		t.Error("birthMillis on a missing file: want ok=false")
+	}
+	if _, ok := inodeOf(fakeInfo{}); ok {
+		t.Error("inodeOf without a Stat_t: want ok=false")
+	}
+
+	// Right inode tag, unparsable timestamp.
+	abs := seedCreated(t, root, "a.md", "x")
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, _ := inodeOf(info)
+	if err := setXattr(abs, createdXattr, []byte(fmt.Sprintf("soon:%d", ino))); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readCreatedXattr(abs, info); ok {
+		t.Error("readCreatedXattr with a non-numeric timestamp: want ok=false")
+	}
+	if _, ok := readCreatedXattr(abs, fakeInfo{}); ok {
+		t.Error("readCreatedXattr without an inode: want ok=false")
+	}
+}
+
+// fakeInfo is an os.FileInfo whose Sys() isn't a *syscall.Stat_t.
+type fakeInfo struct{ os.FileInfo }
+
+func (fakeInfo) Sys() any { return nil }

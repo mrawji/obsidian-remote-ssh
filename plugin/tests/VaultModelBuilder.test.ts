@@ -647,6 +647,20 @@ describe('VaultModelBuilder.reflect* (#341 writer self-reflect)', () => {
     expect((fileMap['Notes.md'] as FakeTFile).stat).toEqual({ ctime: 500, mtime: 500, size: 9 });
   });
 
+  it('reflectWrite warns and fires nothing when the path holds neither a file nor a folder', () => {
+    const { vault, fileMap, triggers } = makeFakeVault();
+    const builder = new VaultModelBuilder(vault as never, deps);
+    (fileMap as Record<string, unknown>)['Notes.md'] = { path: 'Notes.md' };
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    builder.reflectWrite('Notes.md', { mtime: 500, size: 9 });
+    const warnings = warn.mock.calls.map((c) => String(c[0]));
+    warn.mockRestore();
+
+    expect(triggers).toEqual([]);
+    expect(warnings.some((w) => w.includes('modifyOne("Notes.md") no-op'))).toBe(true);
+  });
+
   it('reflectWrite without a stat leaves an existing file\'s stat untouched', () => {
     const { vault, fileMap } = makeFakeVault();
     const builder = new VaultModelBuilder(vault as never, deps);

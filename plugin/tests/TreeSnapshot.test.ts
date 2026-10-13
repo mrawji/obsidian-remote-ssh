@@ -105,5 +105,16 @@ describe('TreeSnapshot', () => {
       expect(out[2]).toEqual({ path: 'notes/a.md', isDirectory: false, ctime: 3, mtime: 5, size: 50 });
       expect(out[0].isDirectory).toBe(true);
     });
+
+    it('uses mtime as ctime when the model has none, and 0 without a stat', () => {
+      const out = collectModelEntries([
+        { path: 'a.md', stat: { mtime: 7, size: 1 } },
+        { path: 'b.md' },
+      ], '.obsidian');
+      expect(out).toEqual([
+        { path: 'a.md', isDirectory: false, ctime: 7, mtime: 7, size: 1 },
+        { path: 'b.md', isDirectory: false, ctime: 0, mtime: 0, size: 0 },
+      ]);
+    });
   });
 });

@@ -1482,6 +1482,19 @@ describe('SftpDataAdapter — writer reflect (#341)', () => {
     expect(r.reflectWrite.mock.calls[0][1]).toMatchObject({ ctime: 777, size: 5 });
   });
 
+  it('remembers the ancestor with mtime 0 when stat-after-write fails', async () => {
+    const fake = makeFakeClient({ dirs: { '/v': [] } });
+    const tracker = new AncestorTracker();
+    const adapter = new SftpDataAdapter(
+      fake.client, '/v', readCache, dirCache, 'v', null, null, null, tracker,
+    );
+    fake.client.stat.mockRejectedValueOnce(new Error('stat blew up'));
+
+    await adapter.write('note.md', 'hello');
+
+    expect(tracker.get('note.md')).toMatchObject({ content: 'hello', mtime: 0 });
+  });
+
   it('reflectWrite gets no stat when stat-after-write fails', async () => {
     const fake = makeFakeClient({ dirs: { '/v': [] } });
     const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
