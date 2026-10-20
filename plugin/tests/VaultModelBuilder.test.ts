@@ -586,6 +586,20 @@ describe('VaultModelBuilder.reflect* (#341 writer self-reflect)', () => {
     expect(triggers.map(t => t.event)).toEqual(['create']);
   });
 
+  it('forgetText drops the file\'s cached text and fires nothing', () => {
+    const { vault, fileMap, triggers } = makeFakeVault();
+    const builder = new VaultModelBuilder(vault as never, deps);
+    builder.reflectWrite('Notes.md');
+    const cache = vi.fn();
+    (fileMap['Notes.md'] as unknown as { cache: typeof cache }).cache = cache;
+
+    builder.forgetText('Notes.md');
+    builder.forgetText('Missing.md');           // unmodelled: no throw
+
+    expect(cache).toHaveBeenCalledWith(null);
+    expect(triggers.map(t => t.event)).toEqual(['create']);
+  });
+
   it('reflectWrite on an existing file fires modify, does not re-insert', () => {
     const { vault, fileMap, triggers } = makeFakeVault();
     const builder = new VaultModelBuilder(vault as never, deps);
