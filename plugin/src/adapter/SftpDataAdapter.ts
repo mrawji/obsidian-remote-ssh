@@ -390,9 +390,65 @@ export class SftpDataAdapter {
 
   // ─── DataAdapter (write-side) ────────────────────────────────────────────
 
-  async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
-    await this.writeText(normalizedPath, data, options);
+  /**
+   * Tail of each path's write chain; see `serialized`. An entry leaves the
+   * map once its chain drains.
+   */
+  private readonly writeChains = new Map<string, Promise<void>>();
+
+  /**
+   * Run a write to one path once the previous write to it has settled.
+   *
+   * Native adapters queue writes, so they never overlap; plugins rely on
+   * that, e.g. settings that save as you type fire `saveData` per keystroke
+   * without awaiting the last. Overlapping here, each write would assert the
+   * mtime cached from before the previous one landed, and the server would
+   * reject it as a conflict. Per path, not global: writes to different files
+   * have no ordering to keep. A failed write doesn't block the next.
+   */
+  private serialized<T>(normalizedPath: string, run: () => Promise<T>): Promise<T> {
+    const prev = this.writeChains.get(normalizedPath) ?? Promise.resolve();
+    const result = prev.then(run);
+    const tail = result.then(() => undefined, () => undefined);
+    this.writeChains.set(normalizedPath, tail);
+    void tail.then(() => {
+      if (this.writeChains.get(normalizedPath) === tail) this.writeChains.delete(normalizedPath);
+    });
+    return result;
   }
+
+  async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
+    await this.serialized(normalizedPath, () => this.writeText(normalizedPath, data, options));
+  }
+
+  async writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
+    return this.serialized(normalizedPath, () => this.writeBinaryNow(normalizedPath, data, options));
+  }
+
+  async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
+    return this.serialized(normalizedPath, () => this.appendNow(normalizedPath, data, options));
+  }
+
+  async appendBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
+    return this.serialized(normalizedPath, () => this.appendBinaryNow(normalizedPath, data, options));
+  }
+
+  /**
+   * Read, transform, and write back a plaintext file. Serialized with this
+   * window's other writes to the path, but not atomic across writers
+   * elsewhere — same caveat as the underlying SFTP write (which goes
+   * through a tmp+rename inside SftpClient).
+   */
+  async process(
+    normalizedPath: string,
+    fn: (data: string) => string,
+    options?: DataWriteOptions,
+  ): Promise<string> {
+    return this.serialized(normalizedPath, () => this.processNow(normalizedPath, fn, options));
+  }
+
+  // The `*Now` bodies run inside `serialized`; they call each other, never
+  // the public methods, which would wait on the chain they are part of.
 
   /**
    * `write`, returning the text that landed: a conflict merge may have
@@ -423,7 +479,7 @@ export class SftpDataAdapter {
     }
   }
 
-  async writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
+  private async writeBinaryNow(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
       if (this.reconnecting) {
@@ -440,7 +496,7 @@ export class SftpDataAdapter {
     }
   }
 
-  async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
+  private async appendNow(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
       if (this.reconnecting) {
@@ -459,13 +515,13 @@ export class SftpDataAdapter {
       let existing = '';
       try { existing = await this.read(normalizedPath); }
       catch { /* file did not exist; start empty so append acts like create */ }
-      await this.write(normalizedPath, existing + data, options);
+      await this.writeText(normalizedPath, existing + data, options);
     } finally {
       perfTracer.end(__t1, { op: 'append', path: normalizedPath, bytes: data.length });
     }
   }
 
-  async appendBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
+  private async appendBinaryNow(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
       if (this.reconnecting) {
@@ -484,7 +540,7 @@ export class SftpDataAdapter {
       const { stat: written, landed: landedBuf } = await this.writeBuffer(normalizedPath, merged, false);
       this.settleTextCache(normalizedPath, landedBuf === merged, options);
       // appendBinary writes through writeBuffer directly (not via
-      // this.write/writeBinary), so it must reflect itself or the
+      // writeText/writeBinaryNow), so it must reflect itself or the
       // writer's model misses binary appends (#341).
       this.applied([normalizedPath], r => r.reflectWrite(normalizedPath, written));
     } finally {
@@ -492,12 +548,7 @@ export class SftpDataAdapter {
     }
   }
 
-  /**
-   * Read, transform, and write back a plaintext file. Not atomic across
-   * concurrent writers — same caveat as the underlying SFTP write (which
-   * goes through a tmp+rename inside SftpClient).
-   */
-  async process(
+  private async processNow(
     normalizedPath: string,
     fn: (data: string) => string,
     options?: DataWriteOptions,
@@ -656,12 +707,12 @@ export class SftpDataAdapter {
       switch (op.kind) {
         case 'write': {
           const data = Buffer.from(op.contentBase64, 'base64');
-          await this.writeBuffer(op.path, data, true, op.expectedMtime);
+          await this.serialized(op.path, () => this.writeBuffer(op.path, data, true, op.expectedMtime));
           return { result: 'ok' };
         }
         case 'writeBinary': {
           const data = Buffer.from(op.contentBase64, 'base64');
-          await this.writeBuffer(op.path, data, false, op.expectedMtime);
+          await this.serialized(op.path, () => this.writeBuffer(op.path, data, false, op.expectedMtime));
           return { result: 'ok' };
         }
         case 'append': {

@@ -1418,6 +1418,122 @@ describe('SftpDataAdapter (offline queue while reconnecting)', () => {
   });
 });
 
+// Plugins with "save as you type" settings fire saveData per keystroke
+// without awaiting the last. Native adapters queue writes, so they never
+// overlap; ours must too, or each write asserts the mtime from before the
+// previous one landed and the server rejects it as a conflict.
+describe('SftpDataAdapter: overlapping writes to one path', () => {
+  /** A client that enforces expectedMtime as the daemon does, with latency. */
+  function makeStrictClient() {
+    const fake = makeFakeClient({
+      dirs: { '/v': [] },
+      files: { '/v/data.json': { data: Buffer.from('{}'), mtime: 100 } },
+    });
+    let mtime = 100;
+    fake.spies.writeBinary.mockImplementation(
+      async (p: string, data: Buffer, expectedMtime?: number) => {
+        await new Promise(r => setTimeout(r, 5));
+        const current = fake.files[p];
+        if (expectedMtime !== undefined && current && current.mtime !== expectedMtime) {
+          const err = new Error('precondition failed') as Error & { code: number };
+          err.code = -32020;
+          throw err;
+        }
+        fake.files[p] = { data: Buffer.from(data), mtime: ++mtime };
+      },
+    );
+    return fake;
+  }
+
+  it('lands every write in call order without a conflict', async () => {
+    const fake = makeStrictClient();
+    const readCache = new ReadCache();
+    const tracker = new AncestorTracker();
+    const onText = vi.fn(async () => ({ decision: 'cancel' as const }));
+    const onLegacy = vi.fn(async () => false);
+    const resolver = new ConflictResolver(fake.client, readCache, tracker, onText, onLegacy);
+    const adapter = new SftpDataAdapter(
+      fake.client, '/v', readCache, new DirCache(), 'v', null, null, resolver, tracker,
+    );
+    await adapter.read('data.json');
+
+    await Promise.all(['{"a":1}', '{"a":12}', '{"a":123}'].map(d => adapter.write('data.json', d)));
+
+    expect(onText).not.toHaveBeenCalled();
+    expect(onLegacy).not.toHaveBeenCalled();
+    expect(fake.files['/v/data.json'].data.toString('utf8')).toBe('{"a":123}');
+  });
+
+  it('does not hold a write to one path behind a write to another', async () => {
+    const fake = makeStrictClient();
+    const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+
+    const a = adapter.write('a.md', 'a');
+    const b = adapter.write('b.md', 'b');
+    await vi.waitFor(() => expect(fake.spies.writeBinary).toHaveBeenCalledTimes(2));
+    await Promise.all([a, b]);
+  });
+
+  it('runs append and process after a pending write to the path', async () => {
+    const fake = makeStrictClient();
+    const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+    await adapter.read('data.json');
+
+    await Promise.all([
+      adapter.write('data.json', 'x'),
+      adapter.append('data.json', 'y'),
+      adapter.process('data.json', d => d + 'z'),
+    ]);
+
+    expect(fake.files['/v/data.json'].data.toString('utf8')).toBe('xyz');
+  });
+
+  it('a failed write does not block the next one', async () => {
+    const fake = makeStrictClient();
+    const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+    fake.spies.writeBinary.mockRejectedValueOnce(new Error('boom'));
+
+    const first = adapter.write('data.json', '1');
+    const second = adapter.write('data.json', '2');
+
+    await expect(first).rejects.toThrow('boom');
+    await expect(second).resolves.toBeUndefined();
+    expect(fake.files['/v/data.json'].data.toString('utf8')).toBe('2');
+  });
+
+  it.each(['write', 'writeBinary'] as const)(
+    'a replayed %s waits for a pending write to the path',
+    async kind => {
+      const fake = makeStrictClient();
+      const writeBinary = fake.spies.writeBinary.getMockImplementation()!;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      fake.spies.writeBinary.mockImplementation(async (p: string, data: Buffer, expectedMtime?: number) => {
+        maxInFlight = Math.max(maxInFlight, ++inFlight);
+        try {
+          await writeBinary(p, data, expectedMtime);
+        } finally {
+          inFlight--;
+        }
+      });
+      const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+      await adapter.read('data.json');
+
+      const live = adapter.write('data.json', 'live');
+      const replayed = adapter.replayQueuedOp({
+        kind,
+        path: 'data.json',
+        contentBase64: Buffer.from('replayed').toString('base64'),
+      });
+
+      await live;
+      await expect(replayed).resolves.toEqual({ result: 'ok' });
+      expect(maxInFlight).toBe(1);
+      expect(fake.files['/v/data.json'].data.toString('utf8')).toBe('replayed');
+    },
+  );
+});
+
 describe('SftpDataAdapter: getResourcePath', () => {
   let readCache: ReadCache;
   let dirCache: DirCache;
