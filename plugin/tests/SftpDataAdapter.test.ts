@@ -1439,6 +1439,50 @@ describe('SftpDataAdapter — writer reflect (#341)', () => {
       .toEqual(['note.md', 'blob.bin', 'log.bin']);
   });
 
+  it('reflectWrite carries the post-write remote mtime and size', async () => {
+    const fake = makeFakeClient({ dirs: { '/v': [] } });
+    const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+    const r = makeReflector();
+    adapter.setWriterReflector(r);
+
+    await adapter.write('note.md', 'hello');
+    await adapter.writeBinary('blob.bin', new ArrayBuffer(2));
+    await adapter.appendBinary('blob.bin', new ArrayBuffer(1));
+
+    const remoteMtime = async (p: string) => (await fake.client.stat(p)).mtime;
+    expect(r.reflectWrite.mock.calls).toEqual([
+      ['note.md',  { mtime: expect.any(Number), size: 5 }],
+      ['blob.bin', { mtime: expect.any(Number), size: 2 }],
+      ['blob.bin', { mtime: await remoteMtime('/v/blob.bin'), size: 3 }],
+    ]);
+    expect(r.reflectWrite.mock.calls[0][1].mtime).toBe(await remoteMtime('/v/note.md'));
+  });
+
+  it('remembers the ancestor with mtime 0 when stat-after-write fails', async () => {
+    const fake = makeFakeClient({ dirs: { '/v': [] } });
+    const tracker = new AncestorTracker();
+    const adapter = new SftpDataAdapter(
+      fake.client, '/v', readCache, dirCache, 'v', null, null, null, tracker,
+    );
+    fake.client.stat.mockRejectedValueOnce(new Error('stat blew up'));
+
+    await adapter.write('note.md', 'hello');
+
+    expect(tracker.get('note.md')).toMatchObject({ content: 'hello', mtime: 0 });
+  });
+
+  it('reflectWrite gets no stat when stat-after-write fails', async () => {
+    const fake = makeFakeClient({ dirs: { '/v': [] } });
+    const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+    const r = makeReflector();
+    adapter.setWriterReflector(r);
+    fake.client.stat.mockRejectedValueOnce(new Error('stat blew up'));
+
+    await adapter.write('note.md', 'hello');
+
+    expect(r.reflectWrite).toHaveBeenCalledWith('note.md', undefined);
+  });
+
   it('mkdir → reflectMkdir, remove → reflectRemove, rmdir → reflectRemove', async () => {
     const fake = makeFakeClient({ dirs: { '/v': [] } });
     const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
