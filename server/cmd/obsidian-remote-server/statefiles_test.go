@@ -1,10 +1,12 @@
-//go:build unix
+//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
 
 package main
 
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -56,6 +58,8 @@ func shortLockWait(t *testing.T) {
 	t.Cleanup(func() { lockWait = old })
 }
 
+var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
+
 func exists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
@@ -91,7 +95,7 @@ func TestClaimStateFiles_RemovesAStaleSocket(t *testing.T) {
 	socket := filepath.Join(dir, "s.sock")
 	writeFile(t, socket, "left by a crashed run")
 
-	s, err := claimStateFiles(socket, filepath.Join(dir, "token"))
+	s, err := claimStateFiles(socket, filepath.Join(dir, "token"), quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +111,7 @@ func TestClaimStateFiles_RefusesWhileAnotherDaemonHoldsTheLock(t *testing.T) {
 	socket := filepath.Join(dir, "s.sock")
 	token := filepath.Join(dir, "token")
 
-	first, err := claimStateFiles(socket, token)
+	first, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +119,7 @@ func TestClaimStateFiles_RefusesWhileAnotherDaemonHoldsTheLock(t *testing.T) {
 	writeFile(t, socket, "first daemon's socket")
 	writeFile(t, token, "first daemon's token")
 
-	if _, err := claimStateFiles(socket, token); !errors.Is(err, errDaemonRunning) {
+	if _, err := claimStateFiles(socket, token, quiet); !errors.Is(err, errDaemonRunning) {
 		t.Fatalf("second claim: got %v, want errDaemonRunning", err)
 	}
 	if got := readFile(t, socket); got != "first daemon's socket" {
@@ -131,13 +135,13 @@ func TestClaimStateFiles_WaitsForADaemonThatIsShuttingDown(t *testing.T) {
 	socket := filepath.Join(dir, "s.sock")
 	token := filepath.Join(dir, "token")
 
-	first, err := claimStateFiles(socket, token)
+	first, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.AfterFunc(200*time.Millisecond, first.release)
 
-	second, err := claimStateFiles(socket, token)
+	second, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatalf("claim after the first daemon released: %v", err)
 	}
@@ -150,7 +154,7 @@ func TestRelease_RemovesTheFilesAndFreesTheLock(t *testing.T) {
 	socket := filepath.Join(dir, "s.sock")
 	token := filepath.Join(dir, "token")
 
-	s, err := claimStateFiles(socket, token)
+	s, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +166,7 @@ func TestRelease_RemovesTheFilesAndFreesTheLock(t *testing.T) {
 	if exists(socket) || exists(token) {
 		t.Fatal("release left the socket or the token behind")
 	}
-	again, err := claimStateFiles(socket, token)
+	again, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatalf("lock still held after release: %v", err)
 	}
@@ -177,7 +181,7 @@ func TestRun_RefusesASocketAnotherDaemonOwns(t *testing.T) {
 	socket := filepath.Join(dir, "s.sock")
 	token := filepath.Join(dir, "token")
 
-	first, err := claimStateFiles(socket, token)
+	first, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +280,7 @@ func TestDaemon_ExitRemovesItsOwnFiles(t *testing.T) {
 	if exists(socket) || exists(token) {
 		t.Error("socket or token left behind after a clean exit")
 	}
-	s, err := claimStateFiles(socket, token)
+	s, err := claimStateFiles(socket, token, quiet)
 	if err != nil {
 		t.Fatalf("lock still held after the daemon exited: %v", err)
 	}
@@ -325,7 +329,103 @@ func TestDaemon_RedeployWhileTheOldDaemonDrains(t *testing.T) {
 	if !exists(token) || readFile(t, token) != newToken {
 		t.Error("the old daemon's exit removed or changed the new daemon's token")
 	}
-	if newer.ProcessState != nil {
-		t.Error("the new daemon exited")
+	if err := newer.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Errorf("the new daemon is gone after the old one exited: %v", err)
 	}
+}
+
+// Two profiles with different sockets but the same token file: the
+// second daemon must not overwrite the first one's token.
+func TestClaimStateFiles_LocksTheTokenPathToo(t *testing.T) {
+	shortLockWait(t)
+	dir := shortTempDir(t)
+	token := filepath.Join(dir, "token")
+
+	first, err := claimStateFiles(filepath.Join(dir, "a.sock"), token, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.release()
+	writeFile(t, token, "first daemon's token")
+
+	_, err = claimStateFiles(filepath.Join(dir, "b.sock"), token, quiet)
+	if !errors.Is(err, errDaemonRunning) {
+		t.Fatalf("claim with a shared token path: got %v, want errDaemonRunning", err)
+	}
+	if got := readFile(t, token); got != "first daemon's token" {
+		t.Errorf("token = %q after a refused claim", got)
+	}
+	// The refused claim must not have left b.sock's lock held.
+	again, err := claimStateFiles(filepath.Join(dir, "b.sock"), filepath.Join(dir, "b.token"), quiet)
+	if err != nil {
+		t.Fatalf("b.sock still locked after the refused claim: %v", err)
+	}
+	again.release()
+}
+
+// On a home shared over NFS the lock reaches every host but the socket
+// does not, so a daemon on another host must not block this one.
+func TestClaimStateFiles_IgnoresAHolderOnAnotherHost(t *testing.T) {
+	shortLockWait(t)
+	dir := shortTempDir(t)
+	socket := filepath.Join(dir, "s.sock")
+	token := filepath.Join(dir, "token")
+
+	// Hold the socket's lock the way a daemon on another host would.
+	f, err := os.OpenFile(socket+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := tryLock(f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("some-other-host\n"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := claimStateFiles(socket, token, quiet)
+	if err != nil {
+		t.Fatalf("claim with the lock held on another host: %v", err)
+	}
+	if len(s.locks) != 1 {
+		t.Errorf("got %d locks, want only the token's", len(s.locks))
+	}
+	s.release()
+}
+
+// A daemon left draining a connection that never closes must still stop
+// on the next SIGTERM, or every later pkill would miss it.
+func TestDaemon_SecondSigtermStopsADrainingDaemon(t *testing.T) {
+	dir := shortTempDir(t)
+	socket := filepath.Join(dir, "s.sock")
+	token := filepath.Join(dir, "token")
+
+	d := spawnDaemon(t, dir, socket, token)
+	waitUp(t, socket, token)
+	client, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := d.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	// The first signal is handled once the token is gone.
+	deadline := time.Now().Add(10 * time.Second)
+	for exists(token) {
+		if time.Now().After(deadline) {
+			t.Fatal("token still there 10s after SIGTERM")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := d.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("daemon exited before the second signal (%v): the drain was not reproduced", err)
+	}
+
+	if err := d.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	waitExit(t, d)
 }

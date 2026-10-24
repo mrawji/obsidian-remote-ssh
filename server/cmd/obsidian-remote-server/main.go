@@ -86,7 +86,7 @@ func run(args []string) (int, error) {
 	// either. A daemon that cannot get the lock exits here and leaves the
 	// running daemon's files alone (#614). This also clears a dangling
 	// socket from a prior crashed run.
-	state, err := claimStateFiles(*socketPath, *tokenPath)
+	state, err := claimStateFiles(*socketPath, *tokenPath, logger)
 	if err != nil {
 		return 1, err
 	}
@@ -191,6 +191,10 @@ func run(args []string) (int, error) {
 	defer cancel()
 	go func() {
 		<-ctx.Done()
+		// Stop catching signals: the drain below has no deadline, so a
+		// second SIGTERM must still be able to kill a daemon stuck on a
+		// connection that never closes.
+		cancel()
 		logger.Info("shutdown signal received")
 		_ = listener.Close()
 		// Hand the paths over now rather than after Serve has drained its
