@@ -82,13 +82,15 @@ func run(args []string) (int, error) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
-	// Clean up any dangling socket from a prior crashed run, but refuse
-	// to start on one a live daemon still serves. This runs before the
-	// token is written: overwriting a live daemon's token would lock its
-	// client out.
-	if err := claimSocketPath(*socketPath); err != nil {
+	// Take ownership of the socket and token paths before touching
+	// either. A daemon that cannot get the lock exits here and leaves the
+	// running daemon's files alone (#614). This also clears a dangling
+	// socket from a prior crashed run.
+	state, err := claimStateFiles(*socketPath, *tokenPath)
+	if err != nil {
 		return 1, err
 	}
+	defer state.release()
 
 	token, err := auth.Generate()
 	if err != nil {
@@ -97,30 +99,17 @@ func run(args []string) (int, error) {
 	if err := auth.WriteFile(*tokenPath, token); err != nil {
 		return 1, err
 	}
-	tokenFile, err := ownFile(*tokenPath)
-	if err != nil {
-		return 1, fmt.Errorf("stat token file: %w", err)
-	}
-	defer tokenFile.remove()
 
-	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o700); err != nil {
-		return 1, fmt.Errorf("mkdir socket dir: %w", err)
-	}
 	listener, err := net.Listen("unix", *socketPath)
 	if err != nil {
 		return 1, fmt.Errorf("listen %q: %w", *socketPath, err)
 	}
-	socketFile, err := ownFile(*socketPath)
-	if err != nil {
-		_ = listener.Close()
-		return 1, fmt.Errorf("stat socket: %w", err)
-	}
-	// A UnixListener unlinks its path on Close even if another daemon
-	// has bound a new socket there since; socketFile.remove checks first.
+	// state.release removes the socket while it still holds the lock.
+	// The listener must not unlink the path again on a later Close, when
+	// the path may already be another daemon's.
 	if ul, ok := listener.(*net.UnixListener); ok {
 		ul.SetUnlinkOnClose(false)
 	}
-	defer socketFile.remove()
 	// Restrict socket to the current user.
 	if err := os.Chmod(*socketPath, 0o600); err != nil {
 		logger.Warn("chmod socket", "err", err.Error())
@@ -204,6 +193,9 @@ func run(args []string) (int, error) {
 		<-ctx.Done()
 		logger.Info("shutdown signal received")
 		_ = listener.Close()
+		// Hand the paths over now rather than after Serve has drained its
+		// connections: a redeploy's new daemon is waiting for the lock.
+		state.release()
 	}()
 
 	fmt.Fprintf(os.Stderr, "obsidian-remote-server %s\n", Version)

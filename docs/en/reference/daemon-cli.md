@@ -42,8 +42,8 @@ Relative paths are accepted but resolved to absolute via `filepath.Abs` at start
 Unix socket the daemon listens on. **Default: `<state-dir>/server.sock`** (state-dir is normally `~/.obsidian-remote/`).
 
 The daemon:
-1. Checks any existing file at this path. If another daemon still answers on it, exits with code `1` and leaves both that socket and the token file alone. Otherwise removes it (cleanup of a dangling socket from a crashed prior run)
-2. Creates the parent directory with mode `0700` if missing
+1. Creates the parent directory with mode `0700` if missing
+2. Takes an exclusive lock on `<socket>.lock`, waiting up to 2 s for a daemon that is shutting down. If another daemon still holds it, exits with code `1` and leaves that daemon's socket and token file alone. Otherwise removes any existing file at the socket path (cleanup of a dangling socket from a crashed prior run)
 3. Binds the Unix socket
 4. Chmods the socket to `0600` so only the daemon's user can connect
 
@@ -85,8 +85,9 @@ So a typical invocation with all defaults plants:
 
 ```
 ~/.obsidian-remote/
-    server.sock     # the Unix socket the daemon listens on (mode 0600)
-    token           # 32-byte hex token (mode 0600); auto-removed on clean exit
+    server.sock      # the Unix socket the daemon listens on (mode 0600)
+    server.sock.lock # held by the running daemon; decides which daemon owns the socket and token. Left in place on exit
+    token            # 32-byte hex token (mode 0600); auto-removed on clean exit
 ```
 
 You can override either path independently — useful for multi-vault setups (one socket per vault on the same OS user; see [[en/server/multi-user|Multi-user hosting]]).
@@ -166,11 +167,11 @@ In the plugin profile for each, set the matching socket + token paths. See [[en/
 
 ## Signal handling
 
-The daemon installs a SIGINT + SIGTERM handler that closes the listener (which unwinds `Serve`), removes the socket file + token file, then exits `0`. This is graceful shutdown.
+The daemon installs a SIGINT + SIGTERM handler that closes the listener, removes the socket file + token file, releases the lock, and then waits for open connections to finish before it exits `0`. This is graceful shutdown.
 
-It removes each file only if it is still the one this daemon created. If another daemon has taken over the path in the meantime (a redeploy starts the new daemon while the old one may still be draining connections), the old daemon leaves the new one's socket and token in place.
+The files go and the lock is released *before* the drain, while the daemon still owns the paths. A redeploy starts the new daemon right after sending SIGTERM, so the new daemon can take the lock at once. The old daemon never touches the paths again after that, even if it takes a while to drain.
 
-`kill -9` (SIGKILL) skips the cleanup. The next daemon start will find the stale socket file at `<socket>` and the existing handler removes it before binding fresh — so a hard kill doesn't permanently jam the path.
+`kill -9` (SIGKILL) skips the cleanup. The kernel still drops the lock when the process dies, so the next daemon takes it, finds the stale socket file at `<socket>` and removes it before binding fresh. A hard kill doesn't permanently jam the path.
 
 ## Environment variables
 
