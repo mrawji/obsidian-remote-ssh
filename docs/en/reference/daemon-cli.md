@@ -42,7 +42,7 @@ Relative paths are accepted but resolved to absolute via `filepath.Abs` at start
 Unix socket the daemon listens on. **Default: `<state-dir>/server.sock`** (state-dir is normally `~/.obsidian-remote/`).
 
 The daemon:
-1. Removes any existing file at this path (cleanup of dangling sockets from a crashed prior run)
+1. Checks any existing file at this path. If another daemon still answers on it, exits with code `1` and leaves both that socket and the token file alone. Otherwise removes it (cleanup of a dangling socket from a crashed prior run)
 2. Creates the parent directory with mode `0700` if missing
 3. Binds the Unix socket
 4. Chmods the socket to `0600` so only the daemon's user can connect
@@ -161,12 +161,14 @@ In the plugin profile for each, set the matching socket + token paths. See [[en/
 | Code | Meaning |
 |---|---|
 | `0` | Clean shutdown (SIGINT / SIGTERM received and listener drained, or `--version` printed) |
-| `1` | Runtime error after startup (cannot bind socket, token write failed, vault root vanished, etc.) — message goes to stderr |
+| `1` | Runtime error after startup (another daemon already serves the socket, cannot bind socket, token write failed, vault root vanished, etc.) — message goes to stderr |
 | `2` | Argument parse error (missing required flag, invalid value) — flag.ContinueOnError surfaces this |
 
 ## Signal handling
 
 The daemon installs a SIGINT + SIGTERM handler that closes the listener (which unwinds `Serve`), removes the socket file + token file, then exits `0`. This is graceful shutdown.
+
+It removes each file only if it is still the one this daemon created. If another daemon has taken over the path in the meantime (a redeploy starts the new daemon while the old one may still be draining connections), the old daemon leaves the new one's socket and token in place.
 
 `kill -9` (SIGKILL) skips the cleanup. The next daemon start will find the stale socket file at `<socket>` and the existing handler removes it before binding fresh — so a hard kill doesn't permanently jam the path.
 

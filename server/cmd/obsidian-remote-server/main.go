@@ -82,6 +82,14 @@ func run(args []string) (int, error) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
+	// Clean up any dangling socket from a prior crashed run, but refuse
+	// to start on one a live daemon still serves. This runs before the
+	// token is written: overwriting a live daemon's token would lock its
+	// client out.
+	if err := claimSocketPath(*socketPath); err != nil {
+		return 1, err
+	}
+
 	token, err := auth.Generate()
 	if err != nil {
 		return 1, err
@@ -89,10 +97,12 @@ func run(args []string) (int, error) {
 	if err := auth.WriteFile(*tokenPath, token); err != nil {
 		return 1, err
 	}
-	defer func() { _ = os.Remove(*tokenPath) }()
+	tokenFile, err := ownFile(*tokenPath)
+	if err != nil {
+		return 1, fmt.Errorf("stat token file: %w", err)
+	}
+	defer tokenFile.remove()
 
-	// Clean up any dangling socket from a prior crashed run.
-	_ = os.Remove(*socketPath)
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o700); err != nil {
 		return 1, fmt.Errorf("mkdir socket dir: %w", err)
 	}
@@ -100,7 +110,17 @@ func run(args []string) (int, error) {
 	if err != nil {
 		return 1, fmt.Errorf("listen %q: %w", *socketPath, err)
 	}
-	defer func() { _ = os.Remove(*socketPath) }()
+	socketFile, err := ownFile(*socketPath)
+	if err != nil {
+		_ = listener.Close()
+		return 1, fmt.Errorf("stat socket: %w", err)
+	}
+	// A UnixListener unlinks its path on Close even if another daemon
+	// has bound a new socket there since; socketFile.remove checks first.
+	if ul, ok := listener.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	defer socketFile.remove()
 	// Restrict socket to the current user.
 	if err := os.Chmod(*socketPath, 0o600); err != nil {
 		logger.Warn("chmod socket", "err", err.Error())
