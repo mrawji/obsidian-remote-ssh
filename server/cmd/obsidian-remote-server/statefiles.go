@@ -83,7 +83,7 @@ func claimStateFiles(socket, token string, log *slog.Logger) (*stateFiles, error
 // over NFS the lock reaches every host, but the unix socket does not.
 func lockPath(path string, log *slog.Logger) (*os.File, error) {
 	name := path + ".lock"
-	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 — daemon-controlled path, not user input
 	if err != nil {
 		return nil, fmt.Errorf("open lock %q: %w", name, err)
 	}
@@ -117,7 +117,7 @@ func lockPath(path string, log *slog.Logger) (*os.File, error) {
 // lockHolder returns the host the holder of lock name wrote, or "" if it
 // has not written one yet.
 func lockHolder(name string) string {
-	b, err := os.ReadFile(name)
+	b, err := os.ReadFile(name) // #nosec G304 — daemon-controlled path, not user input
 	if err != nil {
 		return ""
 	}
