@@ -29,6 +29,13 @@ export interface WriterReflector {
   reflectWrite(path: string, stat?: WrittenStat): void;
 
   /**
+   * Drop Obsidian's cached copy of the file's text, so the next cachedRead
+   * goes through the adapter: the write put other text on the remote than
+   * the caller handed in.
+   */
+  forgetText(path: string): void;
+
+  /**
    * After `rename`: move the entry between `fileMap` keys and fire
    * `vault.trigger('rename', file, oldPath)`.
    */

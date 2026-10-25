@@ -402,8 +402,9 @@ export class VaultModelBuilder {
 
   // ─── writer self-reflect (#341) ─────────────────────────────────────────
   //
-  // These four methods structurally satisfy `adapter/WriterReflector`.
-  // `SftpDataAdapter` calls them after a local-originated mutation so
+  // These methods structurally satisfy `adapter/WriterReflector`.
+  // `SftpDataAdapter` calls them after a local-originated mutation
+  // (`forgetText` just before the `reflectWrite` it precedes) so
   // the writer's own vault model stays in sync without waiting for a
   // remote `FsChangeListener` echo (which never arrives on the SFTP
   // transport — no daemon). There is no `implements WriterReflector`
@@ -411,7 +412,7 @@ export class VaultModelBuilder {
   // value the class never references. Conformance is instead pinned
   // at build time by the type-only `satisfies`-style anchor at the
   // bottom of this file (tsconfig compiles only `src/**`, so the test
-  // wiring is *not* a typecheck — without the anchor a `reflect*`
+  // wiring is *not* a typecheck — without the anchor a member's
   // signature drift would ship green).
   //
   // The underlying `*One` mutators return `false` when the model
@@ -419,6 +420,12 @@ export class VaultModelBuilder {
   // missing). For a writer reflect that `false` means the writer's
   // own vault model just diverged from the remote — the exact #341
   // symptom — so it is logged rather than silently dropped.
+
+  /** `TFile.cache` is internal; null drops the cached text. */
+  forgetText(path: string): void {
+    const file = this.vault.getAbstractFileByPath(path) as { cache?: (data: null) => void } | null;
+    file?.cache?.(null);
+  }
 
   /**
    * Reflect a writer-side `adapter.write` / `writeBinary`. Inserts the
