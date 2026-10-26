@@ -18,6 +18,14 @@ func inodeOf(info os.FileInfo) (uint64, bool) {
 	return uint64(st.Ino), true
 }
 
+func deviceOf(info os.FileInfo) (uint64, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(st.Dev), true
+}
+
 // xattrAbsent reports whether a getxattr error means the file has no
 // such xattr, or can't have one, rather than that the read failed.
 // ERANGE: the value is longer than any of ours. ENOTSUP and EOPNOTSUPP

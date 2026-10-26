@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // createdXattr keeps a file's creation time across atomicWriteFile's
@@ -46,7 +47,7 @@ var birthTime = birthMillis
 // garbled value, nor where xattrs aren't supported.
 func readCreatedXattr(abs string, info os.FileInfo) (int64, bool, error) {
 	ino, ok := inodeOf(info)
-	if !ok {
+	if !ok || !xattrsUsable(abs, info) {
 		return 0, false, nil
 	}
 	// Fits "<int64>:<uint64>"; anything longer isn't ours.
@@ -77,9 +78,35 @@ func writeCreatedXattr(abs string, ms int64) error {
 		return err
 	}
 	ino, ok := inodeOf(info)
-	if !ok {
+	if !ok || !xattrsUsable(abs, info) {
 		return errors.ErrUnsupported
 	}
 	val := strconv.FormatInt(ms, 10) + ":" + strconv.FormatUint(ino, 10)
 	return setXattr(abs, createdXattr, []byte(val))
+}
+
+// A var, so a test can fake the filesystem.
+var xattrsUsable = onLocalDisk
+
+// localDevs caches onLocalDisk per device: statfs can itself be a round
+// trip on a network filesystem.
+var localDevs sync.Map // uint64 → bool
+
+// onLocalDisk reports whether abs is on a local disk, the only place the
+// xattr is read or written. Over NFS a file without it costs a round trip
+// on every lookup, since the client doesn't cache "no such attribute":
+// that made fs.walk of an unstamped vault 65x slower at a 0.5 ms round
+// trip. Off local disks, created falls back as on a filesystem without
+// xattrs. A filesystem it doesn't recognize counts as not local.
+func onLocalDisk(abs string, info os.FileInfo) bool {
+	dev, ok := deviceOf(info)
+	if !ok {
+		return false
+	}
+	if v, ok := localDevs.Load(dev); ok {
+		return v.(bool)
+	}
+	local := isLocalFS(abs)
+	localDevs.Store(dev, local)
+	return local
 }

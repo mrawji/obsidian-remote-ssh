@@ -484,3 +484,83 @@ func TestFsStat_OmitsUnknownCreated(t *testing.T) {
 		t.Errorf("stat JSON = %s, want no \"created\"", out)
 	}
 }
+
+// fakeLocal makes onLocalDisk report local for the test's duration.
+func fakeLocal(t *testing.T, local bool) {
+	t.Helper()
+	orig := xattrsUsable
+	t.Cleanup(func() { xattrsUsable = orig })
+	xattrsUsable = func(string, os.FileInfo) bool { return local }
+}
+
+// Over NFS a file without the xattr costs a round trip per lookup, which
+// the client doesn't cache: off local disks it isn't read at all.
+func TestCreatedMillis_SkipsTheXattrOffLocalDisks(t *testing.T) {
+	root := t.TempDir()
+	abs := seedCreated(t, root, "a.md", "x")
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeLocal(t, false)
+	calls := failXattrReads(t, nil, 0)
+	fakeBirth(t, 0, false)
+
+	if got, want := createdMillis(abs, info), mtimeMillis(info); got != want {
+		t.Errorf("created = %d, want mtime %d", got, want)
+	}
+	if *calls != 0 {
+		t.Errorf("getXattr calls = %d, want 0", *calls)
+	}
+}
+
+// Nor stamped: nothing would read it.
+func TestAtomicWriteFile_DoesNotStampOffLocalDisks(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "note.md")
+	if err := os.WriteFile(abs, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeLocal(t, false)
+	origSet := setXattr
+	t.Cleanup(func() { setXattr = origSet })
+	stamped := 0
+	setXattr = func(path, name string, data []byte) error {
+		stamped++
+		return origSet(path, name, data)
+	}
+
+	if _, _, rerr := atomicWriteFile(abs, "note.md", []byte("v2"), 0); rerr != nil {
+		t.Fatalf("atomicWriteFile: %+v", rerr)
+	}
+	if stamped != 0 {
+		t.Errorf("setXattr calls = %d, want 0", stamped)
+	}
+}
+
+// The tests' temp dir is on a local disk (ext4, xfs or tmpfs in CI).
+func TestOnLocalDisk_TempDir(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "a.md")
+	if err := os.WriteFile(abs, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := inodeOf(info); !ok {
+		t.Skip("no xattr support on this platform")
+	}
+	if !onLocalDisk(abs, info) {
+		t.Errorf("onLocalDisk(%s) = false, want true", abs)
+	}
+}
+
+func TestOnLocalDisk_ErrorPaths(t *testing.T) {
+	if onLocalDisk(t.TempDir(), fakeInfo{}) {
+		t.Error("onLocalDisk without a device: want false")
+	}
+	if isLocalFS(filepath.Join(t.TempDir(), "missing")) {
+		t.Error("isLocalFS on a missing path: want false")
+	}
+}

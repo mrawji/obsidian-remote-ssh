@@ -137,7 +137,9 @@ Atomicity notes:
   rename replaces the inode. If you find it on your files, that is what
   it is: safe to remove, after which the daemon reports the file's
   birth time or mtime as `created`. Best-effort; a filesystem without
-  user xattrs just doesn't get it.
+  user xattrs just doesn't get it, and neither does one that isn't a
+  local disk (NFS, SMB, FUSE): there, a file without the xattr would cost
+  a network round trip on every listing.
 
 ## Notifications (server → client)
 

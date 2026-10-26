@@ -161,7 +161,7 @@ const writeFilePerm = 0o644
 // never fails the write, and without it a file reports its last save as
 // its creation time, as it did before the xattr existed. A stamp that
 // can't be read (after one retry) isn't replaced with a guess: tmp is
-// left unstamped.
+// left unstamped. Only on local disks: see onLocalDisk.
 //
 // relativePath is used solely to tag error messages with a path the
 // client recognises.
