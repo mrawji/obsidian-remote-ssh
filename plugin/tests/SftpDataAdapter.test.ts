@@ -10,6 +10,7 @@ import { OfflineQueue } from '../src/offline/OfflineQueue';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { logger } from '../src/util/logger';
 import type { RemoteEntry, RemoteStat } from '../src/types';
 
 /** Minimal stand-in for SftpClient covering both read- and write-side calls. */
@@ -1087,6 +1088,30 @@ describe('SftpDataAdapter (read-side)', () => {
       expect(await adapter.process('note.md', () => 'mine')).toBe('merged text');
     });
 
+    // The resolver hands back a new Buffer here; what counts is the bytes.
+    it('a merge that lands the caller\'s own text calls immediate', async () => {
+      const { adapter } = await primeAndConflict({
+        ancestorContent: 'v0',
+        mineContent:     'mine',
+        theirsContent:   'theirs',
+        decision:        { decision: 'merged', content: 'mine' },
+      });
+      const forgetText = vi.fn();
+      adapter.setWriterReflector({
+        reflectWrite:  vi.fn(),
+        forgetText,
+        reflectRename: vi.fn(),
+        reflectRemove: vi.fn(),
+        reflectMkdir:  vi.fn(),
+      });
+      const immediate = vi.fn();
+
+      await adapter.write('note.md', 'mine', { immediate } as never);
+
+      expect(immediate).toHaveBeenCalledTimes(1);
+      expect(forgetText).not.toHaveBeenCalled();
+    });
+
     it('keep-mine still calls immediate', async () => {
       const { adapter } = await primeAndConflict({
         ancestorContent: 'v0',
@@ -1213,16 +1238,22 @@ describe('SftpDataAdapter (offline queue while reconnecting)', () => {
     });
   });
 
-  it('calls options.immediate once a write is queued', async () => {
+  it('calls options.immediate once a write is queued, on every write path', async () => {
     const fake = makeFakeClient({});
     const adapter = makeAdapterWithQueue({ client: fake.client });
     adapter.setReconnecting(true);
-    const immediate = vi.fn();
+    const called: string[] = [];
+    const opts = (p: string) => ({ immediate: () => { called.push(p); } });
 
-    await adapter.write('a.md', 'hello', { immediate } as never);
-    await adapter.writeBinary('b.bin', new ArrayBuffer(1), { immediate } as never);
+    await adapter.write('a.md', 'hello', opts('write a.md'));
+    await adapter.writeBinary('b.bin', new ArrayBuffer(1), opts('writeBinary b.bin'));
+    await adapter.append('a.md', 'y', opts('append a.md'));
+    await adapter.appendBinary('b.bin', new ArrayBuffer(1), opts('appendBinary b.bin'));
+    await adapter.process('a.md', s => s + 'z', opts('process a.md'));
 
-    expect(immediate).toHaveBeenCalledTimes(2);
+    expect(called).toEqual([
+      'write a.md', 'writeBinary b.bin', 'append a.md', 'appendBinary b.bin', 'process a.md',
+    ]);
   });
 
   it('does not call options.immediate when there is no queue to take the write', async () => {
@@ -1661,6 +1692,32 @@ describe('SftpDataAdapter — writer reflect (#341)', () => {
       'immediate d.bin', 'reflect d.bin',
       'immediate a.md', 'reflect a.md',
     ]);
+  });
+
+  // The write already landed: reporting it as failed would provoke a retry,
+  // and skipping the reflect would leave the vault model stale.
+  // Logged with the thrown value's kind, as `reflect` does, whether or not
+  // it is an Error.
+  it('a throwing options.immediate is logged, and neither fails the write nor skips the reflect', async () => {
+    const fake = makeFakeClient({ dirs: { '/v': [] } });
+    const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
+    const r = makeReflector();
+    adapter.setWriterReflector(r);
+    const throwsError = () => { throw new TypeError('hook fault'); };
+    const throwsString = () => { throw 'hook fault'; };
+    const warn = vi.spyOn(logger, 'warn');
+    try {
+      await adapter.write('a.md', 'x', { immediate: throwsError } as never);
+      await adapter.writeBinary('b.bin', new ArrayBuffer(1), { immediate: throwsString } as never);
+
+      expect(r.reflectWrite.mock.calls.map(c => c[0])).toEqual(['a.md', 'b.bin']);
+      expect(warn.mock.calls.map(c => c[0])).toEqual([
+        'SftpDataAdapter: immediate hook failed [TypeError]: hook fault',
+        'SftpDataAdapter: immediate hook failed [string]: hook fault',
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('does not call options.immediate when the write fails', async () => {
