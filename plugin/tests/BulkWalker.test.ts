@@ -123,12 +123,15 @@ describe('BulkWalker', () => {
     expect(result.entries[2]).toMatchObject({ path: 'README.md',    isDirectory: false, mtime: 3000, size: 42 });
   });
 
-  it('takes ctime from the daemon\'s created, falling back to mtime', async () => {
+  // ctime 0 is the model's "unknown": the reconcile keeps the modelled one,
+  // and a new file falls back to mtime when it's inserted.
+  it('takes ctime from the daemon\'s created, or 0 (unknown) without one', async () => {
     const adapter = makeAdapter({});
     const { rpc } = makeRpc(['fs.walk'], {
       entries: [
         { path: 'new.md', type: 'file', mtime: 2000, created: 500, size: 1 },
-        { path: 'old.md', type: 'file', mtime: 3000, size: 1 }, // no `created`
+        { path: 'old.md', type: 'file', mtime: 3000, size: 1 }, // no `created`: older daemon
+        { path: 'zero.md', type: 'file', mtime: 4000, created: 0, size: 1 },
       ],
       truncated: false,
     });
@@ -136,7 +139,7 @@ describe('BulkWalker', () => {
 
     const result = await walker.walk('');
 
-    expect(result.entries.map(e => [e.path, e.ctime])).toEqual([['new.md', 500], ['old.md', 3000]]);
+    expect(result.entries.map(e => [e.path, e.ctime])).toEqual([['new.md', 500], ['old.md', 0], ['zero.md', 0]]);
   });
 
   it('hides ALL dot-prefixed entries (incl the config dir) and reports hiddenCount', async () => {

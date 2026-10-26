@@ -26,7 +26,7 @@ export interface ServerInfo {
 export interface Stat {
   type: 'file' | 'folder';
   mtime: number;
-  /** Creation time, unix ms (Obsidian `FileStats.ctime`, not POSIX st_ctime). */
+  /** Creation time, unix ms (Obsidian `FileStats.ctime`, not POSIX st_ctime). Absent when unknown. */
   created?: number;
   size: number;
   mode: number;

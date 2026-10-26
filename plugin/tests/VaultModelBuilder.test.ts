@@ -454,6 +454,18 @@ describe('VaultModelBuilder.modifyOne', () => {
     expect(triggers).toEqual([{ event: 'modify', args: [file] }]);
   });
 
+  it('keeps the existing ctime when given an unknown one (0)', async () => {
+    const { vault, fileMap } = makeFakeVault();
+    const builder = new VaultModelBuilder(vault as never, deps);
+    await builder.build([
+      { path: 'note.md', isDirectory: false, ctime: 1, mtime: 2, size: 3 },
+    ]);
+
+    builder.modifyOne('note.md', { ctime: 0, mtime: 20, size: 30 });
+
+    expect((fileMap['note.md'] as FakeTFile).stat).toEqual({ ctime: 1, mtime: 20, size: 30 });
+  });
+
   it('fires modify but leaves stat untouched when called without a stat arg', async () => {
     const { vault, fileMap, triggers } = makeFakeVault();
     const builder = new VaultModelBuilder(vault as never, deps);
@@ -649,6 +661,17 @@ describe('VaultModelBuilder.reflect* (#341 writer self-reflect)', () => {
 
     expect((fileMap['Notes.md'] as FakeTFile).stat).toEqual({ ctime: 50, mtime: 500, size: 9 });
     expect((fileMap['Fresh.md'] as FakeTFile).stat).toEqual({ ctime: 40, mtime: 600, size: 1 });
+  });
+
+  it('a file inserted with an unknown ctime (0) gets its mtime', () => {
+    const { vault, fileMap } = makeFakeVault();
+    const builder = new VaultModelBuilder(vault as never, deps);
+
+    builder.insertOne({ path: 'Notes.md', isDirectory: false, ctime: 0, mtime: 200, size: 3 });
+    builder.reflectWrite('Fresh.md', { ctime: 0, mtime: 600, size: 1 });
+
+    expect((fileMap['Notes.md'] as FakeTFile).stat).toEqual({ ctime: 200, mtime: 200, size: 3 });
+    expect((fileMap['Fresh.md'] as FakeTFile).stat).toEqual({ ctime: 600, mtime: 600, size: 1 });
   });
 
   it('reflectWrite does not keep a placeholder ctime of 0', () => {

@@ -105,7 +105,8 @@ interface Stat {
   // Creation time, unix ms (Obsidian FileStats.ctime, not POSIX st_ctime).
   // From the `user.obsidian-remote.created` xattr ("<ms>:<inode>", kept
   // across tmp+rename writes), else OS birth time clamped to mtime, else
-  // mtime.
+  // mtime. Absent when unknown: from an older daemon, or when the xattr
+  // couldn't be read.
   created?: number;
   size: number;   // bytes (0 for folders)
   mode: number;   // POSIX mode bits (informational)

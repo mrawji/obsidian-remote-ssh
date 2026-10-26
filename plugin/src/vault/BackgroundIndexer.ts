@@ -335,11 +335,15 @@ export class BackgroundIndexer {
         if (e.isDirectory) continue;
         const was = before.get(e.path);
         if (!was || was.isDirectory) continue;
-        // Compare ctime too: a restored snapshot can hold a stale one.
-        if (was.mtime === e.mtime && was.size === e.size && was.ctime === e.ctime) continue;
+        // Compare ctime too: a restored snapshot can hold a stale one. Not
+        // when the walk doesn't know it (0, an older daemon): that would fire
+        // `modify` on every edited note at every reconnect.
+        const sameCtime = e.ctime === 0 || was.ctime === e.ctime;
+        if (was.mtime === e.mtime && was.size === e.size && sameCtime) continue;
         const now = this.deps.currentStat?.(e.path);
         if (now && (now.mtime !== was.mtime || now.size !== was.size)) continue;
-        if (builder.modifyOne(e.path, { ctime: e.ctime, mtime: e.mtime, size: e.size })) modified++;
+        const ctime = e.ctime || was.ctime;
+        if (builder.modifyOne(e.path, { ctime, mtime: e.mtime, size: e.size })) modified++;
       }
     }
     if (opts.removals) {

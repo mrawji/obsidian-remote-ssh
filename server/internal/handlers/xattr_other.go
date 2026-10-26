@@ -9,8 +9,8 @@ import (
 
 func inodeOf(os.FileInfo) (uint64, bool) { return 0, false }
 
+func xattrAbsent(err error) bool { return errors.Is(err, errors.ErrUnsupported) }
+
 var getXattr = func(string, string, []byte) (int, error) { return 0, errors.ErrUnsupported }
 
 var setXattr = func(string, string, []byte) error { return errors.ErrUnsupported }
-
-func removeXattr(string, string) error { return errors.ErrUnsupported }

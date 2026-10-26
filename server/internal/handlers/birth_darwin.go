@@ -7,8 +7,12 @@ import (
 	"syscall"
 )
 
-// birthMillis reads st_birthtimespec.
+// birthMillis reads st_birthtimespec. It needs info: unlike Linux, it
+// doesn't look up the path.
 func birthMillis(_ string, info os.FileInfo) (int64, bool) {
+	if info == nil {
+		return 0, false
+	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return 0, false

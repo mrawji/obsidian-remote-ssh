@@ -159,7 +159,9 @@ const writeFilePerm = 0o644
 // (see createdXattr; the inode tells a stamp copied along with the file
 // from ours). Best-effort, by design: a failure reading or writing it
 // never fails the write, and without it a file reports its last save as
-// its creation time, as it did before the xattr existed.
+// its creation time, as it did before the xattr existed. A stamp that
+// can't be read (after one retry) isn't replaced with a guess: tmp is
+// left unstamped.
 //
 // relativePath is used solely to tag error messages with a path the
 // client recognises.
@@ -172,6 +174,11 @@ func atomicWriteFile(abs, relativePath string, data []byte, expectedMtime int64)
 	if info, err := os.Stat(abs); err == nil {
 		preExisted = true
 		created = createdMillis(abs, info)
+		if created == 0 {
+			// Unknown: the xattr read failed. The rename drops the
+			// stamp along with the old inode, so try once more.
+			created = createdMillis(abs, info)
+		}
 		if expectedMtime != 0 {
 			got := info.ModTime().UnixMilli()
 			if got != expectedMtime {
@@ -211,7 +218,7 @@ func atomicWriteFile(abs, relativePath string, data []byte, expectedMtime int64)
 		// some Windows filesystems): keep going.
 		_ = err
 	}
-	if preExisted {
+	if preExisted && created > 0 {
 		// The rename swaps in tmp's inode; carry the creation time over.
 		// Best-effort: without xattr support the write still succeeds.
 		_ = writeCreatedXattr(tmpPath, created)

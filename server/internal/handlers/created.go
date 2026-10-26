@@ -16,40 +16,57 @@ const createdXattr = "user.obsidian-remote.created"
 // createdMillis returns the creation time in unix ms (Obsidian
 // FileStats.ctime, not POSIX st_ctime): the xattr, else the OS birth
 // time clamped to mtime (copied vaults get fresh birth times), else
-// mtime. Non-regular files return mtime: the plugin ignores folder
-// ctimes, and the lookups would follow symlinks.
+// mtime. It returns 0, unknown, when the xattr couldn't be read: the
+// stamp may be there, and a fallback would contradict it. Non-regular
+// files return mtime: the plugin ignores folder ctimes, and the lookups
+// would follow symlinks.
 func createdMillis(abs string, info os.FileInfo) int64 {
 	if info.Mode().IsRegular() {
-		if ms, ok := readCreatedXattr(abs, info); ok {
+		ms, ok, err := readCreatedXattr(abs, info)
+		if err != nil {
+			return 0
+		}
+		if ok {
 			return ms
 		}
-		if ms, ok := birthMillis(abs, info); ok {
+		// 0: the filesystem doesn't record a birth time (macOS reports
+		// 0 on NFS, SMB and some FUSE mounts).
+		if ms, ok := birthTime(abs, info); ok && ms > 0 {
 			return min(ms, mtimeMillis(info))
 		}
 	}
 	return mtimeMillis(info)
 }
 
-func readCreatedXattr(abs string, info os.FileInfo) (int64, bool) {
+// A var, so a test can fake the OS birth time.
+var birthTime = birthMillis
+
+// readCreatedXattr returns our stamp on abs, if it has a valid one. err
+// is set only when the read failed, not for a missing, foreign or
+// garbled value, nor where xattrs aren't supported.
+func readCreatedXattr(abs string, info os.FileInfo) (int64, bool, error) {
 	ino, ok := inodeOf(info)
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
 	// Fits "<int64>:<uint64>"; anything longer isn't ours.
 	buf := make([]byte, 48)
 	n, err := getXattr(abs, createdXattr, buf)
-	if err != nil || n <= 0 {
-		return 0, false
+	if err != nil {
+		if xattrAbsent(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
 	}
 	msStr, inoStr, found := strings.Cut(string(buf[:n]), ":")
 	if !found || inoStr != strconv.FormatUint(ino, 10) {
-		return 0, false
+		return 0, false, nil
 	}
 	ms, err := strconv.ParseInt(msStr, 10, 64)
 	if err != nil || ms <= 0 {
-		return 0, false
+		return 0, false, nil
 	}
-	return ms, true
+	return ms, true, nil
 }
 
 // writeCreatedXattr tags the value with abs's inode. Rename keeps the

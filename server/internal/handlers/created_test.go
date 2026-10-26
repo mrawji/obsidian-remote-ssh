@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -33,14 +34,14 @@ func seedCreated(t *testing.T, root, rel, content string) string {
 	return abs
 }
 
-// requireXattrs skips the test unless user xattrs can be set on abs.
+// requireXattrs skips the test unless user xattrs can be set on abs. The
+// probe stays on abs; the test's temp dir goes away with it.
 func requireXattrs(t *testing.T, abs string) {
 	t.Helper()
 	const probe = "user.obsidian-remote.probe"
 	if err := setXattr(abs, probe, []byte("1")); err != nil {
 		t.Skipf("filesystem has no user xattrs (%v)", err)
 	}
-	_ = removeXattr(abs, probe)
 }
 
 func TestCreatedMillis_PrefersXattr(t *testing.T) {
@@ -168,6 +169,21 @@ func TestCreatedMillis_IgnoresGarbageXattr(t *testing.T) {
 	}
 	if got := createdMillis(abs, info); got == 0 {
 		t.Errorf("createdMillis = 0, want a btime / mtime fallback")
+	}
+}
+
+func TestCreatedMillis_IgnoresEmptyXattr(t *testing.T) {
+	root := t.TempDir()
+	abs := seedCreated(t, root, "a.md", "x")
+	if err := setXattr(abs, createdXattr, nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := createdMillis(abs, info); got == 0 || got == seededCreated {
+		t.Errorf("createdMillis = %d, want a btime / mtime fallback", got)
 	}
 }
 
@@ -310,10 +326,10 @@ func TestCreatedHelpers_ErrorPaths(t *testing.T) {
 	if err := setXattr(abs, createdXattr, []byte(fmt.Sprintf("soon:%d", ino))); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := readCreatedXattr(abs, info); ok {
+	if _, ok, _ := readCreatedXattr(abs, info); ok {
 		t.Error("readCreatedXattr with a non-numeric timestamp: want ok=false")
 	}
-	if _, ok := readCreatedXattr(abs, fakeInfo{}); ok {
+	if _, ok, _ := readCreatedXattr(abs, fakeInfo{}); ok {
 		t.Error("readCreatedXattr without an inode: want ok=false")
 	}
 }
@@ -322,3 +338,149 @@ func TestCreatedHelpers_ErrorPaths(t *testing.T) {
 type fakeInfo struct{ os.FileInfo }
 
 func (fakeInfo) Sys() any { return nil }
+
+// fakeBirth makes birthTime report ms, ok for the test's duration.
+func fakeBirth(t *testing.T, ms int64, ok bool) {
+	t.Helper()
+	orig := birthTime
+	t.Cleanup(func() { birthTime = orig })
+	birthTime = func(string, os.FileInfo) (int64, bool) { return ms, ok }
+}
+
+// failXattrReads makes the first n getXattr calls fail with err (all of
+// them if n < 0) and counts the calls.
+func failXattrReads(t *testing.T, err error, n int) *int {
+	t.Helper()
+	orig := getXattr
+	t.Cleanup(func() { getXattr = orig })
+	calls := 0
+	getXattr = func(path, name string, dest []byte) (int, error) {
+		calls++
+		if n < 0 || calls <= n {
+			return 0, err
+		}
+		return orig(path, name, dest)
+	}
+	return &calls
+}
+
+// Filesystems that don't record a birth time can report 0 (macOS on NFS,
+// SMB, some FUSE mounts); taken at face value it would win the clamp.
+func TestCreatedMillis_IgnoresZeroBirthTime(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "a.md")
+	if err := os.WriteFile(abs, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeBirth(t, 0, true)
+
+	if got, want := createdMillis(abs, info), mtimeMillis(info); got != want {
+		t.Errorf("created = %d, want mtime %d", got, want)
+	}
+}
+
+// A read that failed says nothing about the stamp, so the creation time
+// is unknown (0), not the fallback.
+func TestCreatedMillis_UnknownWhenXattrReadFails(t *testing.T) {
+	root := t.TempDir()
+	abs := seedCreated(t, root, "a.md", "x")
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failXattrReads(t, syscall.EIO, -1)
+
+	if got := createdMillis(abs, info); got != 0 {
+		t.Errorf("created = %d, want 0 (unknown)", got)
+	}
+}
+
+// No xattr support is permanent, not a failed read: fall back as before.
+func TestCreatedMillis_FallsBackWhenXattrsUnsupported(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "a.md")
+	if err := os.WriteFile(abs, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failXattrReads(t, errors.ErrUnsupported, -1)
+	fakeBirth(t, 0, false)
+
+	if got, want := createdMillis(abs, info), mtimeMillis(info); got != want {
+		t.Errorf("created = %d, want mtime %d", got, want)
+	}
+}
+
+// The rename swaps the inode, so a stamp that can't be read now is lost:
+// try once more before giving up.
+func TestAtomicWriteFile_RetriesAFailedXattrRead(t *testing.T) {
+	root := t.TempDir()
+	abs := seedCreated(t, root, "note.md", "v1")
+	calls := failXattrReads(t, syscall.EIO, 1)
+
+	if _, _, rerr := atomicWriteFile(abs, "note.md", []byte("v2"), 0); rerr != nil {
+		t.Fatalf("atomicWriteFile: %+v", rerr)
+	}
+	if *calls != 2 {
+		t.Errorf("getXattr calls = %d, want 2", *calls)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := createdMillis(abs, info); got != seededCreated {
+		t.Errorf("created after overwrite = %d, want %d", got, seededCreated)
+	}
+}
+
+// Stamping the fallback would make a guess permanent.
+func TestAtomicWriteFile_DoesNotStampAnUnknownCreated(t *testing.T) {
+	root := t.TempDir()
+	abs := seedCreated(t, root, "note.md", "v1")
+	failXattrReads(t, syscall.EIO, -1)
+	origSet := setXattr
+	t.Cleanup(func() { setXattr = origSet })
+	stamped := 0
+	setXattr = func(path, name string, data []byte) error {
+		stamped++
+		return origSet(path, name, data)
+	}
+
+	if _, _, rerr := atomicWriteFile(abs, "note.md", []byte("v2"), 0); rerr != nil {
+		t.Fatalf("atomicWriteFile: %+v", rerr)
+	}
+	if stamped != 0 {
+		t.Errorf("setXattr calls = %d, want 0", stamped)
+	}
+	if got, err := os.ReadFile(abs); err != nil || string(got) != "v2" {
+		t.Errorf("content = %q (%v), want %q", got, err, "v2")
+	}
+}
+
+// Unknown is sent as an absent field, so clients fall back on their side.
+func TestFsStat_OmitsUnknownCreated(t *testing.T) {
+	root := t.TempDir()
+	seedCreated(t, root, "a.md", "x")
+	failXattrReads(t, syscall.EIO, -1)
+	raw, _ := json.Marshal(proto.PathOnlyParams{Path: "a.md"})
+	result, rerr := FsStat(root)(context.Background(), raw)
+	if rerr != nil {
+		t.Fatalf("unexpected error: %+v", rerr)
+	}
+	out, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(out, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["created"]; ok {
+		t.Errorf("stat JSON = %s, want no \"created\"", out)
+	}
+}

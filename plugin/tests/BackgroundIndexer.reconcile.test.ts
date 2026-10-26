@@ -123,6 +123,26 @@ describe('BackgroundIndexer reconcile', () => {
     expect(completions).toEqual([{ viaFastPath: true, modified: 1, removed: 0 }]);
   });
 
+  // An older daemon reports no `created`, so the walk's ctime is 0 (unknown).
+  // Comparing it would fire `modify` on every edited note at every reconnect.
+  it('fast path: does not compare a ctime the walk does not know', async () => {
+    const m = makeModel([{ ...file('a.md', 5, 10), ctime: 3 }]);
+    const { indexer } = makeIndexer({
+      fastPath: true, model: m, remote: [{ ...file('a.md', 5, 10), ctime: 0 }],
+    });
+    await indexer.start();
+    expect(m.modifyOne).not.toHaveBeenCalled();
+  });
+
+  it('fast path: keeps the modelled ctime when the walk does not know it', async () => {
+    const m = makeModel([{ ...file('a.md', 5, 10), ctime: 3 }]);
+    const { indexer } = makeIndexer({
+      fastPath: true, model: m, remote: [{ ...file('a.md', 6, 12), ctime: 0 }],
+    });
+    await indexer.start();
+    expect(m.modifyOne).toHaveBeenCalledExactlyOnceWith('a.md', { ctime: 3, mtime: 6, size: 12 });
+  });
+
   it('fast path: drops notes and folders the remote no longer has', async () => {
     const m = makeModel([file('keep.md'), dir('old'), file('old/x.md'), file('gone.md')]);
     const { indexer, completions } = makeIndexer({ fastPath: true, model: m, remote: [file('keep.md')] });

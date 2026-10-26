@@ -43,8 +43,8 @@ type Stat struct {
 	// Mtime is the modification time in unix milliseconds.
 	Mtime int64 `json:"mtime"`
 	// Created is the creation time in unix milliseconds (Obsidian
-	// FileStats.ctime, not POSIX st_ctime).
-	Created int64 `json:"created"`
+	// FileStats.ctime, not POSIX st_ctime). Omitted when unknown.
+	Created int64 `json:"created,omitempty"`
 	// Size in bytes; 0 for directories.
 	Size int64 `json:"size"`
 	// Mode is POSIX mode bits (informational).
@@ -57,7 +57,7 @@ type Entry struct {
 	Name    string    `json:"name"`
 	Type    EntryType `json:"type"`
 	Mtime   int64     `json:"mtime"`
-	Created int64     `json:"created"` // see Stat.Created
+	Created int64     `json:"created,omitempty"` // see Stat.Created
 	Size    int64     `json:"size"`
 }
 
@@ -206,7 +206,7 @@ type WalkEntry struct {
 	Path    string    `json:"path"`
 	Type    EntryType `json:"type"`
 	Mtime   int64     `json:"mtime"`
-	Created int64     `json:"created"` // see Stat.Created
+	Created int64     `json:"created,omitempty"` // see Stat.Created
 	Size    int64     `json:"size"`
 }
 
