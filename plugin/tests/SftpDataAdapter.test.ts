@@ -1563,6 +1563,74 @@ describe('SftpDataAdapter: overlapping writes to one path', () => {
       expect(fake.files['/v/data.json'].data.toString('utf8')).toBe('replayed');
     },
   );
+
+  // A write queued behind an in-flight one must land before a path
+  // mutation, or it lands after it and brings the old path back.
+  describe('path mutations wait for queued writes', () => {
+    it('rename moves the last write instead of leaving the old path behind', async () => {
+      const fake = makeStrictClient();
+      const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+      await adapter.read('data.json');
+
+      const writes = [adapter.write('data.json', '1'), adapter.write('data.json', '2')];
+      await adapter.rename('data.json', 'moved.json');
+      await Promise.all(writes);
+
+      expect(fake.files['/v/data.json']).toBeUndefined();
+      expect(fake.files['/v/moved.json'].data.toString('utf8')).toBe('2');
+    });
+
+    it('remove does not leave a queued write behind', async () => {
+      const fake = makeStrictClient();
+      const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+      await adapter.read('data.json');
+
+      const writes = [adapter.write('data.json', '1'), adapter.write('data.json', '2')];
+      await adapter.remove('data.json');
+      await Promise.all(writes);
+
+      expect(fake.files['/v/data.json']).toBeUndefined();
+    });
+
+    it('copy copies the last write', async () => {
+      const fake = makeStrictClient();
+      const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+      await adapter.read('data.json');
+
+      const writes = [adapter.write('data.json', '1'), adapter.write('data.json', '2')];
+      await adapter.copy('data.json', 'copy.json');
+      await Promise.all(writes);
+
+      expect(fake.files['/v/copy.json'].data.toString('utf8')).toBe('2');
+    });
+
+    it('rmdir waits for writes to files under the folder', async () => {
+      const fake = makeStrictClient();
+      const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+
+      const writes = [adapter.write('d/x.md', '1'), adapter.write('d/x.md', '2')];
+      await adapter.rmdir('d', true);
+      await Promise.all(writes);
+
+      expect(fake.files['/v/d/x.md']).toBeUndefined();
+    });
+
+    it('does not wait for writes to a sibling whose name only shares the prefix', async () => {
+      const fake = makeStrictClient();
+      const adapter = new SftpDataAdapter(fake.client, '/v', new ReadCache(), new DirCache(), 'v');
+      await adapter.read('data.json');
+      let release!: () => void;
+      fake.spies.writeBinary.mockImplementationOnce(() => new Promise<void>(r => { release = r; }));
+
+      const stuck = adapter.write('data.json.bak', 'x');
+      await vi.waitFor(() => expect(fake.spies.writeBinary).toHaveBeenCalledTimes(1));
+      await adapter.remove('data.json');
+
+      expect(fake.files['/v/data.json']).toBeUndefined();
+      release();
+      await stuck;
+    });
+  });
 });
 
 describe('SftpDataAdapter: getResourcePath', () => {
