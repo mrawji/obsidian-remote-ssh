@@ -417,6 +417,22 @@ export class SftpDataAdapter {
     return result;
   }
 
+  /**
+   * Wait for the writes already queued to these paths, or to anything under
+   * them. Path mutations (remove, rmdir, rename, copy) call it first: a write
+   * still waiting behind an earlier one would otherwise land after the
+   * mutation, bringing a renamed or deleted file back at its old path, or
+   * copying the file before it. Writes issued after the call are new writes
+   * and land after the mutation, as they should.
+   */
+  private async writesSettled(...paths: string[]): Promise<void> {
+    const pending: Promise<void>[] = [];
+    for (const [path, tail] of this.writeChains) {
+      if (paths.some(p => path === p || path.startsWith(p + '/'))) pending.push(tail);
+    }
+    await Promise.all(pending);
+  }
+
   async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     await this.serialized(normalizedPath, () => this.writeText(normalizedPath, data, options));
   }
@@ -579,6 +595,7 @@ export class SftpDataAdapter {
   async remove(normalizedPath: string): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
+      await this.writesSettled(normalizedPath);
       const remote = this.toRemote(normalizedPath);
       if (this.reconnecting) {
         await this.queueOrThrowMutation({ kind: 'remove', path: normalizedPath });
@@ -598,6 +615,7 @@ export class SftpDataAdapter {
   }
 
   async rmdir(normalizedPath: string, recursive: boolean): Promise<void> {
+    await this.writesSettled(normalizedPath);
     const remote = this.toRemote(normalizedPath);
     if (this.reconnecting) {
       await this.queueOrThrowMutation({ kind: 'rmdir', path: normalizedPath, recursive });
@@ -616,6 +634,7 @@ export class SftpDataAdapter {
   async rename(oldPath: string, newPath: string): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
+      await this.writesSettled(oldPath, newPath);
       const oldRemote = this.toRemote(oldPath);
       const newRemote = this.toRemote(newPath);
       if (this.reconnecting) {
@@ -641,6 +660,7 @@ export class SftpDataAdapter {
   }
 
   async copy(oldPath: string, newPath: string): Promise<void> {
+    await this.writesSettled(oldPath, newPath);
     const newRemote = this.toRemote(newPath);
     if (this.reconnecting) {
       await this.queueOrThrowMutation({ kind: 'copy', srcPath: oldPath, dstPath: newPath });
