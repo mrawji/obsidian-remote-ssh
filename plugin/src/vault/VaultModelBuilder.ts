@@ -16,7 +16,9 @@ export interface RemoteEntry {
   isDirectory: boolean;
   /**
    * stat fields the file editor / Obsidian's own internals expect.
-   * For folders these are ignored; pass zeroes if unknown.
+   * For folders these are ignored; pass zeroes if unknown. A file's ctime
+   * of 0 means unknown too: the model keeps the one it has, else uses
+   * mtime (`insertFile`, `modifyOne`).
    */
   ctime: number;
   mtime: number;
@@ -326,7 +328,8 @@ export class VaultModelBuilder {
     if (!(target instanceof this.deps.TFile)) return false;
     const file: TFile = target;
     if (stat) {
-      file.stat = stat;
+      // `||`: a ctime of 0 is unknown, and so is a modelled one of 0.
+      file.stat = { ...stat, ctime: stat.ctime || file.stat?.ctime || stat.mtime };
     }
     perfTracer.point('T5a', perfTracer.newCid(), { op: 'modify', path });
     this.vault.trigger('modify', file);
@@ -434,8 +437,8 @@ export class VaultModelBuilder {
    * write into a not-yet-modelled subtree still lands.
    *
    * `stat` is applied before the event fires, so `modify` listeners see
-   * the new values. An existing file keeps its ctime: the remote reports
-   * none.
+   * the new values. An existing file keeps its ctime unless the remote
+   * reports one.
    */
   reflectWrite(path: string, stat?: WrittenStat): void {
     const existing = this.vault.getAbstractFileByPath(path);
@@ -452,13 +455,8 @@ export class VaultModelBuilder {
         );
         return;
       }
-      // `||`, not `??`: a ctime of 0 is the "unknown" placeholder.
-      const modelled = existing instanceof this.deps.TFile ? existing.stat?.ctime : undefined;
-      const fileStat = stat && {
-        ctime: modelled || stat.mtime,
-        mtime: stat.mtime,
-        size: stat.size,
-      };
+      // An unknown ctime (undefined → 0) keeps the modelled one: see modifyOne.
+      const fileStat = stat && { ctime: stat.ctime ?? 0, mtime: stat.mtime, size: stat.size };
       if (!this.modifyOne(path, fileStat)) {
         logger.warn(
           `VaultModelBuilder.reflectWrite: modifyOne("${path}") no-op; ` +
@@ -469,7 +467,7 @@ export class VaultModelBuilder {
     }
     if (!this.insertOne(
       stat
-        ? { path, isDirectory: false, ctime: stat.mtime, mtime: stat.mtime, size: stat.size }
+        ? { path, isDirectory: false, ctime: stat.ctime ?? 0, mtime: stat.mtime, size: stat.size }
         : { path, isDirectory: false, ctime: 0, mtime: Date.now(), size: 0 },
       { ensureParents: true },
     )) {
@@ -548,7 +546,8 @@ export class VaultModelBuilder {
     file.basename  = dot > 0 ? name.slice(0, dot) : name;
     file.extension = dot > 0 ? name.slice(dot + 1) : '';
     file.parent    = parent;
-    file.stat      = { ctime: entry.ctime, mtime: entry.mtime, size: entry.size };
+    // `||`: a ctime of 0 is unknown.
+    file.stat      = { ctime: entry.ctime || entry.mtime, mtime: entry.mtime, size: entry.size };
 
     insertIntoFileMap(this.vault, entry.path, file);
     parent.children.push(file);
